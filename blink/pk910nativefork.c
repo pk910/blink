@@ -48,6 +48,9 @@ int js_vfork_wait(int pid, int nohang, int *code_out) {
 int js_vfork_exec(const char *prog, char **argv, char **envp, int f0, int f1,
                   int f2) {
   (void)prog, (void)argv, (void)envp, (void)f0, (void)f1, (void)f2;
-  return -ENOSYS;  // native debug focuses on fork+exit (subshells); no exec
+  // native debug: pretend the exec succeeded and the child immediately exited
+  // 0, so the parent takes the SAME ForkRestoreParent-via-execve resume path
+  // as emscripten (that path is what spins in the browser).
+  return js_vfork_dead(0);
 }
 #endif

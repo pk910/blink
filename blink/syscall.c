@@ -368,10 +368,15 @@ static void ForkRestoreParent(struct Machine *m) {
   struct Dll *e;
   int i, hf;
   bool had;
-  // drop page-lock records: they point into the child page tables we are
-  // about to free, and OpSyscall's tail would otherwise release them against
-  // freed memory. The child's PTEs are going away, so the counts don't matter.
-  m->pagelocks.i = 0;
+  // release the child's held page locks BEFORE freeing its System: clear the
+  // PAGE_LOCKS bits on the child PTEs (the records still point at valid child
+  // page tables here) and wake any waiter. A child that hands off mid-syscall -
+  // execve holds locks on its argv/envp/prog strings - would otherwise leave
+  // those bits set, and FreeSystem's FreeHostPages deadlocks forever in
+  // WaitForPageToNotBeLocked (a 100% CPU busy-wait under wasm). Zeroing the
+  // count alone (the old code) left the bits set; this clears them and, since
+  // the count ends at 0, OpSyscall's tail still won't double-release.
+  ReleaseAllPageLocks(m);
   // close host fds the child opened that the parent never had
   for (e = dll_first(child->fds.list); e; e = dll_next(child->fds.list, e)) {
     hf = FD_CONTAINER(e)->fildes;

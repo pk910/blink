@@ -530,6 +530,7 @@ u8 *BeginStoreNp(struct Machine *, i64, size_t, void *[2], u8 *);
 int GetFileDescriptorLimit(struct System *);
 bool HasPageLock(const struct Machine *, i64) nosideeffect;
 void CollectPageLocks(struct Machine *);
+void ReleaseAllPageLocks(struct Machine *);
 u8 *LookupAddress(struct Machine *, i64);
 u8 *LookupAddress2(struct Machine *, i64, u64, u64);
 u8 *SpyAddress(struct Machine *, i64);

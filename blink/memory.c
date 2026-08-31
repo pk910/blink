@@ -190,6 +190,21 @@ void CollectPageLocks(struct Machine *m) {
   }
 }
 
+// pk910: release EVERY held page lock now, clearing PAGE_LOCKS on each PTE and
+// waking any waiter. The copy-on-write fork's teardown uses this: a child that
+// hands off mid-syscall (execve holds locks on its argv/envp/prog strings) must
+// have those PTE lock bits cleared before FreeSystem, or FreeHostPages
+// deadlocks in WaitForPageToNotBeLocked. Zeroing the record count alone leaves
+// the bits set. Afterward the count is 0, so OpSyscall's tail is a no-op.
+void ReleaseAllPageLocks(struct Machine *m) {
+  if (m->pagelocks.i) {
+    LOCK(&m->system->pagelocks_lock);
+    while (m->pagelocks.i) ReleasePageLock(m->pagelocks.p[--m->pagelocks.i].pslot);
+    unassert(!pthread_cond_broadcast(&m->system->pagelocks_cond));
+    UNLOCK(&m->system->pagelocks_lock);
+  }
+}
+
 // returns page directory entry associated with virtual address
 // @return raw page directory entry contents, or zero w/ errno
 // @raise EFAULT if a valid 4096 page didn't exist at address
