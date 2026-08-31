@@ -83,6 +83,10 @@
 #include "blink/vfs.h"
 #include "blink/xlat.h"
 
+#if defined(__EMSCRIPTEN__) && !defined(PK_FORK)
+#define PK_FORK  // pk910: the copy-on-write fork is the emscripten fork path
+#endif
+
 #ifdef __linux
 #include <sys/prctl.h>
 #endif
@@ -173,7 +177,7 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
 }
 #endif
 
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
 // ── pk910.de copy-on-write real fork ────────────────────────────────────
 // wasm has no host fork(). fork() clones the parent into a private child
 // System - address space shared copy-on-write, fd table isolated with host
@@ -403,7 +407,7 @@ static i64 ForkChildExit(struct Machine *m, int rc) {
   ForkRestoreParent(m);
   return fakepid;
 }
-#endif /* __EMSCRIPTEN__ */
+#endif /* PK_FORK */
 
 static int my_tcgetwinsize(int fd, struct winsize *ws) {
   return VfsIoctl(fd, TIOCGWINSZ, (void *)ws);
@@ -708,7 +712,7 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 }
 
 static int SysFork(struct Machine *m) {
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
   // copy-on-write real fork: clone the parent into a private child System,
   // snapshot the parent CPU, shadow-dup its fds, and run the child in place
   // until it exits/execs (ForkRestoreParent then resumes the parent)
@@ -861,7 +865,7 @@ static bool IsForkOrVfork(u64 flags) {
 static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
   if (IsForkOrVfork(flags)) {
-#if defined(__EMSCRIPTEN__)
+#if defined(PK_FORK)
     // route clone()-based fork/vfork through the copy-on-write fork too
     (void)stack, (void)ptid, (void)tls, (void)func;
     return SysFork(m);
@@ -3829,7 +3833,7 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
   if (g_forkdepth > 0) {
     // the fork child execs: spawn a real kernel process wired to the child's
     // stdio, then discard the clone and resume the parent with the kernel pid
@@ -3866,7 +3870,7 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
     return -1;
   }
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
   {
     int code = 0;
     (void)wstatus;
@@ -6010,13 +6014,13 @@ void OpSyscall(P) {
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
       if ((i64)(ax = ForkChildExit(m, di)) != -2) break;
 #endif
       SysExit(m, di);
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
-#ifdef __EMSCRIPTEN__
+#ifdef PK_FORK
       if ((i64)(ax = ForkChildExit(m, di)) != -2) break;
 #endif
       SysExitGroup(m, di);

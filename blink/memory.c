@@ -17,7 +17,6 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <errno.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -65,7 +64,7 @@ static void CowSplitRange(struct Machine *m, i64 addr, u32 size) {
 
 void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
   if (size) {
-    if (UNLIKELY(g_cowpages > 0) && !m->metal) CowSplitRange(m, addr, size);
+    if (!m->metal) CowSplitRange(m, addr, size);
     m->writeaddr = addr;
     m->writesize = size;
   }
@@ -553,6 +552,10 @@ static u8 *AccessRam2(struct Machine *m, i64 v, size_t n, void *p[2], u8 *tmp,
   u8 *a, *b;
   unsigned k;
   unassert(n <= 4096);
+  // pk910: the write path (BeginStore, and PushN which bypasses SetWriteAddr)
+  // resolves addresses read-only, so copy-on-write pages must be split here by
+  // write intent (copy==false means a store).
+  if (UNLIKELY(g_cowpages > 0) && !copy && !m->metal) CowSplitRange(m, v, n);
   if ((v & 4095) + n <= 4096) {
     a = ResolveAddress(m, v);
     if (!protect_rom || !IsRomAddress(m, a)) return a;
