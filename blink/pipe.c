@@ -51,7 +51,12 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
     return efault();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
-#ifdef HAVE_PIPE2
+#if defined(__EMSCRIPTEN__)
+  // pk910.de: kernel-backed pipes, so pipeline ends can span workers
+  int js_kernel_pipe(int *out);
+  oflags = 0;
+  if (js_kernel_pipe(fds) != -1) {
+#elif defined(HAVE_PIPE2)
   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
 #else
   if (flags) LOCK(&m->system->exec_lock);
@@ -85,7 +90,7 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
   } else {
     rc = -1;
   }
-#ifndef HAVE_PIPE2
+#if !defined(HAVE_PIPE2) && !defined(__EMSCRIPTEN__)
   if (flags) UNLOCK(&m->system->exec_lock);
 #endif
   return rc;

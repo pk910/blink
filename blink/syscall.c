@@ -173,6 +173,65 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
 }
 #endif
 
+#ifdef __EMSCRIPTEN__
+// ── pk910.de sequential vfork bridge ────────────────────────────────────
+// wasm has no fork. fork/vfork suspend the parent and run the child in
+// place (true vfork semantics: shared memory + fd table); at execve the
+// target becomes a real kernel process in another worker and the parent
+// resumes from the register snapshot with the kernel pid. wait4 bridges
+// to the kernel. Guest pipes are kernel pipes so pipeline ends can span
+// workers. The JS side lives in x86-runtime.js (globalThis.__pkx).
+
+static bool g_invfork;
+static u8 g_vfork_beg[128];
+static u8 g_vfork_xmm[16][16];
+static u64 g_vfork_ip;
+static u32 g_vfork_flags;
+
+// implemented in scripts/blink-lib.js (an emscripten JS library, not EM_JS -
+// EM_JS metadata was GC'd out of the -O3 archive build). They bridge into
+// the worker-global __pkx object defined by x86-runtime.js.
+extern int js_kernel_pipe(int *out);
+extern int js_vfork_exec(const char *prog, char **argv, char **envp, int f0, int f1, int f2);
+extern int js_vfork_dead(int code);
+extern int js_vfork_wait(int pid, int nohang, int *code_out);
+
+static int GetHostFdNum(struct Machine *m, int fildes) {
+  struct Fd *fd;
+  int host = -1;
+  LOCK(&m->system->fds.lock);
+  if ((fd = GetFd(&m->system->fds, fildes))) host = fd->fildes;
+  UNLOCK(&m->system->fds.lock);
+  return host;
+}
+
+static void VforkSaveParent(struct Machine *m) {
+  memcpy(g_vfork_beg, m->beg, sizeof(g_vfork_beg));
+  memcpy(g_vfork_xmm, m->xmm, sizeof(g_vfork_xmm));
+  g_vfork_ip = m->ip;
+  g_vfork_flags = m->flags;
+  g_invfork = true;
+}
+
+static void VforkRestoreParent(struct Machine *m) {
+  memcpy(m->beg, g_vfork_beg, sizeof(g_vfork_beg));
+  memcpy(m->xmm, g_vfork_xmm, sizeof(g_vfork_xmm));
+  m->ip = g_vfork_ip;
+  m->flags = g_vfork_flags;
+  g_invfork = false;
+}
+
+// the vfork child exited without exec: register a dead kid with the JS
+// side and resume the parent; returns the fake pid, or -2 outside vfork
+static i64 VforkChildExit(struct Machine *m, int rc) {
+  i64 fakepid;
+  if (!g_invfork) return -2;
+  fakepid = js_vfork_dead(rc & 255);
+  VforkRestoreParent(m);
+  return fakepid;
+}
+#endif /* __EMSCRIPTEN__ */
+
 static int my_tcgetwinsize(int fd, struct winsize *ws) {
   return VfsIoctl(fd, TIOCGWINSZ, (void *)ws);
 }
@@ -476,7 +535,14 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 }
 
 static int SysFork(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  // sequential vfork: the child borrows the machine until execve/_exit
+  if (g_invfork) return enosys();  // nested vfork is out of scope
+  VforkSaveParent(m);
+  return 0;
+#else
   return Fork(m, 0, 0, 0);
+#endif
 }
 
 static int SysVfork(struct Machine *m) {
@@ -3558,6 +3624,20 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
+#ifdef __EMSCRIPTEN__
+  if (g_invfork) {
+    // the vfork child execs: spawn a real kernel process with the child's
+    // stdio wiring, then resume the parent with the kernel pid
+    int pid = js_vfork_exec(prog, argv, envp, GetHostFdNum(m, 0),
+                            GetHostFdNum(m, 1), GetHostFdNum(m, 2));
+    if (pid < 0) {
+      errno = -pid;
+      return -1;  // exec failed: the child continues and will _exit
+    }
+    VforkRestoreParent(m);
+    return pid;
+  }
+#endif
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
@@ -3581,6 +3661,28 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
     return -1;
   }
+#ifdef __EMSCRIPTEN__
+  {
+    int code = 0;
+    (void)wstatus;
+    (void)hrusage;
+    rc = js_vfork_wait(pid, !!(options & WNOHANG), &code);
+    if (rc < 0) {
+      errno = -rc;
+      return -1;
+    }
+    if (rc > 0 && opt_out_wstatus_addr) {
+      gwstatus = (code & 255) << 8;  // WIFEXITED encoding
+      Write32(gwstatusb, gwstatus);
+      CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+    }
+    if (opt_out_rusage_addr) {
+      memset(&grusage, 0, sizeof(grusage));
+      CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
+    }
+    return rc;
+  }
+#endif
 #ifdef HAVE_WAIT4
   RESTARTABLE(rc = wait4(pid, &wstatus, options, &hrusage));
 #else
@@ -3922,7 +4024,14 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
   for (;;) {
     if (CompareTime(now, deadline) >= 0) return 0;
     ts = SubtractTime(deadline, now);
+#ifdef __EMSCRIPTEN__
+    // pk910.de: emscripten's nanosleep busy-waits; emscripten_sleep is
+    // provided by a JS shim that parks the worker instead
+    emscripten_sleep(ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + 1);
+    if (0) {
+#else
     if (nanosleep(&ts, 0)) {
+#endif
       unassert(errno == EINTR);
       // this may run a guest signal handler before returning
       if (CheckInterrupt(m, false)) {
@@ -5696,9 +5805,15 @@ void OpSyscall(P) {
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
+#ifdef __EMSCRIPTEN__
+      if ((i64)(ax = VforkChildExit(m, di)) != -2) break;
+#endif
       SysExit(m, di);
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
+#ifdef __EMSCRIPTEN__
+      if ((i64)(ax = VforkChildExit(m, di)) != -2) break;
+#endif
       SysExitGroup(m, di);
     case 0x00F:
       SigRestore(m);
