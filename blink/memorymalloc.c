@@ -79,11 +79,32 @@ static u64 TrackHostPage(u8 *ptr) {
       g_hostpages.c += g_hostpages.c >> 1;
       g_hostpages.p =
           realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
+      // pk910: the refcount array grows in lockstep with the page array
+      g_hostpages.refs =
+          realloc(g_hostpages.refs, g_hostpages.c * sizeof(*g_hostpages.refs));
     }
     entry = g_hostpages.n++;
     g_hostpages.p[entry] = ptr;
+    g_hostpages.refs[entry] = 1;  // pk910: one owner until fork shares it
     return entry << 12;
   }
+}
+
+// pk910: host-page refcounts drive copy-on-write fork. A page shared between a
+// forked parent and child is freed only when the last owner drops it.
+void IncHostPageRef(u64 entry) {
+  if (!HasLinearMapping()) g_hostpages.refs[(entry & PAGE_TA) >> 12] += 1;
+}
+bool DecHostPageRef(u64 entry) {
+  size_t i;
+  if (HasLinearMapping()) return true;
+  i = (entry & PAGE_TA) >> 12;
+  unassert(g_hostpages.refs[i] > 0);
+  return --g_hostpages.refs[i] == 0;
+}
+u32 GetHostPageRef(u64 entry) {
+  if (HasLinearMapping()) return 1;
+  return g_hostpages.refs[(entry & PAGE_TA) >> 12];
 }
 
 void FreeAnonymousPage(struct System *s, u8 *page) {
@@ -639,9 +660,13 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
   if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) == PAGE_HOST) {
     unassert(~entry & PAGE_RSRV);
     s->memstat.committed -= 1;
-    ClearPage((page = FindHostPage(entry)));
-    FreeAnonymousPage(s, page);
     --*rss_delta;
+    if (entry & PAGE_COW) --g_cowpages;  // pk910: this COW PTE is going away
+    // pk910: only the final owner of a copy-on-write page actually frees it
+    if (DecHostPageRef(entry)) {
+      ClearPage((page = FindHostPage(entry)));
+      FreeAnonymousPage(s, page);
+    }
     return false;
   } else if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) ==
              (PAGE_HOST | PAGE_MAP | PAGE_MUG)) {

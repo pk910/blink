@@ -99,6 +99,7 @@
 #define PAGE_MAP   0x0000000000000800  // PAGE_TA bits are a linear host mmap
 #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
 #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
+#define PAGE_COW   0x0008000000000000  // pk910: copy-on-write shared data page
 #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
 #define PAGE_FILE  0x0040000000000000  // page has tracking bit in s->filemap
 #define PAGE_LOCK  0x0080000000000000  // a bit used to increment lock counts
@@ -169,6 +170,7 @@ struct HostPages {
   size_t n;
   size_t c;
   u8 **p;
+  u32 *refs;  // pk910: per-host-page share count, for copy-on-write fork
 };
 
 struct PageLock {
@@ -483,6 +485,10 @@ void ExecuteInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
 void FreeAnonymousPage(struct System *, u8 *);
+void IncHostPageRef(u64);      // pk910: bump a shared host page's refcount
+bool DecHostPageRef(u64);      // pk910: drop it; true if it reached zero
+u32 GetHostPageRef(u64);       // pk910: current refcount
+extern long g_cowpages;        // pk910: live copy-on-write PTE count (write gate)
 u64 FindPageTableEntry(struct Machine *, u64);
 bool CheckMemoryInvariants(struct System *) nosideeffect dontdiscard;
 i64 ReserveVirtual(struct System *, i64, i64, u64, int, i64, bool, bool);

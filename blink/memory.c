@@ -46,8 +46,26 @@ void SetReadAddr(struct Machine *m, i64 addr, u32 size) {
   }
 }
 
+// pk910: count of PTEs currently marked copy-on-write. While zero (the usual
+// case) the write path skips the COW check entirely.
+long g_cowpages;
+
+bool CowMaybeSplit(struct Machine *, i64);
+
+// pk910: split every copy-on-write page overlapping a pending guest write. The
+// guest store path resolves addresses with need=PAGE_U (not PAGE_RW), so the
+// LookupAddress2 hook alone would miss stores - this catches them by write
+// intent instead. Blink calls SetWriteAddr at the start of every write.
+static void CowSplitRange(struct Machine *m, i64 addr, u32 size) {
+  i64 p, end;
+  for (p = addr & -4096, end = addr + size; p < end; p += 4096) {
+    CowMaybeSplit(m, p);
+  }
+}
+
 void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
   if (size) {
+    if (UNLIKELY(g_cowpages > 0) && !m->metal) CowSplitRange(m, addr, size);
     m->writeaddr = addr;
     m->writesize = size;
   }
@@ -260,6 +278,53 @@ MapError:
   return (uintptr_t)efault0();
 }
 
+// pk910: walk to the leaf PTE slot for a page (no TLB, no page locking).
+static u8 *FindLeafPslot(struct System *s, u64 page, u64 *out_entry) {
+  u8 *pslot;
+  u64 entry;
+  unsigned level, index;
+  entry = s->cr3;
+  for (level = 39;; level -= 9) {
+    index = (page >> level) & 511;
+    pslot = GetPageAddress(s, entry, level == 39) + index * 8;
+    if (!pslot) return 0;
+    entry = LoadPte(pslot);
+    if (!(entry & PAGE_V)) return 0;
+    if ((entry & PAGE_PS) && level > 12) return 0;  // huge: not COW-shared
+    if (level == 12) break;
+  }
+  *out_entry = entry;
+  return pslot;
+}
+
+// pk910: a guest write hit a copy-on-write page (present, read-only, PAGE_COW).
+// Give this system a private writable page - copying only if still shared - and
+// ask the caller to retry. Returns false if it isn't a COW page.
+bool CowMaybeSplit(struct Machine *m, i64 virt) {
+  u8 *pslot, *src, *dst;
+  u64 entry, newpage;
+  if (!(pslot = FindLeafPslot(m->system, virt & -4096, &entry))) return false;
+  if ((entry & (PAGE_V | PAGE_RW | PAGE_COW | PAGE_HOST)) !=
+      (PAGE_V | PAGE_COW | PAGE_HOST)) {
+    return false;  // not a present, read-only, host-backed COW page
+  }
+  if (GetHostPageRef(entry) <= 1) {
+    StorePte(pslot, (entry | PAGE_RW) & ~(u64)PAGE_COW);  // sole owner, no copy
+  } else {
+    if ((newpage = AllocateAnonymousPage(m->system)) == (u64)-1) return false;
+    m->system->rss -= 1;  // replaces a resident page, doesn't add one
+    src = FindHostPage(entry);
+    dst = FindHostPage(newpage);
+    memcpy(dst, src, 4096);
+    StorePte(pslot, (newpage & (PAGE_TA | PAGE_HOST)) |
+                        (entry & ~(PAGE_TA | PAGE_HOST | PAGE_COW)) | PAGE_RW);
+    DecHostPageRef(entry);  // this system dropped the shared original
+  }
+  --g_cowpages;
+  atomic_store_explicit(&m->invalidated, true, memory_order_relaxed);
+  return true;
+}
+
 u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
   u8 *host;
   u64 entry;
@@ -277,6 +342,11 @@ u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
     return (u8 *)efault0();
   }
   if ((entry & mask) != need) {
+    // pk910: a write to a copy-on-write page splits it, then we retry once
+    if ((need & PAGE_RW) && !m->metal && (entry & (PAGE_V | PAGE_COW)) ==
+        (PAGE_V | PAGE_COW) && CowMaybeSplit(m, virt)) {
+      return LookupAddress2(m, virt, mask, need);
+    }
     m->segvcode = SEGV_ACCERR_LINUX;
     return (u8 *)efault0();
   }

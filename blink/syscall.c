@@ -174,19 +174,14 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
 #endif
 
 #ifdef __EMSCRIPTEN__
-// ── pk910.de sequential vfork bridge ────────────────────────────────────
-// wasm has no fork. fork/vfork suspend the parent and run the child in
-// place (true vfork semantics: shared memory + fd table); at execve the
-// target becomes a real kernel process in another worker and the parent
-// resumes from the register snapshot with the kernel pid. wait4 bridges
-// to the kernel. Guest pipes are kernel pipes so pipeline ends can span
-// workers. The JS side lives in x86-runtime.js (globalThis.__pkx).
-
-static bool g_invfork;
-static u8 g_vfork_beg[128];
-static u8 g_vfork_xmm[16][16];
-static u64 g_vfork_ip;
-static u32 g_vfork_flags;
+// ── pk910.de copy-on-write real fork ────────────────────────────────────
+// wasm has no host fork(). fork() clones the parent into a private child
+// System - address space shared copy-on-write, fd table isolated with host
+// shadow dups - runs the child sequentially to _exit or execve on the same
+// interpreter, then discards the clone and resumes the pristine parent with
+// the child's pid. Real fork semantics (the parent is never mutated), done
+// in one wasm instance. execve hands the child off to a kernel worker; wait4
+// bridges to the kernel. The JS side lives in x86-runtime.js (__pkx).
 
 // implemented in scripts/blink-lib.js (an emscripten JS library, not EM_JS -
 // EM_JS metadata was GC'd out of the -O3 archive build). They bridge into
@@ -205,29 +200,207 @@ static int GetHostFdNum(struct Machine *m, int fildes) {
   return host;
 }
 
-static void VforkSaveParent(struct Machine *m) {
-  memcpy(g_vfork_beg, m->beg, sizeof(g_vfork_beg));
-  memcpy(g_vfork_xmm, m->xmm, sizeof(g_vfork_xmm));
-  g_vfork_ip = m->ip;
-  g_vfork_flags = m->flags;
-  g_invfork = true;
+#define MAX_FORK_DEPTH 64
+
+struct ForkFrame {
+  u8 beg[128];
+  _Alignas(16) u8 xmm[16][16];
+  struct MachineFpu fpu;
+  struct DescriptorCache seg[8];
+  u64 ip;
+  u32 flags;
+  u32 mxcsr;
+  struct System *parent;  // the System to resume when the child ends
+  int *pfd;               // parent host fd numbers, captured at fork
+  int *shadow;            // shadow[i] = dup(pfd[i]) (or -1)
+  int nfd;
+};
+
+static struct ForkFrame g_forks[MAX_FORK_DEPTH];
+static int g_forkdepth;
+
+// Clone one guest data page for the child. Anonymous pages are shared
+// copy-on-write (both sides marked read-only + PAGE_COW, refcount bumped);
+// file/linear pages get an eager private copy; reserved pages copy verbatim.
+static u64 CloneLeaf(struct System *dst, struct System *src, u8 *src_slot,
+                     u64 src_pte) {
+  u64 npage, ro;
+  if (src_pte & PAGE_RSRV) {
+    if (!(src_pte & (PAGE_MAP | PAGE_MUG))) {
+      return src_pte;  // reserved anonymous: the child faults its own page
+    }
+    // reserved file/linear page: commit it in the parent (the mapping is
+    // already there, this just loads it) so the child can get a private copy
+    // below - sharing the reservation would let the child's teardown munmap
+    // the parent's file mapping.
+    src_pte &= ~(u64)PAGE_RSRV;
+    StorePte(src_slot, src_pte);
+    src->memstat.committed += 1;
+    src->memstat.reserved -= 1;
+    src->rss += 1;
+  }
+  // only plain anonymous pages are shared copy-on-write; file-tracked
+  // (PAGE_FILE) and linear/individually-mapped (PAGE_MAP/PAGE_MUG) pages are
+  // eager-copied to a private anon page below - COW-sharing them without
+  // cloning s->filemaps corrupts the parent when the child's teardown untracks
+  // or unmaps them.
+  if ((src_pte & (PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_FILE)) == PAGE_HOST) {
+    ro = (src_pte & ~(u64)(PAGE_RW | PAGE_LOCKS)) | PAGE_COW;
+    // parent's page becomes COW too, unless it was already shared read-only
+    if (!(src_pte & PAGE_COW)) {
+      StorePte(src_slot, (src_pte & ~(u64)PAGE_RW) | PAGE_COW);
+      g_cowpages += 2;  // parent PTE + this child PTE are now COW
+    } else {
+      g_cowpages += 1;  // parent already COW; only the child PTE is new
+    }
+    IncHostPageRef(src_pte);
+    return ro;  // child: same host page, read-only + COW, no locks
+  }
+  if ((npage = AllocateAnonymousPage(dst)) == (u64)-1) return (u64)-1;
+  memcpy(FindHostPage(npage), GetPageAddress(src, src_pte, false), 4096);
+  return (npage & (PAGE_TA | PAGE_HOST)) |
+         (src_pte & (PAGE_V | PAGE_RW | PAGE_U | PAGE_XD));
 }
 
-static void VforkRestoreParent(struct Machine *m) {
-  memcpy(m->beg, g_vfork_beg, sizeof(g_vfork_beg));
-  memcpy(m->xmm, g_vfork_xmm, sizeof(g_vfork_xmm));
-  m->ip = g_vfork_ip;
-  m->flags = g_vfork_flags;
-  g_invfork = false;
+// Recursively clone the page-table subtree rooted at parent entry `src_table`
+// (shift = 39/30/21/12) into a fresh child subtree; return the child's entry.
+static u64 CloneTable(struct System *dst, struct System *src, u64 src_table,
+                      int shift, bool is_cr3) {
+  int i;
+  u8 *src_page, *dst_page, *src_slot;
+  u64 child_table, src_pte, child_pte;
+  if ((child_table = AllocatePageTable(dst)) == (u64)-1) return (u64)-1;
+  src_page = GetPageAddress(src, src_table, is_cr3);
+  dst_page = GetPageAddress(dst, child_table, false);
+  for (i = 0; i < 512; ++i) {
+    src_slot = src_page + i * 8;
+    src_pte = LoadPte(src_slot);
+    if (!(src_pte & PAGE_V)) continue;
+    if (shift > 12 && !(src_pte & PAGE_PS)) {
+      child_pte = CloneTable(dst, src, src_pte, shift - 9, false);
+      if (child_pte == (u64)-1) return (u64)-1;
+      child_pte = (child_pte & (PAGE_TA | PAGE_HOST)) |
+                  (src_pte & (PAGE_V | PAGE_RW | PAGE_U | PAGE_XD | PAGE_G));
+    } else {
+      child_pte = CloneLeaf(dst, src, src_slot, src_pte);
+      if (child_pte == (u64)-1) return (u64)-1;
+    }
+    StorePte(dst_page + i * 8, child_pte);
+  }
+  return child_table;
 }
 
-// the vfork child exited without exec: register a dead kid with the JS
-// side and resume the parent; returns the fake pid, or -2 outside vfork
-static i64 VforkChildExit(struct Machine *m, int rc) {
+// Give the child its own fd table entries pointing at the parent's host fds
+// (same numbers - the underlying descriptions are shared like real fork).
+static void CloneFds(struct Fds *cf, struct Fds *pf) {
+  struct Dll *e;
+  struct Fd *fd, *nf;
+  for (e = dll_last(pf->list); e; e = dll_prev(pf->list, e)) {
+    fd = FD_CONTAINER(e);
+    if ((nf = ForkFd(cf, fd, fd->fildes, fd->oflags))) nf->cb = fd->cb;
+  }
+}
+
+static struct System *CloneSystem(struct System *p) {
+  struct System *c;
+  u64 cr3;
+  if (!(c = NewSystem(p->mode))) return 0;
+  if ((cr3 = CloneTable(c, p, p->cr3, 39, true)) == (u64)-1) {
+    c->cr3 = cr3 == (u64)-1 ? 0 : cr3;
+    FreeSystem(c);
+    return 0;
+  }
+  c->cr3 = cr3;
+  c->brk = p->brk;
+  c->automap = p->automap;
+  c->codestart = p->codestart;
+  c->codesize = p->codesize;
+  c->cr0 = p->cr0;
+  c->cr2 = p->cr2;
+  c->cr4 = p->cr4;
+  c->efer = p->efer;
+  c->gdt_base = p->gdt_base;
+  c->gdt_limit = p->gdt_limit;
+  c->idt_base = p->idt_base;
+  c->idt_limit = p->idt_limit;
+  c->dlab = p->dlab;
+  c->brkchanged = p->brkchanged;
+  memcpy(c->hands, p->hands, sizeof(c->hands));
+  memcpy(c->rlim, p->rlim, sizeof(c->rlim));
+  c->blinksigs = p->blinksigs;
+  c->exec = p->exec;
+  c->redraw = p->redraw;
+  c->onfilemap = p->onfilemap;
+  c->onsymbols = p->onsymbols;
+  c->onbinbase = p->onbinbase;
+  c->onlongbranch = p->onlongbranch;
+  c->pid = p->pid;
+  CloneFds(&c->fds, &p->fds);
+  return c;
+}
+
+// Move the running machine onto another System (address space + fds), flushing
+// the stale TLB / decoded-instruction cache so the new mappings take effect.
+static void SwapMachineSystem(struct Machine *m, struct System *ns) {
+  struct System *os = m->system;
+  LOCK(&os->machines_lock);
+  dll_remove(&os->machines, &m->elem);
+  UNLOCK(&os->machines_lock);
+  m->system = ns;
+  m->mode = ns->mode;
+  LOCK(&ns->machines_lock);
+  dll_make_first(&ns->machines, &m->elem);
+  UNLOCK(&ns->machines_lock);
+  atomic_store_explicit(&m->invalidated, true, memory_order_relaxed);
+  ResetInstructionCache(m);
+}
+
+// The child has ended (exit) or handed off (exec): restore the parent's fd
+// space via the shadows, swap back onto the parent System + registers, and
+// free the child clone (its unique COW pages drop; shared ones survive).
+static void ForkRestoreParent(struct Machine *m) {
+  struct ForkFrame *f = &g_forks[g_forkdepth - 1];
+  struct System *child = m->system;
+  struct Dll *e;
+  int i, hf;
+  bool had;
+  // drop page-lock records: they point into the child page tables we are
+  // about to free, and OpSyscall's tail would otherwise release them against
+  // freed memory. The child's PTEs are going away, so the counts don't matter.
+  m->pagelocks.i = 0;
+  // close host fds the child opened that the parent never had
+  for (e = dll_first(child->fds.list); e; e = dll_next(child->fds.list, e)) {
+    hf = FD_CONTAINER(e)->fildes;
+    for (had = false, i = 0; i < f->nfd; ++i)
+      if (f->pfd[i] == hf) { had = true; break; }
+    if (!had) close(hf);
+  }
+  // rebind every parent fd to its original description through the shadow
+  for (i = 0; i < f->nfd; ++i)
+    if (f->shadow[i] >= 0) dup2(f->shadow[i], f->pfd[i]);
+  SwapMachineSystem(m, f->parent);
+  FreeSystem(child);
+  memcpy(m->beg, f->beg, sizeof(m->beg));
+  memcpy(m->xmm, f->xmm, sizeof(m->xmm));
+  memcpy(&m->fpu, &f->fpu, sizeof(m->fpu));
+  memcpy(m->seg, f->seg, sizeof(m->seg));
+  m->ip = f->ip;
+  m->flags = f->flags;
+  m->mxcsr = f->mxcsr;
+  for (i = 0; i < f->nfd; ++i)
+    if (f->shadow[i] >= 0) close(f->shadow[i]);
+  free(f->pfd);
+  free(f->shadow);
+  --g_forkdepth;
+}
+
+// child exited without exec: register a dead kid, resume the parent; returns
+// the fake pid, or -2 if we're not in a fork
+static i64 ForkChildExit(struct Machine *m, int rc) {
   i64 fakepid;
-  if (!g_invfork) return -2;
+  if (g_forkdepth <= 0) return -2;
   fakepid = js_vfork_dead(rc & 255);
-  VforkRestoreParent(m);
+  ForkRestoreParent(m);
   return fakepid;
 }
 #endif /* __EMSCRIPTEN__ */
@@ -536,10 +709,38 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 
 static int SysFork(struct Machine *m) {
 #ifdef __EMSCRIPTEN__
-  // sequential vfork: the child borrows the machine until execve/_exit
-  if (g_invfork) return enosys();  // nested vfork is out of scope
-  VforkSaveParent(m);
-  return 0;
+  // copy-on-write real fork: clone the parent into a private child System,
+  // snapshot the parent CPU, shadow-dup its fds, and run the child in place
+  // until it exits/execs (ForkRestoreParent then resumes the parent)
+  struct ForkFrame *f;
+  struct System *child;
+  struct Dll *e;
+  int cnt;
+  if (g_forkdepth >= MAX_FORK_DEPTH) return enomem();
+  if (!(child = CloneSystem(m->system))) return enomem();
+  f = &g_forks[g_forkdepth];
+  memcpy(f->beg, m->beg, sizeof(f->beg));
+  memcpy(f->xmm, m->xmm, sizeof(f->xmm));
+  memcpy(&f->fpu, &m->fpu, sizeof(f->fpu));
+  memcpy(f->seg, m->seg, sizeof(f->seg));
+  f->ip = m->ip;
+  f->flags = m->flags;
+  f->mxcsr = m->mxcsr;
+  f->parent = m->system;
+  cnt = 0;
+  for (e = dll_first(m->system->fds.list); e; e = dll_next(m->system->fds.list, e)) ++cnt;
+  f->pfd = (int *)malloc(sizeof(int) * (cnt + 1));
+  f->shadow = (int *)malloc(sizeof(int) * (cnt + 1));
+  f->nfd = 0;
+  for (e = dll_first(m->system->fds.list); e; e = dll_next(m->system->fds.list, e)) {
+    int hf = FD_CONTAINER(e)->fildes;
+    f->pfd[f->nfd] = hf;
+    f->shadow[f->nfd] = dup(hf);  // protects the parent's description
+    ++f->nfd;
+  }
+  ++g_forkdepth;
+  SwapMachineSystem(m, child);
+  return 0;  // child return
 #else
   return Fork(m, 0, 0, 0);
 #endif
@@ -660,7 +861,11 @@ static bool IsForkOrVfork(u64 flags) {
 static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
   if (IsForkOrVfork(flags)) {
-#ifdef HAVE_FORK
+#if defined(__EMSCRIPTEN__)
+    // route clone()-based fork/vfork through the copy-on-write fork too
+    (void)stack, (void)ptid, (void)tls, (void)func;
+    return SysFork(m);
+#elif defined(HAVE_FORK)
     return Fork(m, flags, stack, ctid);
 #else
     LOGF("forking support disabled");
@@ -3625,16 +3830,16 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
 #ifdef __EMSCRIPTEN__
-  if (g_invfork) {
-    // the vfork child execs: spawn a real kernel process with the child's
-    // stdio wiring, then resume the parent with the kernel pid
+  if (g_forkdepth > 0) {
+    // the fork child execs: spawn a real kernel process wired to the child's
+    // stdio, then discard the clone and resume the parent with the kernel pid
     int pid = js_vfork_exec(prog, argv, envp, GetHostFdNum(m, 0),
                             GetHostFdNum(m, 1), GetHostFdNum(m, 2));
     if (pid < 0) {
       errno = -pid;
       return -1;  // exec failed: the child continues and will _exit
     }
-    VforkRestoreParent(m);
+    ForkRestoreParent(m);
     return pid;
   }
 #endif
@@ -5806,13 +6011,13 @@ void OpSyscall(P) {
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
 #ifdef __EMSCRIPTEN__
-      if ((i64)(ax = VforkChildExit(m, di)) != -2) break;
+      if ((i64)(ax = ForkChildExit(m, di)) != -2) break;
 #endif
       SysExit(m, di);
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
 #ifdef __EMSCRIPTEN__
-      if ((i64)(ax = VforkChildExit(m, di)) != -2) break;
+      if ((i64)(ax = ForkChildExit(m, di)) != -2) break;
 #endif
       SysExitGroup(m, di);
     case 0x00F:
