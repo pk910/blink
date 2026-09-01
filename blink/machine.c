@@ -136,7 +136,7 @@ void OpMovGvqpEvqp(P) {  // pk910: extern for wasmjit inline mov
   }
 }
 
-void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 Load8(GetModrmRegisterBytePointerRead1(A)));
   if (IsMakingPath(m)) {
@@ -145,7 +145,7 @@ void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline mem-read
   }
 }
 
-void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 Load16(GetModrmRegisterWordPointerRead2(A)));
   if (IsMakingPath(m)) {
@@ -154,7 +154,7 @@ void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline mem-read
   }
 }
 
-void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i8)Load8(GetModrmRegisterBytePointerRead1(A)));
   if (IsMakingPath(m)) {
@@ -164,7 +164,7 @@ void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline mem-read
   }
 }
 
-void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i16)Load16(GetModrmRegisterWordPointerRead2(A)));
   if (IsMakingPath(m)) {
@@ -174,7 +174,7 @@ void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline mem-read
   }
 }
 
-void OpMovslGdqpEd(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovslGdqpEd(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i32)Load32(GetModrmRegisterWordPointerRead4(A)));
   if (IsMakingPath(m)) {
@@ -322,11 +322,11 @@ static void TripleOp(P, const nexgen32e_f ops[3]) {
   }
 }
 
-static void OpSax(P) {
+void OpSax(P) {  // pk910: extern for wasmjit inline
   TripleOp(A, kSax);
 }
 
-static void OpConvert(P) {
+void OpConvert(P) {  // pk910: extern for wasmjit inline
   TripleOp(A, kConvert);
 }
 
@@ -365,7 +365,7 @@ static void OpMovOvqpRax(P) {
   WriteMemory(rde, ResolveAddress(m, v), Get64(m->ax));
 }
 
-void OpMovEbGb(P) {  // pk910: extern for wasmjit inline mem-write
+void OpMovEbGb(P) {  // pk910: extern for wasmjit inline (reg + mem-write)
   Store8(GetModrmRegisterBytePointerWrite1(A), Get8(ByteRexrReg(m, rde)));
   if (IsMakingPath(m)) {
     Jitter(A, "A"      // res0 = GetReg(RexrReg)
@@ -373,7 +373,7 @@ void OpMovEbGb(P) {  // pk910: extern for wasmjit inline mem-write
   }
 }
 
-void OpMovGbEb(P) {  // pk910: extern for wasmjit inline mem-read
+void OpMovGbEb(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   Put8(ByteRexrReg(m, rde), Load8(GetModrmRegisterBytePointerRead1(A)));
   unassert(!RegLog2(rde));
   if (IsMakingPath(m)) {
@@ -382,7 +382,7 @@ void OpMovGbEb(P) {  // pk910: extern for wasmjit inline mem-read
   }
 }
 
-static void OpMovZbIb(P) {
+void OpMovZbIb(P) {  // pk910: extern for wasmjit inline
   Put8(ByteRexbSrm(m, rde), uimm0);
   if (IsMakingPath(m)) {
     Jitter(A,
@@ -574,7 +574,7 @@ void OpAluFlipCmp(P) {  // pk910: extern for wasmjit inline ALU
   }
 }
 
-static void OpAluAxImm(P) {
+void OpAluAxImm(P) {  // pk910: extern for wasmjit inline
   aluop_f op;
   op = kAlu[(Opcode(rde) & 070) >> 3][RegLog2(rde)];
   WriteRegisterBW(rde, m->ax, op(m, ReadRegisterBW(rde, m->ax), uimm0));
@@ -635,11 +635,11 @@ static void OpRoAxImm(P, const aluop_f ops[4], const aluop_f fops[4]) {
   }
 }
 
-static void OpCmpAxImm(P) {
+void OpCmpAxImm(P) {  // pk910: extern for wasmjit inline
   OpRoAxImm(A, kAlu[ALU_SUB], kAluFast[ALU_SUB]);
 }
 
-static void OpTestAxImm(P) {
+void OpTestAxImm(P) {  // pk910: extern for wasmjit inline
   OpRoAxImm(A, kAlu[ALU_AND], kAluFast[ALU_AND]);
 }
 
@@ -736,7 +736,7 @@ static void BsuwiConstant(P, u64 y) {
   }
 }
 
-static void OpBsuwi1(P) {
+void OpBsuwi1(P) {  // pk910: extern for wasmjit inline
   BsuwiConstant(A, 1);
 }
 
@@ -751,7 +751,7 @@ static aluop_f Bsubi(P, u64 y) {
   return op;
 }
 
-static void OpBsubiCl(P) {
+void OpBsubiCl(P) {  // pk910: extern for wasmjit inline
   aluop_f op;
   op = Bsubi(A, m->cl);
   if (IsMakingPath(m)) {
@@ -783,11 +783,11 @@ static void BsubiConstant(P, u64 y) {
   }
 }
 
-static void OpBsubi1(P) {
+void OpBsubi1(P) {  // pk910: extern for wasmjit inline
   BsubiConstant(A, 1);
 }
 
-static void OpBsubiImm(P) {
+void OpBsubiImm(P) {  // pk910: extern for wasmjit inline
   BsubiConstant(A, uimm0);
 }
 
@@ -972,7 +972,7 @@ static void SetEb(P, bool x) {
   Store8(GetModrmRegisterBytePointerWrite1(A), x);
 }
 
-static void OpSetcc(P) {
+void OpSetcc(P) {  // pk910: extern for wasmjit inline
   cc_f cc;
   cc = GetCc(A);
   SetEb(A, cc(m));
@@ -1002,7 +1002,7 @@ static void OpCmovImpl(P, bool cond) {
   WriteRegister(rde, RegRexrReg(m, rde), x);
 }
 
-static void OpCmov(P) {
+void OpCmov(P) {  // pk910: extern for wasmjit inline
   cc_f cc;
   cc = GetCc(A);
   OpCmovImpl(A, cc(m));
@@ -1181,7 +1181,7 @@ static const nexgen32e_f kOp0f6[] = {
     OpDivAlAhAxEbSigned,
 };
 
-static void Op0f6(P) {
+void Op0f6(P) {  // pk910: extern for wasmjit inline
   kOp0f6[ModrmReg(rde)](A);
 }
 
@@ -1196,7 +1196,7 @@ static const nexgen32e_f kOp0f7[] = {
     OpDivRdxRaxEvqpSigned,
 };
 
-static void Op0f7(P) {
+void Op0f7(P) {  // pk910: extern for wasmjit inline
   kOp0f7[ModrmReg(rde)](A);
 }
 
@@ -1216,7 +1216,7 @@ static const nexgen32e_f kOp0ff[] = {
     OpUd,       //
 };
 
-static void Op0ff(P) {
+void Op0ff(P) {  // pk910: extern for wasmjit inline
   kOp0ff[ModrmReg(rde)](A);
 }
 
