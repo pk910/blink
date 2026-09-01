@@ -70,8 +70,15 @@ bool IsPageInSmcQueue(struct Machine *m, i64 page) {
 }
 
 // @asyncsignalsafe
+#ifdef HAVE_WASM_JIT
+void WasmJitFlushCode(void);  // pk910: invalidate wasm-JIT blocks on code write
+#endif
+
 void AddPageToSmcQueue(struct Machine *m, i64 page) {
   int i;
+#ifdef HAVE_WASM_JIT
+  WasmJitFlushCode();  // the guest wrote an executable page; drop stale JIT blocks
+#endif
   page &= -4096;
   for (i = 0; i < kSmcQueueSize; ++i) {
     if (!m->smcqueue.p[i]) {

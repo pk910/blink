@@ -64,25 +64,35 @@ struct SharedEntry {
   _Atomic(u32) hits;
   const u8 *bytes;
   u32 len;
+  u32 gen;  // g_codegen when emitted; stale if code changed (SMC)
 };
 static struct SharedEntry g_shared[PKJIT_SHARED];
 
 struct LocalHook {
   u64 virt;
   u32 idx;
+  u32 gen;
 };
 static _Thread_local struct LocalHook *t_local;
 static _Thread_local u8 *t_scratch;
 static int g_pkjit_ready;
 static _Atomic(u32) g_emits;
+// Bumped whenever the guest writes an executable page (SMC); stale-gen blocks are
+// never executed and get re-emitted. Called from smc.c AddPageToSmcQueue.
+static _Atomic(u32) g_codegen;
+void WasmJitFlushCode(void) {
+  atomic_fetch_add_explicit(&g_codegen, 1, memory_order_release);
+}
 
-// Fixed module prefix: 2 types (t0 = block/handler (i32,i64,i64,i64)->() ;
-// t1 = kAlu (i32,i64,i64)->i64), imports env.mem (shared {1,65536}) + env.tbl
-// (funcref), func(t0), export "b". Only the code section (appended) varies.
+// Fixed module prefix: 3 types (t0 = block/handler (i32,i64,i64,i64)->() ;
+// t1 = kAlu (i32,i64,i64)->i64 ; t2 = CommitStash (i32)->()), imports env.mem
+// (shared {1,65536}) + env.tbl (funcref), func(t0), export "b". Only the code
+// section (appended) varies.
 static const u8 kPrefix[] = {
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    0x01, 0x0f, 0x02, 0x60, 0x04, 0x7f, 0x7e, 0x7e, 0x7e, 0x00,  // t0
+    0x01, 0x13, 0x03, 0x60, 0x04, 0x7f, 0x7e, 0x7e, 0x7e, 0x00,  // t0
     0x60, 0x03, 0x7f, 0x7e, 0x7e, 0x01, 0x7e,                    // t1
+    0x60, 0x01, 0x7f, 0x00,                                      // t2
     0x02, 0x1b, 0x02, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x6d, 0x65,
     0x6d, 0x02, 0x03, 0x01, 0x80, 0x80, 0x04, 0x03, 0x65, 0x6e,
     0x76, 0x03, 0x74, 0x62, 0x6c, 0x01, 0x70, 0x00, 0x00,
@@ -150,6 +160,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 
 #define OFF_FLAGS ((u32)offsetof(struct Machine, flags))
 #define OFF_OPLEN ((u32)offsetof(struct Machine, oplen))
+#define OFF_STASH ((u32)offsetof(struct Machine, stashaddr))
 // scratch locals (declared after the 16 GPR locals): i64 20..23, i32 24..26
 #define LT0 20
 #define LT1 21
@@ -229,6 +240,21 @@ static void EmitHandler(struct Buf *b, u64 rde, i64 disp, u64 uimm0, u32 hidx) {
   EConst(b, (i64)uimm0);
   bput(b, 0x41); bleb_s(b, (i64)(i32)hidx);  // i32.const handler idx
   bput(b, 0x11); bleb_u(b, 0); bput(b, 0x00);  // call_indirect t0 table0
+}
+
+// After a handler, drain a page-crossing store's stash: if (m->stashaddr)
+// CommitStash(m). The interpreter does this per instruction (machine.c:2158);
+// a chained block would otherwise lose a page-crossing write.
+static void EmitCommitStash(struct Buf *b) {
+  EGet(b, 0);
+  bput(b, 0x29); bleb_u(b, 3); bleb_u(b, OFF_STASH);  // i64.load m->stashaddr
+  EConst(b, 0);
+  bput(b, 0x52);              // i64.ne  -> i32 cond
+  bput(b, 0x04); bput(b, 0x40);  // if (void)
+  EGet(b, 0);
+  bput(b, 0x41); bleb_s(b, (i64)(i32)(uintptr_t)&CommitStash);  // i32.const
+  bput(b, 0x11); bleb_u(b, 2); bput(b, 0x00);  // call_indirect t2 (i32)->()
+  bput(b, 0x0b);             // end
 }
 
 // dst = kAlu[t][log2](m, dst, y); y is GPR src or (imm) immediate.
@@ -455,6 +481,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
       EGet(&bb, 0); EConstI(&bb, (i32)oplen);
       bput(&bb, 0x3a); bleb_u(&bb, 0); bleb_u(&bb, OFF_OPLEN);  // i32.store8
       EmitHandler(&bb, rde, xedd.op.disp, xedd.op.uimm0, (u32)(uintptr_t)h);
+      EmitCommitStash(&bb);                 // drain page-crossing store stash
       RcInval(&rc);                         // handler may have changed regs
       ip_dirty = false;
       if (ClassifyOp(rde) != kOpNormal) {   // branch/precious ends the block
@@ -508,12 +535,13 @@ static inline u32 HashLocal(u64 ip) {
   return (u32)((ip * 2654435761u) >> 11) & (PKJIT_LOCAL - 1);
 }
 
-static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip,
+static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
                                     int first_compile) {
   int idx = pk_jit_install(s->bytes, (int)s->len, first_compile);
   if (idx <= 0) return 0;
   struct LocalHook *lh = &t_local[HashLocal(ip)];
   lh->idx = (u32)idx;
+  lh->gen = gen;
   lh->virt = ip;
   return (nexgen32e_f)(uintptr_t)idx;
 }
@@ -524,8 +552,10 @@ nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
     t_local = (struct LocalHook *)calloc(PKJIT_LOCAL, sizeof(struct LocalHook));
     if (!t_local) { g_pkjit_ready = -1; return 0; }
   }
+  u32 curgen = atomic_load_explicit(&g_codegen, memory_order_acquire);
   struct LocalHook *lh = &t_local[HashLocal(ip)];
-  if (lh->virt == ip && lh->idx) return (nexgen32e_f)(uintptr_t)lh->idx;
+  if (lh->virt == ip && lh->idx && lh->gen == curgen)
+    return (nexgen32e_f)(uintptr_t)lh->idx;
 
   struct SharedEntry *s = &g_shared[HashShared(ip)];
   u64 sv = atomic_load_explicit(&s->virt, memory_order_acquire);
@@ -542,18 +572,29 @@ nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
   if (sv != ip) return 0;
 
   u32 st = atomic_load_explicit(&s->state, memory_order_acquire);
-  if (st == kReady) return InstantiateLocal(s, ip, 0);
-  if (st == kEmitting) return 0;
-
-  if (atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1 <
-      PKJIT_THRESHOLD) {
+  if (st == kReady) {
+    if (s->gen == curgen) return InstantiateLocal(s, ip, curgen, 0);
+    // stale code (SMC): grab the re-emit, else another thread has it
+    u32 want = kReady;
+    if (!atomic_compare_exchange_strong_explicit(&s->state, &want, kEmitting,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire)) {
+      return 0;
+    }
+    // fall through to re-emit
+  } else if (st == kEmitting) {
     return 0;
-  }
-  u32 want = kWarming;
-  if (!atomic_compare_exchange_strong_explicit(&s->state, &want, kEmitting,
-                                               memory_order_acq_rel,
-                                               memory_order_acquire)) {
-    return 0;
+  } else {  // warming
+    if (atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1 <
+        PKJIT_THRESHOLD) {
+      return 0;
+    }
+    u32 want = kWarming;
+    if (!atomic_compare_exchange_strong_explicit(&s->state, &want, kEmitting,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire)) {
+      return 0;
+    }
   }
   const u8 *bytes;
   u32 len;
@@ -561,11 +602,12 @@ nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
     atomic_store_explicit(&s->state, kEmitting, memory_order_release);  // park
     return 0;
   }
-  s->bytes = bytes;
-  s->len = len;
+  s->bytes = bytes;  // old bytes (if re-emit) intentionally leaked: other threads
+  s->len = len;      // may still read them; SMC is rare so the leak is bounded
+  s->gen = curgen;
   atomic_store_explicit(&s->state, kReady, memory_order_release);
   u32 seq = atomic_fetch_add_explicit(&g_emits, 1, memory_order_relaxed) + 1;
-  return InstantiateLocal(s, ip, (int)seq);
+  return InstantiateLocal(s, ip, curgen, (int)seq);
 }
 
 #endif  // HAVE_WASM_JIT
