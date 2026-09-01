@@ -1045,9 +1045,9 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       o->t = t; o->lg = lg; o->d = d; o->im = im; o->iv = iv;
       regs |= 1u << d;
       if (!im) regs |= 1u << 1;  // CL form reads RCX
-    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg) &&
-               !GetNeededFlags(m, (i64)pcn, CF | OF)) {
-      o->kind = kSlImul;  // imul low result; CF/OF (its only flags) are dead
+    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg)) {
+      o->kind = kSlImul;  // exact CF/OF emitted only if live at pcn
+      o->need = GetNeededFlags(m, (i64)pcn, CF | OF);
       o->d = d; o->s = s; o->b = lb; o->im = im; o->iv = iv; o->lg = lg;
       regs |= 1u << d;
       regs |= 1u << s;
@@ -1100,7 +1100,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
         EmitBsuInline(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
         break;
       case kSlImul:
-        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg);
+        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg, o->need);
         break;
       default:  // kSlLea
         EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
