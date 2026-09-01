@@ -50,6 +50,10 @@
 #define READ64(p) Read64((const u8 *)(p))
 #define READ32(p) Read32((const u8 *)(p))
 
+// pk910: read an executable image via pread (routes to the pk910 kernel VFS)
+// instead of mmap-ing the fd - wasm/DISABLE_VFS has no host file mmap.
+static void *PkReadFile(int fd, size_t len);
+
 #ifndef __COSMOPOLITAN__
 #define IsWindows() 0
 #endif
@@ -446,9 +450,7 @@ static bool LoadElf(struct Machine *m,  //
     SYS_LOGF("LoadInterpreter %s", elf->interpreter);
     if ((fd = VfsOpen(AT_FDCWD, elf->interpreter, O_RDONLY, 0)) == -1 ||
         (VfsFstat(fd, &st) == -1 || !st.st_size) ||
-        (ehdri = (Elf64_Ehdr_ *)Mmap(0, st.st_size, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE, fd, 0, "loader")) ==
-            MAP_FAILED ||
+        (ehdri = (Elf64_Ehdr_ *)PkReadFile(fd, st.st_size)) == MAP_FAILED ||
         !IsSupportedExecutable(elf->interpreter, ehdri, st.st_size)) {
       WriteErrorString(elf->interpreter);
       WriteErrorString(": failed to load interpreter (errno ");
@@ -473,7 +475,7 @@ static bool LoadElf(struct Machine *m,  //
           break;
       }
     }
-    unassert(!Munmap(ehdri, st.st_size));
+    free(ehdri);
     unassert(!VfsClose(fd));
   }
   return execstack;
@@ -549,6 +551,25 @@ static int GetElfHeader(char ehdr[64], const char *prog, const char *image) {
 
 static void FreeProgName(void) {
   free(g_progname);
+}
+
+// pk910: wasm/DISABLE_VFS has no host file mmap (kernel fds have no emscripten
+// FS stream). The loader only needs a readable image of the executable, so
+// read it into a malloc'd buffer via pread (which routes to the pk910 kernel
+// VFS) instead of mmap-ing the fd. Callers free() instead of munmap().
+static void *PkReadFile(int fd, size_t len) {
+  char *p;
+  size_t off;
+  ssize_t n;
+  if (!(p = (char *)malloc(len))) return MAP_FAILED;
+  // pread returns short (the kernel caps a read at 64KB) - loop to fill len
+  for (off = 0; off < len; off += (size_t)n) {
+    if ((n = pread(fd, p + off, len - off, off)) <= 0) {
+      free(p);
+      return MAP_FAILED;
+    }
+  }
+  return p;
 }
 
 static int CheckExecutableFile(const char *prog, const struct stat *st) {
@@ -723,8 +744,8 @@ void LoadProgram(struct Machine *m, char *execfn, char *prog, char **args,
     SYS_LOGF("LoadProgram %s", prog);
     if ((fd = VfsOpen(AT_FDCWD, prog, O_RDONLY, 0)) == -1 ||
         VfsFstat(fd, &st) == -1 || CheckExecutableFile(prog, &st) == -1 ||
-        (map = Mmap(0, (mapsize = st.st_size), PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE, fd, 0, "loader")) == MAP_FAILED) {
+        (mapsize = st.st_size,
+         (map = PkReadFile(fd, mapsize)) == MAP_FAILED)) {
       WriteErrorString(prog);
       WriteErrorString(": failed to load executable (errno ");
       FormatInt64(tmp, errno);
@@ -747,7 +768,7 @@ error: unsupported executable; we need:\n\
       // turns out it's a shell script
       if (isfirst) {
         // start over using the shebang interpreter instead
-        unassert(!VfsMunmap(map, mapsize));
+        free(map);
         unassert(!VfsClose(fd));
         isfirst = false;
       } else {
@@ -822,7 +843,7 @@ error: unsupported executable; we need:\n\
   unassert(CheckMemoryInvariants(m->system));
   elf->execfn = strdup(elf->execfn);
   elf->prog = strdup(elf->prog);
-  unassert(!VfsMunmap(map, mapsize));
+  free(map);
   unassert(!VfsClose(fd));
   m->system->loaded = true;
 #ifndef DISABLE_VFS
@@ -846,11 +867,11 @@ static bool CanEmulateImpl(struct Machine *m, char **prog, char ***argv,
     VfsClose(fd);
     return false;
   }
-  img = VfsMmap(0, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+  img = PkReadFile(fd, st.st_size);
   VfsClose(fd);
   if (img == MAP_FAILED) goto CantEmulate;
   res = !!CanEmulateData(m, prog, argv, isfirst, (char *)img, st.st_size);
-  unassert(!VfsMunmap(img, st.st_size));
+  free(img);
   return res;
 }
 

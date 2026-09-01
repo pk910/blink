@@ -110,7 +110,7 @@ static void OpSahf(P) {
   ImportFlags(m, (m->flags & ~0xff) | m->ah);
 }
 
-static void OpLeaGvqpM(P) {
+void OpLeaGvqpM(P) {  // pk910: extern for wasmjit inline lea
   WriteRegister(rde, RegRexrReg(m, rde), LoadEffectiveAddress(A).addr);
   if (IsMakingPath(m)) {
     Jitter(A, "L"      // res0 = LoadEffectiveAddress()
@@ -918,7 +918,7 @@ static cc_f GetCc(P) {
   return kConditionCode[code];
 }
 
-static void OpJcc(P) {
+void OpJcc(P) {  // pk910: extern for wasmjit self-loop detection
   cc_f cc;
   cc = GetCc(A);
   if (IsMakingPath(m)) {

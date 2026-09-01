@@ -137,7 +137,23 @@ void FreeBig(void *p, size_t n) {
 }
 
 void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
-  void *p = Mmap(0, n, prot, flags, fd, off, "big");
+  void *p;
+  if (fd != -1) {
+    // pk910: wasm/DISABLE_VFS has no host file mmap (kernel fds have no
+    // emscripten FS stream). Back file-backed guest pages with anonymous
+    // memory filled from the kernel VFS via pread. The guest's own page
+    // protections are enforced by blink's softmmu, so a writable host page
+    // is fine even for read-only segments.
+    size_t got;
+    ssize_t r;
+    p = Mmap(0, n, prot | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS_, -1, 0, "big");
+    if (p == MAP_FAILED) return 0;
+    for (got = 0; got < n; got += (size_t)r) {
+      if ((r = pread(fd, (char *)p + got, n - got, off + got)) <= 0) break;
+    }
+    return p;
+  }
+  p = Mmap(0, n, prot, flags, fd, off, "big");
   return p != MAP_FAILED ? p : 0;
 }
 

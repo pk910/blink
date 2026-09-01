@@ -36,6 +36,7 @@
 #include "blink/alu.h"
 #include "blink/machine.h"
 #include "blink/modrm.h"
+#include "blink/flags.h"
 #include "blink/rde.h"
 
 extern int pk_jit_install(const void *bytes, int len, int first_compile);
@@ -49,6 +50,8 @@ void OpAluTest(P);
 void OpMovEvqpGvqp(P);  // mov Ev,Gv (#1 hottest; reg-reg when mod==3)
 void OpMovGvqpEvqp(P);  // mov Gv,Ev
 void OpMovZvqpIvqp(P);  // mov Zv,imm
+void OpJcc(P);          // conditional jump (self-loop terminator detection)
+void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -75,6 +78,7 @@ struct LocalHook {
 };
 static _Thread_local struct LocalHook *t_local;
 static _Thread_local u8 *t_scratch;
+static _Thread_local int t_wasloop;  // diag: last emit was a self-loop
 static int g_pkjit_ready;
 static _Atomic(u32) g_emits;
 // Bumped whenever the guest writes an executable page (SMC); stale-gen blocks are
@@ -161,6 +165,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define OFF_FLAGS ((u32)offsetof(struct Machine, flags))
 #define OFF_OPLEN ((u32)offsetof(struct Machine, oplen))
 #define OFF_STASH ((u32)offsetof(struct Machine, stashaddr))
+#define OFF_ATT ((u32)offsetof(struct Machine, attention))
 // scratch locals (declared after the 16 GPR locals): i64 20..23, i32 24..26
 #define LT0 20
 #define LT1 21
@@ -175,6 +180,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_OR  0x84
 #define I64_XOR 0x85
 #define I64_SHRU 0x88
+#define I64_SHL 0x86
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
 #define I64_WRAP 0xa7
@@ -257,6 +263,39 @@ static void EmitCommitStash(struct Buf *b) {
   bput(b, 0x0b);             // end
 }
 
+// push (FL >> n) & 1 as i32 (flag bit n)
+static void EmitBit(struct Buf *b, int n) {
+  EGet(b, FL);
+  if (n) { EConstI(b, n); bput(b, 0x76); }  // i32.shr_u
+  EConstI(b, 1); bput(b, 0x71);             // i32.and
+}
+#define I32_XOR 0x73
+// push i32 (1 if jcc condition `cc` is taken), from FL. cc 10/11 (P/NP, lazy
+// parity) are excluded by the caller. CF=bit0 ZF=6 SF=7 OF=11.
+static void EmitCond(struct Buf *b, int cc) {
+  switch (cc) {
+    case 0: EmitBit(b, 11); break;                                  // JO
+    case 1: EmitBit(b, 11); EConstI(b, 1); bput(b, I32_XOR); break; // JNO
+    case 2: EmitBit(b, 0); break;                                   // JB
+    case 3: EmitBit(b, 0); EConstI(b, 1); bput(b, I32_XOR); break;  // JAE
+    case 4: EmitBit(b, 6); break;                                   // JE
+    case 5: EmitBit(b, 6); EConstI(b, 1); bput(b, I32_XOR); break;  // JNE
+    case 6: EmitBit(b, 0); EmitBit(b, 6); bput(b, I32_OR); break;   // JBE CF|ZF
+    case 7: EmitBit(b, 0); EmitBit(b, 6); bput(b, I32_OR);
+            EConstI(b, 1); bput(b, I32_XOR); break;                 // JA !(CF|ZF)
+    case 8: EmitBit(b, 7); break;                                   // JS
+    case 9: EmitBit(b, 7); EConstI(b, 1); bput(b, I32_XOR); break;  // JNS
+    case 12: EmitBit(b, 7); EmitBit(b, 11); bput(b, I32_XOR); break;  // JL SF^OF
+    case 13: EmitBit(b, 7); EmitBit(b, 11); bput(b, I32_XOR);
+             EConstI(b, 1); bput(b, I32_XOR); break;                  // JGE
+    case 14: EmitBit(b, 6); EmitBit(b, 7); EmitBit(b, 11);
+             bput(b, I32_XOR); bput(b, I32_OR); break;                // JLE ZF|(SF^OF)
+    default: EmitBit(b, 6); EmitBit(b, 7); EmitBit(b, 11);           // JG (15)
+             bput(b, I32_XOR); bput(b, I32_OR);
+             EConstI(b, 1); bput(b, I32_XOR); break;
+  }
+}
+
 // dst = kAlu[t][log2](m, dst, y); y is GPR src or (imm) immediate.
 static void EmitAlu(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
                     int src, bool imm, u64 immv, bool wb) {
@@ -288,7 +327,8 @@ static const u8 kBin[8] = {I64_ADD, I64_OR, 0, 0, I64_AND, I64_SUB, I64_XOR,
 // flags local FL. Used for add/or/and/sub/xor/cmp/test (not adc/sbb). LT0=x,
 // LT1=y, LT2=z; operands masked to width so the 32/64-bit paths share formulas.
 static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
-                          int src, bool imm, u64 immv, bool wb, bool keepcf) {
+                          int src, bool imm, u64 immv, bool wb, bool keepcf,
+                          int needed) {
   bool w32 = (log2 == 2);
   i64 mask = w32 ? (i64)0xffffffffLL : (i64)-1;
   int signsh = w32 ? 31 : 63;
@@ -316,6 +356,8 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT2);
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
+  // DEAD-FLAG ELIMINATION: skip entirely if no downstream reader needs them.
+  if (needed) {
   FlagsEnsure(b, rc);
   EGet(b, FL);
   EConstI(b, keep);
@@ -354,6 +396,7 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   EConstI(b, 24); EBin(b, I32_SHL); EBin(b, I32_OR);
   ESet(b, FL);
   rc->fl_dirty = 1;
+  }  // if (needed)
   if (wb) {
     EGet(b, LT2);
     ESet(b, LOC_GPR + dst);
@@ -375,6 +418,57 @@ static void EmitMov(struct Buf *b, struct Rc *rc, int dst, int src, bool imm,
   ESet(b, LOC_GPR + dst);
   rc->loaded[dst] = 1;
   rc->dirty[dst] = 1;
+}
+
+// dst = disp + base + (index << scale), address-arithmetic only (no flags,
+// no memory access). This is `lea`, which gcc emits pervasively as a cheap
+// 3-operand add/shift. RIP-relative folds to a compile-time constant.
+static void EmitLea(struct Buf *b, struct Rc *rc, int dst, int base, int index,
+                    int scale, i64 dispv, bool hasBase, bool hasIndex,
+                    bool riprel, bool legacy, int log2, u64 pc_next) {
+  EConst(b, dispv + (riprel ? (i64)pc_next : 0));  // disp (+ rip)
+  if (hasBase) { RcLoad(b, rc, base); EGet(b, LOC_GPR + base); EBin(b, I64_ADD); }
+  if (hasIndex) {
+    RcLoad(b, rc, index);
+    EGet(b, LOC_GPR + index);
+    if (scale) { EConst(b, (i64)scale); EBin(b, I64_SHL); }
+    EBin(b, I64_ADD);
+  }
+  if (legacy) { EConst(b, (i64)0xffffffff); EBin(b, I64_AND); }  // 32-bit addr
+  if (log2 == 2) { EConst(b, (i64)0xffffffff); EBin(b, I64_AND); }  // 32-bit dst ze
+  ESet(b, LOC_GPR + dst);
+  rc->loaded[dst] = 1;
+  rc->dirty[dst] = 1;
+}
+
+// Decide if this insn is an inlinable lea with a 32/64-bit dst and non-16-bit
+// addressing. Fills the address components. 16-bit dst/addr -> fallback.
+static bool LeaDecode(nexgen32e_f h, u64 rde, i64 disp, int *dst, int *base,
+                      int *index, int *scale, i64 *dispv, bool *hasBase,
+                      bool *hasIndex, bool *riprel, bool *legacy, int *log2) {
+  if (h != OpLeaGvqpM) return false;
+  int lg = RegLog2(rde);
+  if (lg != 2 && lg != 3) return false;      // 16-bit dst preserves upper: fallback
+  int eam = Eamode(rde);
+  if (eam == XED_MODE_REAL) return false;    // 16-bit addressing: fallback
+  *legacy = (eam == XED_MODE_LEGACY);
+  *log2 = lg;
+  *dst = (int)RexrReg(rde);
+  *dispv = disp;
+  *base = *index = *scale = 0;
+  *hasBase = *hasIndex = *riprel = false;
+  if (!SibExists(rde)) {
+    if (IsRipRelative(rde)) *riprel = true;
+    else { *hasBase = true; *base = (int)RexbRm(rde); }
+  } else {
+    if (SibHasBase(rde)) { *hasBase = true; *base = (int)RexbBase(rde); }
+    if (SibHasIndex(rde)) {
+      *hasIndex = true;
+      *index = (int)(Rexx(rde) << 3 | SibIndex(rde));
+      *scale = (int)SibScale(rde);
+    }
+  }
+  return true;
 }
 
 // Decide if this insn is an inlinable register-direct 32/64-bit mov.
@@ -437,16 +531,130 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
   return false;
 }
 
+// A block whose ONLY control transfer is a backward Jcc to its own start, with
+// an all-inline body, is emitted as a wasm `loop` that iterates entirely in wasm
+// (the engine JITs it to ~native) instead of returning to the C dispatcher each
+// iteration. Returns true and fills bb/rc if it emitted one.
+static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
+                         struct Rc *rc) {
+  struct XedDecodedInst x;
+  u64 pc = ip;
+  u16 regs = 0;
+  int cc = -1;
+  u64 fall = 0;
+  bool ok = true;
+  int n;
+  for (n = 0; n < PKJIT_MAXINSN; ++n) {  // pre-pass: detect + collect regs
+    if (GetInstruction(m, pc, &x)) { ok = false; break; }
+    u64 rde = x.op.rde;
+    u32 ol = Oplength(rde);
+    if (!ol) { ok = false; break; }
+    nexgen32e_f h = GetOp(Mopcode(rde));
+    u64 pcn = pc + ol;
+    if (h == OpJcc) {  // terminator
+      int c = (int)(Opcode(rde) & 15);
+      if (c == 0xa || c == 0xb) ok = false;  // JP/JNP need lazy parity
+      else if (n > 0 && (u64)(pcn + x.op.disp) == ip) { cc = c; fall = pcn; }
+      else ok = false;
+      break;
+    }
+    int t, lg, d, s;
+    bool im, w;
+    u64 iv;
+    int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
+    if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
+      regs |= 1u << d; if (!im) regs |= 1u << s;
+    } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
+      regs |= 1u << d; if (!im) regs |= 1u << s;
+    } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
+                         &lrp, &llg, &lg)) {
+      regs |= 1u << d;
+      if (lhb) regs |= 1u << lb;
+      if (lhi) regs |= 1u << li;
+    } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
+               (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
+      regs |= 1u << (int)RexbRm(rde);
+    } else { ok = false; break; }
+    pc = pcn;
+  }
+  if (!ok || cc < 0) return false;
+
+  // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
+  for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
+  FlagsEnsure(bb, rc);
+  bput(bb, 0x02); bput(bb, 0x40);  // block $B
+  bput(bb, 0x03); bput(bb, 0x40);  // loop $L
+  // attention check at loop top: if (m->attention) { m->ip = ip; exit }
+  EGet(bb, 0); bput(bb, 0x2d); bleb_u(bb, 0); bleb_u(bb, OFF_ATT);  // i32.load8_u
+  bput(bb, 0x04); bput(bb, 0x40);  // if
+  EGet(bb, 0); EConst(bb, (i64)ip); EStore(bb, OFF_IP);
+  bput(bb, 0x0c); bleb_u(bb, 2);   // br 2 -> after block
+  bput(bb, 0x0b);                  // end if
+  // body (re-decode; RcLoad now no-ops since pre-loaded)
+  pc = ip;
+  for (;;) {
+    GetInstruction(m, pc, &x);
+    u64 rde = x.op.rde;
+    u32 ol = Oplength(rde);
+    nexgen32e_f h = GetOp(Mopcode(rde));
+    if (h == OpJcc) break;
+    int t, lg, d, s;
+    bool im, w;
+    u64 iv;
+    int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
+    if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
+      int need = GetNeededFlags(m, pc + ol, CF | ZF | SF | OF | AF | PF);
+      if (t == 2 || t == 3) EmitAlu(bb, rc, t, lg, d, s, im, iv, w);
+      else EmitAluInline(bb, rc, t, lg, d, s, im, iv, w, false, need);
+    } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
+      EmitMov(bb, rc, d, s, im, iv, lg);
+    } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
+                         &lrp, &llg, &lg)) {
+      EmitLea(bb, rc, d, lb, li, lsc, ldv, lhb, lhi, lrp, llg, lg, pc + ol);
+    } else {
+      EmitAlu(bb, rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
+              (int)RexbRm(rde), 0, true, 0, true);
+    }
+    pc += ol;
+  }
+  // condition: loop back if the jcc is taken
+  FlagsEnsure(bb, rc);
+  EmitCond(bb, cc);
+  bput(bb, 0x0d); bleb_u(bb, 0);   // br_if 0 -> loop $L
+  // not taken: m->ip = fall-through, exit
+  EGet(bb, 0); EConst(bb, (i64)fall); EStore(bb, OFF_IP);
+  bput(bb, 0x0c); bleb_u(bb, 1);   // br 1 -> after block
+  bput(bb, 0x0b);                  // end loop
+  bput(bb, 0x0b);                  // end block
+  RcSpill(bb, rc);                 // postamble: flush cache to memory
+  t_wasloop = 1;
+  return true;
+}
+
 static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) {
   if (!t_scratch && !(t_scratch = (u8 *)malloc(PKJIT_SCRATCH))) return false;
   struct Buf bb = {t_scratch, 0, PKJIT_SCRATCH, 0};
   struct Rc rc;
   RcInval(&rc);
+  t_wasloop = 0;
   struct XedDecodedInst xedd;
   u64 pc = ip;
   int count = 0;
   bool ip_dirty = false;   // true if m->ip != pc (an inline op advanced pc)
   bool terminated = false;
+  // SELF-LOOP is a WIP: it compiles a hot backward-Jcc loop into a single wasm
+  // `loop` that iterates entirely in wasm (the path to ~native speed). The emitted
+  // module is provably correct in isolation (verified: instantiate + call via
+  // call_indirect reproduces the exact loop result), but blink traps ("unreachable"
+  // in Actor) the SECOND time a self-loop runs in a multi-function guest - a deep
+  // blink/V8 runtime interaction not reproducible outside blink. Gated OFF until
+  // root-caused; the linear path below is correct and already inlines lea/ALU/mov.
+  // Enable with -DPKJIT_SELFLOOP to iterate on it. See memory x86-wasm-jit.
+#ifdef PKJIT_SELFLOOP
+  if (EmitSelfLoop(m, ip, &bb, &rc)) goto assemble;
+#else
+  (void)EmitSelfLoop;
+#endif
   for (; count < PKJIT_MAXINSN; ++count) {
     if (GetInstruction(m, pc, &xedd)) break;
     u64 rde = xedd.op.rde;
@@ -457,14 +665,22 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     int t, log2, dst, src;
     bool imm, wb;
     u64 immv;
+    int lbase, lindex, lscale; i64 ldispv; bool lhb, lhi, lrip, lleg;
     if (AluDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
                   &wb)) {
+      // pc is already past this insn; skip flag emission if all flags are dead.
+      int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
       if (t == 2 || t == 3) EmitAlu(&bb, &rc, t, log2, dst, src, imm, immv, wb);
-      else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb, false);
+      else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb, false, need);
       ip_dirty = true;  // inline op: m->ip not updated
     } else if (MovDecode(h, rde, xedd.op.uimm0, &dst, &src, &imm, &immv,
                          &log2)) {
       EmitMov(&bb, &rc, dst, src, imm, immv, log2);
+      ip_dirty = true;
+    } else if (LeaDecode(h, rde, xedd.op.disp, &dst, &lbase, &lindex, &lscale,
+                         &ldispv, &lhb, &lhi, &lrip, &lleg, &log2)) {
+      EmitLea(&bb, &rc, dst, lbase, lindex, lscale, ldispv, lhb, lhi, lrip, lleg,
+              log2, pc);  // pc already advanced past this insn = rip base
       ip_dirty = true;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
@@ -496,9 +712,10 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   if (!terminated) {  // finalize: flush cache + set m->ip to the fall-through
     RcSpill(&bb, &rc);
     if (ip_dirty) { EGet(&bb, 0); EConst(&bb, (i64)pc); EStore(&bb, OFF_IP); }
-    if (bb.ovf) return false;
   }
 
+assemble:
+  if (bb.ovf) return false;
   u32 body_len = 5 + bb.n + 1;  // locals(02 14 7e 01 7f) + instrs + end
   u32 content_len = 1 + leb_u_size(body_len) + body_len;
   u32 total = (u32)sizeof(kPrefix) + 1 + leb_u_size(content_len) + content_len;
@@ -607,7 +824,7 @@ nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
   s->gen = curgen;
   atomic_store_explicit(&s->state, kReady, memory_order_release);
   u32 seq = atomic_fetch_add_explicit(&g_emits, 1, memory_order_relaxed) + 1;
-  return InstantiateLocal(s, ip, curgen, (int)seq);
+  return InstantiateLocal(s, ip, curgen, t_wasloop ? -(int)seq : (int)seq);
 }
 
 #endif  // HAVE_WASM_JIT
