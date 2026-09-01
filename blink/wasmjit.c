@@ -345,6 +345,50 @@ static void EmitBsu(struct Buf *b, struct Rc *rc, int op, int log2, int dst,
   rc->fl_loaded = 0;            // kBsu wrote m->flags; FL cache stale
 }
 
+#define I64_SHRS 0x87
+#define I64_ROTL 0x89
+#define I64_ROTR 0x8a
+
+// Inline shift/rotate as a pure wasm op - VALUE semantics only, so the caller
+// must confirm ALL flags are dead downstream (x86 shifts touch CF/OF/ZF/SF/PF
+// and leave them unchanged for count==0; with dead flags only the value
+// matters). RCL/RCR are excluded (value reads CF); 32-bit rotates excluded
+// (no cheap 32-in-64 rotate). Count masks &63/&31 exactly like x86.
+static void EmitBsuInline(struct Buf *b, struct Rc *rc, int op, int log2,
+                          int dst, bool imm, u64 immv) {
+  bool w32 = (log2 == 2);
+  i64 cmask = w32 ? 31 : 63;
+  RcLoad(b, rc, dst);
+  if (!imm) RcLoad(b, rc, 1);  // CL = RCX low bits
+  // value operand
+  EGet(b, LOC_GPR + dst);
+  if (w32) {
+    if (op == 7) {  // SAR: sign-extend low 32 first
+      EConst(b, 32); EBin(b, I64_SHL);
+      EConst(b, 32); EBin(b, I64_SHRS);
+    } else {
+      EConst(b, 0xffffffff); EBin(b, I64_AND);
+    }
+  }
+  // count operand (masked)
+  if (imm) {
+    EConst(b, (i64)(immv & (u64)cmask));
+  } else {
+    EGet(b, LOC_GPR + 1); EConst(b, cmask); EBin(b, I64_AND);
+  }
+  switch (op) {
+    case 0: EBin(b, I64_ROTL); break;              // rol (64-bit only)
+    case 1: EBin(b, I64_ROTR); break;              // ror (64-bit only)
+    case 5: EBin(b, I64_SHRU); break;              // shr
+    case 7: EBin(b, I64_SHRS); break;              // sar
+    default: EBin(b, I64_SHL); break;              // shl/sal (4/6)
+  }
+  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }  // 32-bit zero-extend
+  ESet(b, LOC_GPR + dst);
+  rc->loaded[dst] = 1;
+  rc->dirty[dst] = 1;
+}
+
 // Decide if this insn is an inlinable register-direct 32/64-bit shift/rotate.
 static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
                       int *dst, bool *imm, u64 *immv) {
@@ -641,7 +685,8 @@ struct SlOp {
   i64 ldv;                        // lea displacement
   u64 pcn;                        // pc after this insn (lea rip base)
 };
-enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea, kSlBsu, kSlImul };
+enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea, kSlBsu, kSlBsuInline,
+       kSlImul };
 #define PKJIT_SLMAX 48  // self-loop insn cap (hot loops are short; bounds ops[])
 
 static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
@@ -695,7 +740,13 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       if (lhb) regs |= 1u << lb;
       if (lhi) regs |= 1u << li;
     } else if (BsuDecode(h, rde, x.op.uimm0, &t, &lg, &d, &im, &iv)) {
-      o->kind = kSlBsu;  // shift/rotate via kBsu leaf (exact flags)
+      // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
+      if (!GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF) &&
+          t != 2 && t != 3 && (lg == 3 || t >= 4)) {
+        o->kind = kSlBsuInline;
+      } else {
+        o->kind = kSlBsu;  // exact flags via kBsu leaf
+      }
       o->t = t; o->lg = lg; o->d = d; o->im = im; o->iv = iv;
       regs |= 1u << d;
       if (!im) regs |= 1u << 1;  // CL form reads RCX
@@ -749,6 +800,9 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
         break;
       case kSlBsu:
         EmitBsu(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
+        break;
+      case kSlBsuInline:
+        EmitBsuInline(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
         break;
       case kSlImul:
         EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg);
@@ -825,7 +879,13 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
               log2, pc);  // pc already advanced past this insn = rip base
       ip_dirty = true;
     } else if (BsuDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &imm, &immv)) {
-      EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+      // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
+      if (!GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF) &&
+          t != 2 && t != 3 && (log2 == 3 || t >= 4)) {
+        EmitBsuInline(&bb, &rc, t, log2, dst, imm, immv);
+      } else {
+        EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+      }
       ip_dirty = true;
     } else if (ImulDecode(h, rde, xedd.op.uimm0, &dst, &iareg, &ibreg, &imm,
                           &immv, &log2) &&
