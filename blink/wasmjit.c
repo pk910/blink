@@ -187,9 +187,12 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
 #define I64_WRAP 0xa7
+#define I64_SHRS 0x87
+#define I64_NE  0x52
 #define I32_OR  0x72
 #define I32_AND 0x71
 #define I32_SHL 0x74
+#define I32_MUL 0x6c
 
 // ── register cache ──────────────────────────────────────────────────────────
 struct Rc {
@@ -360,32 +363,102 @@ static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
   return true;
 }
 
-// dst = areg * (breg | imm), low bits only. Inlined ONLY when CF/OF are dead
-// (imul's only defined flags); i64.mul gives the low 64 = the x86 imul result.
-// 32-bit masks operands + result (imul r32 zero-extends into r64).
+// dst = areg * (breg | imm), low bits only; 32-bit masks operands + result
+// (imul r32 zero-extends into r64). When `need`, also produce imul's EXACT
+// blink flags (divmul.c AluImul): CF = OF = signed-overflow of the product,
+// every other flag (incl. lazy parity byte) untouched. 32-bit overflow test is
+// z != (i64)(i32)z on the exact 64-bit product of sign-extended operands; the
+// 64-bit test needs the high half, computed from four 32-bit partial products
+// (mulhu, then the Hacker's Delight signed adjustment), then hs != lo>>s63.
 static void EmitImul(struct Buf *b, struct Rc *rc, int dst, int areg, int breg,
-                     bool bimm, u64 immv, int log2) {
+                     bool bimm, u64 immv, int log2, int need) {
   bool w32 = (log2 == 2);
-  RcLoad(b, rc, areg);
-  EGet(b, LOC_GPR + areg);
-  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
-  if (bimm) {
-    EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
-  } else {
-    RcLoad(b, rc, breg);
-    EGet(b, LOC_GPR + breg);
+  if (!need) {  // CF/OF dead: lean path, no flag work
+    RcLoad(b, rc, areg);
+    EGet(b, LOC_GPR + areg);
     if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    if (bimm) {
+      EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
+    } else {
+      RcLoad(b, rc, breg);
+      EGet(b, LOC_GPR + breg);
+      if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    }
+    EBin(b, I64_MUL);
+    if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    ESet(b, LOC_GPR + dst);
+    rc->loaded[dst] = 1;
+    rc->dirty[dst] = 1;
+    return;
   }
-  EBin(b, I64_MUL);
+  RcLoad(b, rc, areg);
+  if (!bimm) RcLoad(b, rc, breg);
+  FlagsEnsure(b, rc);
+  // LT0 = a, LT1 = b|imm (sign-extended for 32-bit so the i64 product is exact)
+  EGet(b, LOC_GPR + areg);
+  if (w32) { EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS); }
+  ESet(b, LT0);
+  if (bimm) {
+    EConst(b, w32 ? (i64)(i32)immv : (i64)immv);  // blink Load32+(i32) sign-ext
+  } else {
+    EGet(b, LOC_GPR + breg);
+    if (w32) { EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS); }
+  }
+  ESet(b, LT1);
+  // LT2 = low product ; dst = LT2 (32-bit: zero-extend low half)
+  EGet(b, LT0); EGet(b, LT1); EBin(b, I64_MUL); ESet(b, LT2);
+  EGet(b, LT2);
   if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
   ESet(b, LOC_GPR + dst);
   rc->loaded[dst] = 1;
   rc->dirty[dst] = 1;
+  // FL = (FL & ~(CF|OF)) | of * 0x801
+  EGet(b, FL); EConstI(b, ~0x801); EBin(b, I32_AND);
+  if (w32) {
+    // of = LT2 != (i64)(i32)LT2
+    EGet(b, LT2);
+    EGet(b, LT2); EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS);
+    EBin(b, I64_NE);
+  } else {
+    // LT3 = u = a1*b0 + ((a0*b0) >> 32)   (all partials < 2^64, no overflow)
+    EGet(b, LT0); EConst(b, 32); EBin(b, I64_SHRU);
+    EGet(b, LT1); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_MUL);
+    EGet(b, LT0); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EGet(b, LT1); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_MUL); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD); ESet(b, LT3);
+    // hi(unsigned) = a1*b1 + (u >> 32) + ((a0*b1 + (u & 0xffffffff)) >> 32)
+    EGet(b, LT0); EConst(b, 32); EBin(b, I64_SHRU);
+    EGet(b, LT1); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_MUL);
+    EGet(b, LT3); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD);
+    EGet(b, LT0); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EGet(b, LT1); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_MUL);
+    EGet(b, LT3); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_ADD); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD);
+    // hi(signed) = hi - ((a>>s63)&b) - ((b>>s63)&a)
+    EGet(b, LT0); EConst(b, 63); EBin(b, I64_SHRS);
+    EGet(b, LT1); EBin(b, I64_AND);
+    EBin(b, I64_SUB);
+    EGet(b, LT1); EConst(b, 63); EBin(b, I64_SHRS);
+    EGet(b, LT0); EBin(b, I64_AND);
+    EBin(b, I64_SUB);
+    // of = hs != (lo >>s 63)
+    EGet(b, LT2); EConst(b, 63); EBin(b, I64_SHRS);
+    EBin(b, I64_NE);
+  }
+  EConstI(b, 0x801); EBin(b, I32_MUL);
+  EBin(b, I32_OR);
+  ESet(b, FL);
+  rc->fl_dirty = 1;
 }
 
 // Decide if this insn is an inlinable register-direct 32/64-bit imul. Two forms:
-// OpImulGvqpEvqp reg=reg*rm ; OpImulGvqpEvqpImm reg=rm*imm. Only the low result
-// is produced, so the caller must confirm CF/OF are dead before using this.
+// OpImulGvqpEvqp reg=reg*rm ; OpImulGvqpEvqpImm reg=rm*imm.
 static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
                        int *breg, bool *bimm, u64 *immv, int *log2) {
   int lg = RegLog2(rde);
@@ -771,9 +844,10 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
       EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
       ip_dirty = true;
     } else if (ImulDecode(h, rde, xedd.op.uimm0, &dst, &iareg, &ibreg, &imm,
-                          &immv, &log2) &&
-               !GetNeededFlags(m, pc, CF | OF)) {
-      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2);  // CF/OF dead
+                          &immv, &log2)) {
+      // exact CF/OF emitted only if a downstream reader needs them
+      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2,
+               GetNeededFlags(m, pc, CF | OF));
       ip_dirty = true;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
