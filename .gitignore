@@ -18,3 +18,4 @@ blink.log
 /perf.data.old
 /third_party/cosmo/**/*.com
 /third_party/cosmo/**/*.dbg
+blink-node-prejs.js
