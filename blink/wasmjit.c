@@ -70,6 +70,10 @@ void Op0f6(P);          // group3 byte: test/not/neg/mul/div rm8
 void Op0f7(P);          // group3: test/not/neg/mul/div rm16/32/64
 void Op0fe(P);          // inc/dec rm8
 void Op0ff(P);          // group5: inc/dec/call/jmp/push rm
+void OpBsubiImm(P);     // shift/rotate rm8, imm
+void OpBsubi1(P);       // shift/rotate rm8, 1
+void OpBsubiCl(P);      // shift/rotate rm8, cl
+void OpBsuwi1(P);       // shift/rotate rm16/32/64, 1
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -757,6 +761,30 @@ static void EmitMovx(struct Buf *b, struct Rc *rc, int dlog2, int dr, int sr,
   EWriteSub(b, rc, dr, 0, dlog2);
 }
 
+// dst.sub = kBsu[op][log2](m, dst.sub, count) with byte/word merge writeback.
+// Like EmitBsu but for the widths/forms it doesn't cover. count is imm or CL;
+// the leaf applies the x86 count mask itself. RCL/RCR read CF (spill first).
+static void EmitBsuSub(struct Buf *b, struct Rc *rc, int op, int log2, int dr,
+                       int dsh, bool imm, u64 immv) {
+  RcLoad(b, rc, dr);
+  if (!imm) RcLoad(b, rc, 1);   // CL = rcx low byte
+  FlagsSpill(b, rc);
+  EGet(b, 0);                   // m
+  EGet(b, LOC_GPR + dr);        // value (leaf truncates to width)
+  if (dsh) { EConst(b, dsh); EBin(b, I64_SHRU); }
+  if (imm) {
+    EConst(b, (i64)immv);
+  } else {
+    EGet(b, LOC_GPR + 1); EConst(b, 0xff); EBin(b, I64_AND);
+  }
+  u32 fidx = (u32)(uintptr_t)kBsu[op][log2];
+  bput(b, 0x41); bleb_s(b, (i64)(i32)fidx);    // i32.const kBsu fn idx
+  bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 -> i64
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, dsh, log2);
+  rc->fl_loaded = 0;            // kBsu wrote m->flags; FL cache stale
+}
+
 // setcc: dst byte = (cc taken), via EmitCond's FL bit logic. No flags written.
 static void EmitSetcc(struct Buf *b, struct Rc *rc, int cc, int dr, int dsh) {
   FlagsEnsure(b, rc);
@@ -878,6 +906,21 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
       EmitAluSub(b, rc, ALU_NEG, lg, dr, dsh, 0, 0, true, 0, true);
     else  // 0/1: test rm, imm - flags only
       EmitAluSub(b, rc, ALU_AND, lg, dr, dsh, 0, 0, true, uimm0, false);
+    return true;
+  }
+  // shifts/rotates: byte, by-1 and word forms via kBsu leaf (the 32/64-bit
+  // imm/cl forms go through BsuDecode's EmitBsu instead)
+  if ((h == OpBsubiImm || h == OpBsubi1 || h == OpBsubiCl) &&
+      IsModrmRegister(rde)) {
+    dr = ByteRegOf((int)RexRexb(rde), &dsh);
+    EmitBsuSub(b, rc, (int)ModrmReg(rde), 0, dr, dsh, h != OpBsubiCl,
+               h == OpBsubi1 ? 1 : uimm0);
+    return true;
+  }
+  if ((h == OpBsuwi1 || ((h == OpBsuwiImm || h == OpBsuwiCl) && lg == 1)) &&
+      IsModrmRegister(rde)) {
+    EmitBsuSub(b, rc, (int)ModrmReg(rde), lg, (int)RexbRm(rde), 0,
+               h != OpBsuwiCl, h == OpBsuwi1 ? 1 : uimm0);
     return true;
   }
   // inc/dec rm (fe/ff; ff /2../7 call/jmp/push -> fallback)

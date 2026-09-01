@@ -736,7 +736,7 @@ static void BsuwiConstant(P, u64 y) {
   }
 }
 
-static void OpBsuwi1(P) {
+void OpBsuwi1(P) {  // pk910: extern for wasmjit inline
   BsuwiConstant(A, 1);
 }
 
@@ -751,7 +751,7 @@ static aluop_f Bsubi(P, u64 y) {
   return op;
 }
 
-static void OpBsubiCl(P) {
+void OpBsubiCl(P) {  // pk910: extern for wasmjit inline
   aluop_f op;
   op = Bsubi(A, m->cl);
   if (IsMakingPath(m)) {
@@ -783,11 +783,11 @@ static void BsubiConstant(P, u64 y) {
   }
 }
 
-static void OpBsubi1(P) {
+void OpBsubi1(P) {  // pk910: extern for wasmjit inline
   BsubiConstant(A, 1);
 }
 
-static void OpBsubiImm(P) {
+void OpBsubiImm(P) {  // pk910: extern for wasmjit inline
   BsubiConstant(A, uimm0);
 }
 
