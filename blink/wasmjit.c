@@ -694,6 +694,18 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       regs |= 1u << d;
       if (lhb) regs |= 1u << lb;
       if (lhi) regs |= 1u << li;
+    } else if (BsuDecode(h, rde, x.op.uimm0, &t, &lg, &d, &im, &iv)) {
+      o->kind = kSlBsu;  // shift/rotate via kBsu leaf (exact flags)
+      o->t = t; o->lg = lg; o->d = d; o->im = im; o->iv = iv;
+      regs |= 1u << d;
+      if (!im) regs |= 1u << 1;  // CL form reads RCX
+    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg) &&
+               !GetNeededFlags(m, (i64)pcn, CF | OF)) {
+      o->kind = kSlImul;  // imul low result; CF/OF (its only flags) are dead
+      o->d = d; o->s = s; o->b = lb; o->im = im; o->iv = iv; o->lg = lg;
+      regs |= 1u << d;
+      regs |= 1u << s;
+      if (!im) regs |= 1u << lb;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
       // inc/dec via kAlu[10/11](x,0): exact flags (AF=0, CF preserved)
@@ -734,6 +746,12 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
         break;
       case kSlMov:
         EmitMov(bb, rc, o->d, o->s, o->im, o->iv, o->lg);
+        break;
+      case kSlBsu:
+        EmitBsu(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
+        break;
+      case kSlImul:
+        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg);
         break;
       default:  // kSlLea
         EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
