@@ -263,6 +263,13 @@
 #define HAVE_JIT
 #endif
 
+// pk910: the wasm host has no native JIT (HAVE_JIT above is arch-gated off), so
+// it uses the runtime x86 -> WebAssembly recompiler in wasmjit.c instead. See
+// ai_plans/wasm-jit.md. Disable at runtime with BLINK_WASMJIT=0.
+#if defined(__EMSCRIPTEN__) && !defined(HAVE_JIT) && !defined(DISABLE_WASM_JIT)
+#define HAVE_WASM_JIT
+#endif
+
 #if defined(HAVE_JIT) && defined(__GNUC__) && !defined(__SANITIZE_ADDRESS__)
 #ifndef __OPTIMIZE__
 #define TRIVIALLY_RELOCATABLE \

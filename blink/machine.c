@@ -118,7 +118,7 @@ static void OpLeaGvqpM(P) {
   }
 }
 
-static void OpMovEvqpGvqp(P) {
+void OpMovEvqpGvqp(P) {  // pk910: extern for wasmjit inline mov
   WriteRegisterOrMemory(rde, GetModrmRegisterWordPointerWriteOszRexw(A),
                         ReadRegister(rde, RegRexrReg(m, rde)));
   if (IsMakingPath(m)) {
@@ -127,7 +127,7 @@ static void OpMovEvqpGvqp(P) {
   }
 }
 
-static void OpMovGvqpEvqp(P) {
+void OpMovGvqpEvqp(P) {  // pk910: extern for wasmjit inline mov
   WriteRegister(rde, RegRexrReg(m, rde),
                 ReadMemory(rde, GetModrmRegisterWordPointerReadOszRexw(A)));
   if (IsMakingPath(m)) {
@@ -394,7 +394,7 @@ static void OpMovZbIb(P) {
   }
 }
 
-static void OpMovZvqpIvqp(P) {
+void OpMovZvqpIvqp(P) {  // pk910: extern for wasmjit inline mov
   WriteRegister(rde, RegRexbSrm(m, rde), uimm0);
   if (IsMakingPath(m)) {
     if (!Rexw(rde) && !Osz(rde)) {
@@ -489,7 +489,7 @@ static void AluRo(P, const aluop_f ops[4], const aluop_f fops[4]) {
   }
 }
 
-static void OpAluTest(P) {
+void OpAluTest(P) {  // pk910: extern for wasmjit inline ALU
   if (IsMakingPath(m) && FuseBranchTest(A)) {
     kAlu[ALU_AND][RegLog2(rde)](
         m, ReadRegisterOrMemoryBW(rde, GetModrmReadBW(A)),
@@ -500,7 +500,7 @@ static void OpAluTest(P) {
   AluRo(A, kAlu[ALU_AND], kAluFast[ALU_AND]);
 }
 
-static void OpAluCmp(P) {
+void OpAluCmp(P) {  // pk910: extern for wasmjit inline ALU
   if (IsMakingPath(m) && FuseBranchCmp(A, false)) {
     kAlu[ALU_SUB][RegLog2(rde)](
         m, ReadRegisterOrMemoryBW(rde, GetModrmReadBW(A)),
@@ -511,7 +511,7 @@ static void OpAluCmp(P) {
   AluRo(A, kAlu[ALU_SUB], kAluFast[ALU_SUB]);
 }
 
-static void OpAluFlip(P) {
+void OpAluFlip(P) {  // pk910: extern for wasmjit inline ALU
   aluop_f op = kAlu[(Opcode(rde) & 070) >> 3][RegLog2(rde)];
   u8 *q = RegLog2(rde) ? RegRexrReg(m, rde) : ByteRexrReg(m, rde);
   WriteRegisterBW(rde, q,
@@ -548,7 +548,7 @@ static void OpAluFlip(P) {
   }
 }
 
-static void OpAluFlipCmp(P) {
+void OpAluFlipCmp(P) {  // pk910: extern for wasmjit inline ALU
   aluop_f op = kAlu[ALU_SUB][RegLog2(rde)];
   u8 *q = RegLog2(rde) ? RegRexrReg(m, rde) : ByteRexrReg(m, rde);
   op(m, ReadRegisterBW(rde, q), ReadRegisterOrMemoryBW(rde, GetModrmReadBW(A)));
@@ -2181,6 +2181,10 @@ static void GeneralDispatch(P) {
 #endif
 }
 
+#ifdef HAVE_WASM_JIT
+nexgen32e_f WasmJitLookup(struct Machine *, u64);  // pk910: wasmjit.c
+#endif
+
 void ExecuteInstruction(struct Machine *m) {
 #if LOG_CPU
   LogCpu(m);
@@ -2225,6 +2229,18 @@ void ExecuteInstruction(struct Machine *m) {
   } else {
     JitlessDispatch(DISPATCH_NOTHING);
   }
+#elif defined(HAVE_WASM_JIT)
+  // M3: chain compiled blocks directly instead of returning to Actor between
+  // each (each block sets m->ip and returns; we re-dispatch the next in a tight
+  // loop). Bounded by a budget and an attention check so signals stay responsive.
+  nexgen32e_f func;
+  int budget = 64;
+  while ((func = WasmJitLookup(m, m->ip))) {
+    func(DISPATCH_NOTHING);
+    if (atomic_load_explicit(&m->attention, memory_order_acquire)) return;
+    if (--budget <= 0) return;
+  }
+  JitlessDispatch(DISPATCH_NOTHING);
 #else
   JitlessDispatch(DISPATCH_NOTHING);
 #endif
