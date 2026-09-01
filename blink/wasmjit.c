@@ -465,6 +465,8 @@ static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
   if (lg != 2 && lg != 3) return false;
   if (!IsModrmRegister(rde) || Lock(rde)) return false;  // reg-direct rm only
   *log2 = lg;
+  *breg = 0;   // defined on every true path (see MovDecode)
+  *immv = 0;
   if (h == OpImulGvqpEvqp) {        // reg = reg * rm
     *dst = *areg = (int)RexrReg(rde); *breg = (int)RexbRm(rde); *bimm = false;
     return true;
@@ -634,6 +636,9 @@ static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;
   *log2 = lg;
+  *src = 0;      // every out-param gets a defined value on every true path:
+  *immv = 0;     // callers pass these (by value) into the emitters, and an
+                 // indeterminate value there is poison the optimizer may act on
   if (h == OpMovZvqpIvqp) {  // mov reg, imm
     *dst = (int)RexbSrm(rde); *imm = true; *immv = uimm0;
     return true;
@@ -658,6 +663,8 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;  // only 32/64-bit
   *log2 = lg;
+  *src = 0;    // defined on every true path (see MovDecode)
+  *immv = 0;
   int op = (int)((Opcode(rde) & 070) >> 3);
   int rm = (int)RexbRm(rde), reg = (int)RexrReg(rde);
   if (h == OpAluw) {  // ALU Ev,Gv (add/or/adc/sbb/and/sub/xor), writeback to rm
@@ -692,49 +699,88 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
 // an all-inline body, is emitted as a wasm `loop` that iterates entirely in wasm
 // (the engine JITs it to ~native) instead of returning to the C dispatcher each
 // iteration. Returns true and fills bb/rc if it emitted one.
+//
+// The pre-pass decodes each insn ONCE into ops[] and the emit loop replays the
+// record. (The original re-decoded the stream in a second pass; the duplicated
+// classification let LLVM jump-thread a "can't happen" decode combination into
+// a literal `unreachable` that fired at runtime - see memory x86-wasm-jit.)
+struct SlOp {
+  u8 kind;                        // kSl* below
+  u8 t, lg, d, s, im, w;          // alu/mov: op, width, regs, imm?, writeback?
+  u8 lb, li, lsc, lhb, lhi, lrp, llg;  // lea: base/index/scale/flags
+  int need;                       // alu-inline: flags needed downstream
+  u64 iv;                         // immediate value
+  i64 ldv;                        // lea displacement
+  u64 pcn;                        // pc after this insn (lea rip base)
+};
+enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea };
+#define PKJIT_SLMAX 48  // self-loop insn cap (hot loops are short; bounds ops[])
+
 static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
                          struct Rc *rc) {
   struct XedDecodedInst x;
+  struct SlOp ops[PKJIT_SLMAX];
   u64 pc = ip;
   u16 regs = 0;
   int cc = -1;
   u64 fall = 0;
-  bool ok = true;
-  int n;
-  for (n = 0; n < PKJIT_MAXINSN; ++n) {  // pre-pass: detect + collect regs
-    if (GetInstruction(m, pc, &x)) { ok = false; break; }
+  int n, cnt = 0;
+  for (n = 0; n < PKJIT_SLMAX; ++n) {  // pre-pass: decode + record + collect regs
+    if (GetInstruction(m, pc, &x)) return false;
     u64 rde = x.op.rde;
     u32 ol = Oplength(rde);
-    if (!ol) { ok = false; break; }
+    if (!ol) return false;
     nexgen32e_f h = GetOp(Mopcode(rde));
     u64 pcn = pc + ol;
     if (h == OpJcc) {  // terminator
       int c = (int)(Opcode(rde) & 15);
-      if (c == 0xa || c == 0xb) ok = false;  // JP/JNP need lazy parity
-      else if (n > 0 && (u64)(pcn + x.op.disp) == ip) { cc = c; fall = pcn; }
-      else ok = false;
+      if (c == 0xa || c == 0xb) return false;  // JP/JNP need lazy parity
+      if (!(n > 0 && (u64)(pcn + x.op.disp) == ip)) return false;
+      cc = c;
+      fall = pcn;
       break;
     }
+    struct SlOp *o = &ops[cnt];
+    memset(o, 0, sizeof(*o));
+    o->pcn = pcn;
     int t, lg, d, s;
     bool im, w;
     u64 iv;
     int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
     if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      regs |= 1u << d; if (!im) regs |= 1u << s;
+      o->kind = (t == 2 || t == 3) ? kSlAluCall : kSlAluInline;  // adc/sbb call
+      o->t = t; o->lg = lg; o->d = d; o->s = s; o->im = im; o->w = w; o->iv = iv;
+      o->need = GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF);
+      regs |= 1u << d;
+      if (!im) regs |= 1u << s;
     } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
-      regs |= 1u << d; if (!im) regs |= 1u << s;
+      o->kind = kSlMov;
+      o->d = d; o->s = s; o->im = im; o->iv = iv; o->lg = lg;
+      regs |= 1u << d;
+      if (!im) regs |= 1u << s;
     } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
                          &lrp, &llg, &lg)) {
+      o->kind = kSlLea;
+      o->d = d; o->lb = lb; o->li = li; o->lsc = lsc; o->ldv = ldv;
+      o->lhb = lhb; o->lhi = lhi; o->lrp = lrp; o->llg = llg; o->lg = lg;
       regs |= 1u << d;
       if (lhb) regs |= 1u << lb;
       if (lhi) regs |= 1u << li;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
-      regs |= 1u << (int)RexbRm(rde);
-    } else { ok = false; break; }
+      // inc/dec via kAlu[10/11](x,0): exact flags (AF=0, CF preserved)
+      o->kind = kSlAluCall;
+      o->t = h == OpIncEvqp ? 10 : 11;
+      o->lg = (u8)RegLog2(rde); o->d = (u8)RexbRm(rde);
+      o->im = 1; o->w = 1;
+      regs |= 1u << o->d;
+    } else {
+      return false;
+    }
+    ++cnt;
     pc = pcn;
   }
-  if (!ok || cc < 0) return false;
+  if (cc < 0 || !cnt) return false;
 
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
@@ -747,32 +793,25 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   EGet(bb, 0); EConst(bb, (i64)ip); EStore(bb, OFF_IP);
   bput(bb, 0x0c); bleb_u(bb, 2);   // br 2 -> after block
   bput(bb, 0x0b);                  // end if
-  // body (re-decode; RcLoad now no-ops since pre-loaded)
-  pc = ip;
-  for (;;) {
-    GetInstruction(m, pc, &x);
-    u64 rde = x.op.rde;
-    u32 ol = Oplength(rde);
-    nexgen32e_f h = GetOp(Mopcode(rde));
-    if (h == OpJcc) break;
-    int t, lg, d, s;
-    bool im, w;
-    u64 iv;
-    int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
-    if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      int need = GetNeededFlags(m, pc + ol, CF | ZF | SF | OF | AF | PF);
-      if (t == 2 || t == 3) EmitAlu(bb, rc, t, lg, d, s, im, iv, w);
-      else EmitAluInline(bb, rc, t, lg, d, s, im, iv, w, false, need);
-    } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
-      EmitMov(bb, rc, d, s, im, iv, lg);
-    } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
-                         &lrp, &llg, &lg)) {
-      EmitLea(bb, rc, d, lb, li, lsc, ldv, lhb, lhi, lrp, llg, lg, pc + ol);
-    } else {
-      EmitAlu(bb, rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
-              (int)RexbRm(rde), 0, true, 0, true);
+  // body: replay the recorded ops (RcLoad no-ops since pre-loaded)
+  for (int i = 0; i < cnt; ++i) {
+    struct SlOp *o = &ops[i];
+    switch (o->kind) {
+      case kSlAluCall:
+        EmitAlu(bb, rc, o->t, o->lg, o->d, o->s, o->im, o->iv, o->w);
+        break;
+      case kSlAluInline:
+        EmitAluInline(bb, rc, o->t, o->lg, o->d, o->s, o->im, o->iv, o->w,
+                      false, o->need);
+        break;
+      case kSlMov:
+        EmitMov(bb, rc, o->d, o->s, o->im, o->iv, o->lg);
+        break;
+      default:  // kSlLea
+        EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
+                o->lrp, o->llg, o->lg, o->pcn);
+        break;
     }
-    pc += ol;
   }
   // condition: loop back if the jcc is taken
   FlagsEnsure(bb, rc);
