@@ -633,14 +633,15 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
 // a literal `unreachable` that fired at runtime - see memory x86-wasm-jit.)
 struct SlOp {
   u8 kind;                        // kSl* below
-  u8 t, lg, d, s, im, w;          // alu/mov: op, width, regs, imm?, writeback?
+  u8 t, lg, d, s, im, w;          // alu/mov/bsu: op, width, regs, imm?, writeback?
   u8 lb, li, lsc, lhb, lhi, lrp, llg;  // lea: base/index/scale/flags
+  u8 b;                           // imul: second source reg
   int need;                       // alu-inline: flags needed downstream
   u64 iv;                         // immediate value
   i64 ldv;                        // lea displacement
   u64 pcn;                        // pc after this insn (lea rip base)
 };
-enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea };
+enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea, kSlBsu, kSlImul };
 #define PKJIT_SLMAX 48  // self-loop insn cap (hot loops are short; bounds ops[])
 
 static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
@@ -765,15 +766,14 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   int count = 0;
   bool ip_dirty = false;   // true if m->ip != pc (an inline op advanced pc)
   bool terminated = false;
-  // SELF-LOOP is a WIP: it compiles a hot backward-Jcc loop into a single wasm
-  // `loop` that iterates entirely in wasm (the path to ~native speed). The emitted
-  // module is provably correct in isolation (verified: instantiate + call via
-  // call_indirect reproduces the exact loop result), but blink traps ("unreachable"
-  // in Actor) the SECOND time a self-loop runs in a multi-function guest - a deep
-  // blink/V8 runtime interaction not reproducible outside blink. Gated OFF until
-  // root-caused; the linear path below is correct and already inlines lea/ALU/mov.
-  // Enable with -DPKJIT_SELFLOOP to iterate on it. See memory x86-wasm-jit.
-#ifdef PKJIT_SELFLOOP
+  // SELF-LOOP: a hot backward-Jcc loop with an all-inline body compiles to a
+  // single wasm `loop` that iterates entirely in wasm (~native speed; the alu
+  // bench drops 1059ms -> 16ms). ON by default; -DPKJIT_NO_SELFLOOP disables
+  // for debugging. (The historic 2nd-self-loop "unreachable" crash was
+  // uninit-local poison jump-threaded by -O3 into a literal unreachable in the
+  // old re-decoding body pass - fixed by decode-once replay + defined decode
+  // outs; see memory x86-wasm-jit.)
+#ifndef PKJIT_NO_SELFLOOP
   if (EmitSelfLoop(m, ip, &bb, &rc)) goto assemble;
 #else
   (void)EmitSelfLoop;
