@@ -643,7 +643,7 @@ static void OpTestAxImm(P) {
   OpRoAxImm(A, kAlu[ALU_AND], kAluFast[ALU_AND]);
 }
 
-static void OpBsuwiCl(P) {
+void OpBsuwiCl(P) {  // pk910: extern for wasmjit inline shift
   aluop_f op = kBsu[ModrmReg(rde)][RegLog2(rde)];
   u8 *p = GetModrmRegisterWordPointerWriteOszRexw(A);
   WriteRegisterOrMemory(rde, p, op(m, ReadMemory(rde, p), m->cl));
@@ -740,7 +740,7 @@ static void OpBsuwi1(P) {
   BsuwiConstant(A, 1);
 }
 
-static void OpBsuwiImm(P) {
+void OpBsuwiImm(P) {  // pk910: extern for wasmjit inline shift
   BsuwiConstant(A, uimm0);
 }
 

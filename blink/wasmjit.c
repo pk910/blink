@@ -52,6 +52,8 @@ void OpMovGvqpEvqp(P);  // mov Gv,Ev
 void OpMovZvqpIvqp(P);  // mov Zv,imm
 void OpJcc(P);          // conditional jump (self-loop terminator detection)
 void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
+void OpBsuwiImm(P);    // shift/rotate rm, imm (kBsu leaf)
+void OpBsuwiCl(P);     // shift/rotate rm, cl
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -181,6 +183,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_XOR 0x85
 #define I64_SHRU 0x88
 #define I64_SHL 0x86
+#define I64_MUL 0x7e
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
 #define I64_WRAP 0xa7
@@ -317,6 +320,87 @@ static void EmitAlu(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
     bput(b, 0x1a);  // drop (cmp/test: flags only)
   }
   rc->fl_loaded = 0;  // kAlu wrote m->flags; our FL cache is stale
+}
+
+// rm = kBsu[op][log2](m, rm, count); shift/rotate via blink's own leaf (exact
+// flags incl. the x86 count-masking + undefined-flag quirks). count is imm or CL.
+static void EmitBsu(struct Buf *b, struct Rc *rc, int op, int log2, int dst,
+                    bool imm, u64 immv) {
+  RcLoad(b, rc, dst);
+  if (!imm) RcLoad(b, rc, 1);   // CL = rcx low byte
+  FlagsSpill(b, rc);            // RCL/RCR read CF from m->flags
+  EGet(b, 0);                   // m
+  EGet(b, LOC_GPR + dst);       // value
+  if (imm) {
+    EConst(b, (i64)immv);
+  } else {
+    EGet(b, LOC_GPR + 1); EConst(b, 0xff); EBin(b, I64_AND);  // cl = rcx & 0xff
+  }
+  u32 fidx = (u32)(uintptr_t)kBsu[op][log2];
+  bput(b, 0x41); bleb_s(b, (i64)(i32)fidx);   // i32.const kBsu fn idx
+  bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 table0 -> i64
+  ESet(b, LOC_GPR + dst);       // 32-bit leaf returns zero-extended, so full store ok
+  rc->loaded[dst] = 1;
+  rc->dirty[dst] = 1;
+  rc->fl_loaded = 0;            // kBsu wrote m->flags; FL cache stale
+}
+
+// Decide if this insn is an inlinable register-direct 32/64-bit shift/rotate.
+static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
+                      int *dst, bool *imm, u64 *immv) {
+  if (h != OpBsuwiImm && h != OpBsuwiCl) return false;
+  if (!IsModrmRegister(rde) || Lock(rde)) return false;
+  int lg = RegLog2(rde);
+  if (lg != 2 && lg != 3) return false;  // only 32/64-bit
+  *log2 = lg;
+  *op = (int)ModrmReg(rde);   // BSU_ROL..BSU_SAR
+  *dst = (int)RexbRm(rde);
+  *imm = (h == OpBsuwiImm);
+  *immv = uimm0;
+  return true;
+}
+
+// dst = areg * (breg | imm), low bits only. Inlined ONLY when CF/OF are dead
+// (imul's only defined flags); i64.mul gives the low 64 = the x86 imul result.
+// 32-bit masks operands + result (imul r32 zero-extends into r64).
+static void EmitImul(struct Buf *b, struct Rc *rc, int dst, int areg, int breg,
+                     bool bimm, u64 immv, int log2) {
+  bool w32 = (log2 == 2);
+  RcLoad(b, rc, areg);
+  EGet(b, LOC_GPR + areg);
+  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+  if (bimm) {
+    EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
+  } else {
+    RcLoad(b, rc, breg);
+    EGet(b, LOC_GPR + breg);
+    if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+  }
+  EBin(b, I64_MUL);
+  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+  ESet(b, LOC_GPR + dst);
+  rc->loaded[dst] = 1;
+  rc->dirty[dst] = 1;
+}
+
+// Decide if this insn is an inlinable register-direct 32/64-bit imul. Two forms:
+// OpImulGvqpEvqp reg=reg*rm ; OpImulGvqpEvqpImm reg=rm*imm. Only the low result
+// is produced, so the caller must confirm CF/OF are dead before using this.
+static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
+                       int *breg, bool *bimm, u64 *immv, int *log2) {
+  int lg = RegLog2(rde);
+  if (lg != 2 && lg != 3) return false;
+  if (!IsModrmRegister(rde) || Lock(rde)) return false;  // reg-direct rm only
+  *log2 = lg;
+  if (h == OpImulGvqpEvqp) {        // reg = reg * rm
+    *dst = *areg = (int)RexrReg(rde); *breg = (int)RexbRm(rde); *bimm = false;
+    return true;
+  }
+  if (h == OpImulGvqpEvqpImm) {     // reg = rm * imm
+    *dst = (int)RexrReg(rde); *areg = (int)RexbRm(rde); *bimm = true; *immv = uimm0;
+    return true;
+  }
+  return false;
 }
 
 // i64 binop per ALU op index (0 add,1 or,4 and,5 sub,6 xor,7 cmp=sub).
@@ -666,6 +750,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     bool imm, wb;
     u64 immv;
     int lbase, lindex, lscale; i64 ldispv; bool lhb, lhi, lrip, lleg;
+    int iareg, ibreg;
     if (AluDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
                   &wb)) {
       // pc is already past this insn; skip flag emission if all flags are dead.
@@ -681,6 +766,14 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
                          &ldispv, &lhb, &lhi, &lrip, &lleg, &log2)) {
       EmitLea(&bb, &rc, dst, lbase, lindex, lscale, ldispv, lhb, lhi, lrip, lleg,
               log2, pc);  // pc already advanced past this insn = rip base
+      ip_dirty = true;
+    } else if (BsuDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &imm, &immv)) {
+      EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+      ip_dirty = true;
+    } else if (ImulDecode(h, rde, xedd.op.uimm0, &dst, &iareg, &ibreg, &imm,
+                          &immv, &log2) &&
+               !GetNeededFlags(m, pc, CF | OF)) {
+      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2);  // CF/OF dead
       ip_dirty = true;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
