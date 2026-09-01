@@ -149,6 +149,7 @@ static void EConstI(struct Buf *b, i32 v) { bput(b, 0x41); bleb_s(b, v); } // i3
 static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 
 #define OFF_FLAGS ((u32)offsetof(struct Machine, flags))
+#define OFF_OPLEN ((u32)offsetof(struct Machine, oplen))
 // scratch locals (declared after the 16 GPR locals): i64 20..23, i32 24..26
 #define LT0 20
 #define LT1 21
@@ -261,11 +262,13 @@ static const u8 kBin[8] = {I64_ADD, I64_OR, 0, 0, I64_AND, I64_SUB, I64_XOR,
 // flags local FL. Used for add/or/and/sub/xor/cmp/test (not adc/sbb). LT0=x,
 // LT1=y, LT2=z; operands masked to width so the 32/64-bit paths share formulas.
 static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
-                          int src, bool imm, u64 immv, bool wb) {
+                          int src, bool imm, u64 immv, bool wb, bool keepcf) {
   bool w32 = (log2 == 2);
   i64 mask = w32 ? (i64)0xffffffffLL : (i64)-1;
   int signsh = w32 ? 31 : 63;
   int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
+  // inc/dec (keepcf) preserve CF: keep its bit and don't recompute it.
+  i32 keep = keepcf ? 0x00fff72f : 0x00fff72e;
   // x -> LT0
   RcLoad(b, rc, dst);
   EGet(b, LOC_GPR + dst);
@@ -289,18 +292,19 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
   FlagsEnsure(b, rc);
   EGet(b, FL);
-  EConstI(b, 0x00fff72e);
-  EBin(b, I32_AND);  // clears CF ZF SF OF AF + parity byte
+  EConstI(b, keep);
+  EBin(b, I32_AND);  // clears ZF SF OF AF parity (+ CF unless keepcf)
   // zf<<6
   EGet(b, LT2); EBin(b, I64_EQZ); EConstI(b, 6); EBin(b, I32_SHL); EBin(b, I32_OR);
   // sf<<7
   EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); EBin(b, I64_WRAP);
   EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
   if (kind != 0) {  // cf, of, af (logical leaves them 0)
-    // cf: add z<y ; sub x<z
-    if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
-    else { EGet(b, LT0); EGet(b, LT2); }
-    EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+    if (!keepcf) {  // cf: add z<y ; sub x<z (inc/dec preserve CF)
+      if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
+      else { EGet(b, LT0); EGet(b, LT2); }
+      EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+    }
     // of<<11
     if (kind == 1) {  // ((z^x)&(z^y))
       EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
@@ -430,15 +434,26 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     if (AluDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
                   &wb)) {
       if (t == 2 || t == 3) EmitAlu(&bb, &rc, t, log2, dst, src, imm, immv, wb);
-      else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb);
+      else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb, false);
       ip_dirty = true;  // inline op: m->ip not updated
     } else if (MovDecode(h, rde, xedd.op.uimm0, &dst, &src, &imm, &immv,
                          &log2)) {
       EmitMov(&bb, &rc, dst, src, imm, immv, log2);
       ip_dirty = true;
+    } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
+               (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
+      // inc/dec reg via blink's own kAlu[INC/DEC](x, 0) - exact flag semantics
+      // (AF=0, CF preserved) that a hand-inlined add/sub-1 would get subtly wrong.
+      EmitAlu(&bb, &rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
+              (int)RexbRm(rde), 0, true, 0, true);
+      ip_dirty = true;
     } else {
       RcSpill(&bb, &rc);                    // handler reads regs from memory
       EGet(&bb, 0); EConst(&bb, (i64)pc); EStore(&bb, OFF_IP);  // m->ip = pc
+      // m->oplen = this insn's length, so RestoreIp (m->ip -= m->oplen) rewinds
+      // correctly if the handler faults (matches JitlessDispatch, machine.c:2105).
+      EGet(&bb, 0); EConstI(&bb, (i32)oplen);
+      bput(&bb, 0x3a); bleb_u(&bb, 0); bleb_u(&bb, OFF_OPLEN);  // i32.store8
       EmitHandler(&bb, rde, xedd.op.disp, xedd.op.uimm0, (u32)(uintptr_t)h);
       RcInval(&rc);                         // handler may have changed regs
       ip_dirty = false;
