@@ -54,6 +54,9 @@ void OpJcc(P);          // conditional jump (self-loop terminator detection)
 void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
 void OpBsuwiImm(P);    // shift/rotate rm, imm (kBsu leaf)
 void OpBsuwiCl(P);     // shift/rotate rm, cl
+void OpBsuwi1(P);      // shift/rotate rm, 1 (0xD1)
+void OpCmpAxImm(P);    // cmp al/ax/eax/rax, imm (0x3C/0x3D)
+void OpTestAxImm(P);   // test al/ax/eax/rax, imm (0xA8/0xA9)
 void OpMovzbGvqpEb(P);  // movzx Gv, byte rm  (memory-read inlining)
 void OpMovzwGvqpEw(P);  // movzx Gv, word rm
 void OpMovsbGvqpEb(P);  // movsx Gv, byte rm
@@ -407,14 +410,27 @@ static void EmitBsuInline(struct Buf *b, struct Rc *rc, int op, int log2,
 // Decide if this insn is an inlinable register-direct 32/64-bit shift/rotate.
 static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
                       int *dst, bool *imm, u64 *immv) {
-  if (h != OpBsuwiImm && h != OpBsuwiCl) return false;
+  if (h != OpBsuwiImm && h != OpBsuwiCl && h != OpBsuwi1) return false;
   if (!IsModrmRegister(rde) || Lock(rde)) return false;
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;  // only 32/64-bit
   *log2 = lg;
   *op = (int)ModrmReg(rde);   // BSU_ROL..BSU_SAR
   *dst = (int)RexbRm(rde);
-  *imm = (h == OpBsuwiImm);
+  *imm = (h != OpBsuwiCl);
+  *immv = h == OpBsuwi1 ? 1 : uimm0;
+  return true;
+}
+
+// Decide if this insn is an inlinable cmp/test al/ax/eax/rax, imm (0x3C/0x3D,
+// 0xA8/0xA9). Flags-only (no writeback), any width - EmitAluInline's flag math
+// is width-generic and matches blink's kAlu leaves bit for bit.
+static bool AluAxDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
+                        u64 *immv) {
+  if (h == OpCmpAxImm) *t = ALU_SUB;
+  else if (h == OpTestAxImm) *t = ALU_AND;
+  else return false;
+  *log2 = (int)RegLog2(rde);
   *immv = uimm0;
   return true;
 }
@@ -543,9 +559,11 @@ static const u8 kBin[8] = {I64_ADD, I64_OR, 0, 0, I64_AND, I64_SUB, I64_XOR,
 static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
                           int src, bool imm, u64 immv, bool wb, bool keepcf,
                           int needed) {
-  bool w32 = (log2 == 2);
-  i64 mask = w32 ? (i64)0xffffffffLL : (i64)-1;
-  int signsh = w32 ? 31 : 63;
+  static const i64 kWMask[4] = {0xff, 0xffff, 0xffffffffLL, -1};
+  bool w32 = (log2 != 3);  // any narrow width: operands masked (flag math generic)
+  i64 mask = kWMask[log2 & 3];
+  int signsh = (8 << (log2 & 3)) - 1;
+  if (log2 < 2) wb = false;  // 8/16-bit writeback would clobber upper reg bits
   int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
   // inc/dec (keepcf) preserve CF: keep its bit and don't recompute it.
   i32 keep = keepcf ? 0x00fff72f : 0x00fff72e;
@@ -560,7 +578,7 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   ESet(b, LT0);
   // y -> LT1 (src<0: y is the memory operand value already in LT3)
   if (imm) {
-    EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
+    EConst(b, w32 ? (i64)(immv & (u64)mask) : (i64)immv);
   } else if (src >= 0) {
     RcLoad(b, rc, src);
     EGet(b, LOC_GPR + src);
@@ -980,7 +998,8 @@ struct SlOp {
   u64 pcn;                        // pc after this insn (lea rip base)
 };
 enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea, kSlBsu, kSlBsuInline,
-       kSlImul };
+       kSlImul, kSlSkip };
+#define PKJIT_SLSKMAX 8  // max nested internal forward-Jcc skip regions
 #define PKJIT_SLMAX 48  // self-loop insn cap (hot loops are short; bounds ops[])
 
 static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
@@ -991,21 +1010,41 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   u16 regs = 0;
   int cc = -1;
   u64 fall = 0;
+  u64 skstk[PKJIT_SLSKMAX];  // open skip-region close-pcs (LIFO, properly nested)
+  int sksp = 0;
   int n, cnt = 0;
   for (n = 0; n < PKJIT_SLMAX; ++n) {  // pre-pass: decode + record + collect regs
+    while (sksp && skstk[sksp - 1] == pc) --sksp;  // regions closing here
     if (GetInstruction(m, pc, &x)) return false;
     u64 rde = x.op.rde;
     u32 ol = Oplength(rde);
     if (!ol) return false;
     nexgen32e_f h = GetOp(Mopcode(rde));
     u64 pcn = pc + ol;
-    if (h == OpJcc) {  // terminator
+    if (h == OpJcc) {
       int c = (int)(Opcode(rde) & 15);
       if (c == 0xa || c == 0xb) return false;  // JP/JNP need lazy parity
-      if (!(n > 0 && (u64)(pcn + x.op.disp) == ip)) return false;
-      cc = c;
-      fall = pcn;
-      break;
+      u64 tgt = pcn + (u64)x.op.disp;
+      if (n > 0 && tgt == ip) {  // backward to start: the loop terminator
+        cc = c;
+        fall = pcn;
+        break;
+      }
+      // internal FORWARD Jcc: skip the ops up to tgt (wasm `if` with inverted
+      // cc). tgt must land on a later op start INSIDE the loop - enforced by
+      // requiring the region to close (stack pop above) before the terminator.
+      if (tgt <= pcn || sksp == PKJIT_SLSKMAX) return false;
+      if (sksp && tgt > skstk[sksp - 1]) return false;  // must nest
+      skstk[sksp++] = tgt;
+      struct SlOp *sk = &ops[cnt];
+      memset(sk, 0, sizeof(*sk));
+      sk->kind = kSlSkip;
+      sk->t = c;
+      sk->iv = tgt;
+      sk->pcn = pcn;
+      ++cnt;
+      pc = pcn;
+      continue;
     }
     struct SlOp *o = &ops[cnt];
     memset(o, 0, sizeof(*o));
@@ -1052,6 +1091,11 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       regs |= 1u << d;
       regs |= 1u << s;
       if (!im) regs |= 1u << lb;
+    } else if (AluAxDecode(h, rde, x.op.uimm0, &t, &lg, &iv)) {
+      o->kind = kSlAluInline;  // cmp/test ax,imm: flags only, any width
+      o->t = t; o->lg = lg; o->d = 0; o->im = 1; o->iv = iv;
+      o->need = GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF);
+      regs |= 1u << 0;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
       // inc/dec via kAlu[10/11](x,0): exact flags (AF=0, CF preserved)
@@ -1066,7 +1110,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
     ++cnt;
     pc = pcn;
   }
-  if (cc < 0 || !cnt) return false;
+  if (cc < 0 || !cnt || sksp) return false;
 
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
@@ -1080,9 +1124,26 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   bput(bb, 0x0c); bleb_u(bb, 2);   // br 2 -> after block
   bput(bb, 0x0b);                  // end if
   // body: replay the recorded ops (RcLoad no-ops since pre-loaded)
+  u64 opc = ip;  // start pc of ops[i] = previous op's pcn
+  sksp = 0;
   for (int i = 0; i < cnt; ++i) {
     struct SlOp *o = &ops[i];
+    while (sksp && skstk[sksp - 1] == opc) {  // skip regions closing here
+      bput(bb, 0x0b);  // end if
+      --sksp;
+    }
     switch (o->kind) {
+      case kSlSkip:
+        // internal forward Jcc: wrap the skipped ops in `if (!taken)`. Spill
+        // FL first so m->flags is authoritative on BOTH paths (a call-based op
+        // inside the region spills+invalidates FL; the not-taken path must see
+        // the same m->flags it would have spilled).
+        FlagsEnsure(bb, rc);
+        FlagsSpill(bb, rc);
+        EmitCond(bb, (int)o->t ^ 1);     // cc LSB flip = negation
+        bput(bb, 0x04); bput(bb, 0x40);  // if (void)
+        skstk[sksp++] = o->iv;
+        break;
       case kSlAluCall:
         EmitAlu(bb, rc, o->t, o->lg, o->d, o->s, o->im, o->iv, o->w);
         break;
@@ -1107,6 +1168,11 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
                 o->lrp, o->llg, o->lg, o->pcn);
         break;
     }
+    opc = o->pcn;
+  }
+  while (sksp) {  // skip regions closing at the terminator
+    bput(bb, 0x0b);  // end if
+    --sksp;
   }
   // condition: loop back if the jcc is taken
   FlagsEnsure(bb, rc);
@@ -1165,6 +1231,11 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
       if (t == 2 || t == 3) EmitAlu(&bb, &rc, t, log2, dst, src, imm, immv, wb);
       else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb, false, need);
       ip_dirty = true;  // inline op: m->ip not updated
+    } else if (AluAxDecode(h, rde, xedd.op.uimm0, &t, &log2, &immv)) {
+      // cmp/test al/ax/eax/rax, imm: flags only, any width
+      int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
+      EmitAluInline(&bb, &rc, t, log2, 0, 0, true, immv, false, false, need);
+      ip_dirty = true;
     } else if (MovDecode(h, rde, xedd.op.uimm0, &dst, &src, &imm, &immv,
                          &log2)) {
       EmitMov(&bb, &rc, dst, src, imm, immv, log2);
