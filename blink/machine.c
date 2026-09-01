@@ -416,7 +416,7 @@ void OpMovZvqpIvqp(P) {  // pk910: extern for wasmjit inline mov
   }
 }
 
-static void OpMovImm(P) {
+void OpMovImm(P) {  // pk910: extern for wasmjit inline mem-write
   WriteRegisterOrMemoryBW(rde, GetModrmWriteBW(A), uimm0);
   if (IsMakingPath(m)) {
     Jitter(A,
