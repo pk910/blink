@@ -540,6 +540,12 @@ bool IsValidAddrSize(i64 virt, i64 size) {
 void InvalidateSystem(struct System *s, bool tlb, bool icache) {
   struct Dll *e;
   struct Machine *m;
+#ifdef HAVE_WASM_JIT
+  // pk910: an icache flush means executable mappings changed (mprotect/munmap
+  // of code) - wasm-JIT blocks translated from those addresses are stale too.
+  void WasmJitFlushCode(void);
+  if (icache) WasmJitFlushCode();
+#endif
   if (tlb || icache) {
     LOCK(&s->machines_lock);
     for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {

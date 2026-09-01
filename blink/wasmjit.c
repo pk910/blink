@@ -98,6 +98,30 @@ void WasmJitFlushCode(void) {
   atomic_fetch_add_explicit(&g_codegen, 1, memory_order_release);
 }
 
+// Coarse map of guest pages that contain EMITTED block code, so a guest write
+// to an executable page only invalidates the JIT when translated code could
+// actually be stale (tcc-style codegen writes fresh pages: map miss, no flush).
+// Hash collisions only cause spurious flushes, never missed ones.
+static _Atomic(u8) g_codepages[4096];
+static void NoteCodePages(u64 ip, u64 end) {
+  u64 p;
+  for (p = ip & ~(u64)4095; p <= ((end - 1) & ~(u64)4095); p += 4096) {
+    atomic_store_explicit(&g_codepages[(p >> 12) & 4095], 1,
+                          memory_order_relaxed);
+  }
+}
+// Guest wrote memory at virt that may hold translated code (the caller checked
+// the page is executable, or has no PTE at hand). memory.c write paths call
+// this; on the wasm build the native SMC enqueue is unreachable
+// (IsJitDisabled() is constant-true without HAVE_JIT and the mprotect/segfault
+// path can't fire), so this is THE trigger for stale-block invalidation.
+void WasmJitNoteCodeWrite(i64 virt) {
+  if (atomic_load_explicit(&g_codepages[((u64)virt >> 12) & 4095],
+                           memory_order_relaxed)) {
+    WasmJitFlushCode();
+  }
+}
+
 // Fixed module prefix: 3 types (t0 = block/handler (i32,i64,i64,i64)->() ;
 // t1 = kAlu (i32,i64,i64)->i64 ; t2 = CommitStash (i32)->()), imports env.mem
 // (shared {1,65536}) + env.tbl (funcref), func(t0), export "b". Only the code
@@ -1358,6 +1382,10 @@ assemble:
   bputs(&mb, bb.p, bb.n);
   bput(&mb, 0x0b);        // end
   if (mb.ovf) { free(mem); return false; }
+  // register the guest code range so a later write to it invalidates blocks
+  // (+3072 pads the self-loop path, where pc stays == ip; over-marking only
+  // risks a spurious flush, never a stale block)
+  NoteCodePages(ip, (pc > ip ? pc : ip + 1) + 3072);
   *out = mem;
   *outlen = mb.n;
   return true;
