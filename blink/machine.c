@@ -365,7 +365,7 @@ static void OpMovOvqpRax(P) {
   WriteMemory(rde, ResolveAddress(m, v), Get64(m->ax));
 }
 
-static void OpMovEbGb(P) {
+void OpMovEbGb(P) {  // pk910: extern for wasmjit inline mem-write
   Store8(GetModrmRegisterBytePointerWrite1(A), Get8(ByteRexrReg(m, rde)));
   if (IsMakingPath(m)) {
     Jitter(A, "A"      // res0 = GetReg(RexrReg)
@@ -373,7 +373,7 @@ static void OpMovEbGb(P) {
   }
 }
 
-static void OpMovGbEb(P) {
+void OpMovGbEb(P) {  // pk910: extern for wasmjit inline mem-read
   Put8(ByteRexrReg(m, rde), Load8(GetModrmRegisterBytePointerRead1(A)));
   unassert(!RegLog2(rde));
   if (IsMakingPath(m)) {

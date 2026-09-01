@@ -60,6 +60,8 @@ void OpMovsbGvqpEb(P);  // movsx Gv, byte rm
 void OpMovswGvqpEw(P);  // movsx Gv, word rm
 void OpMovslGdqpEd(P);  // movsxd Gv, dword rm
 void OpMovImm(P);       // mov rm, imm (0xC6/0xC7; memory-write inlining)
+void OpMovEbGb(P);      // mov rm8, r8 (byte store inlining)
+void OpMovGbEb(P);      // mov r8, rm8 (byte load inlining)
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -723,12 +725,22 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
                            nexgen32e_f h, u64 rde, const struct XedDecodedInst *x,
                            u64 pc_next, u32 oplen) {
   int lg = (int)RegLog2(rde);
-  int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ; 3 cmp [mem],imm
-  int t = 0, dst = 0, ysrc = 0, size = 0;
+  int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ;
+             // 3 cmp [mem],imm ; 4 subword load merged into dst (mov r8/r16)
+  int t = 0, dst = 0, ysrc = 0, size = 0, mergesh = 0;
+  i64 mergemask = 0;
   u8 loadop = 0;
   bool wb = false, sx32 = false;
-  if (lg != 2 && lg != 3) return false;  // 16-bit dst keeps upper bits: fallback
-  if (h == OpMovGvqpEvqp) {              // mov reg, [mem]
+  if (h == OpMovGbEb) {                  // mov r8, [mem] (keeps upper bits)
+    int off = kByteReg[RexRexr(rde)];
+    kind = 4; dst = off >> 3; mergesh = (off & 7) * 8;
+    mergemask = ~((i64)0xff << mergesh); size = 1; loadop = 0x31;
+  } else if (h == OpMovGvqpEvqp && lg == 1) {  // mov r16, [mem] (keeps upper)
+    kind = 4; dst = (int)RexrReg(rde); mergesh = 0;
+    mergemask = ~(i64)0xffff; size = 2; loadop = 0x33;
+  } else if (lg != 2 && lg != 3) {
+    return false;  // remaining 16-bit-dst forms keep upper bits: fallback
+  } else if (h == OpMovGvqpEvqp) {       // mov reg, [mem]
     kind = 0; dst = (int)RexrReg(rde);
     size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;  // i64.load32_u / i64.load
   } else if (h == OpMovzbGvqpEb) {       // movzx reg, byte
@@ -763,8 +775,23 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   bool hb, hi, rip;
   if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
   EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (kind == 4) RcLoad(b, rc, dst);  // merge needs the old dst value
   struct Rc pre = *rc;            // the $slow fallback spills THIS state
   EmitMemBegin(b, size, false);
+  if (kind == 4) {                // dst = (dst & ~mask) | (load << sh)
+    EGet(b, LOC_GPR + dst);
+    EConst(b, mergemask); EBin(b, I64_AND);
+    EGet(b, HP0);
+    bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);
+    if (mergesh) { EConst(b, mergesh); EBin(b, I64_SHL); }
+    EBin(b, I64_OR);
+    ESet(b, LOC_GPR + dst);
+    rc->loaded[dst] = 1;
+    rc->dirty[dst] = 1;
+    EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
+               pc_next, oplen);
+    return true;
+  }
   EGet(b, HP0);
   bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);  // load [HP0] (align 0)
   if (kind == 0) {
@@ -801,24 +828,31 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
                             u32 oplen) {
   int lg = (int)RegLog2(rde);
   int kind;  // 0 mov [mem],reg ; 1 mov [mem],imm ; 2 alu [mem],reg ; 3 alu [mem],imm
-  int t = 0, ysrc = 0, size;
-  u8 storeop, loadop;
-  if (lg != 2 && lg != 3) return false;  // 8/16-bit stores: byteops/handler
+  int t = 0, ysrc = 0, size, srcsh = 0;
+  u8 storeop, loadop = 0;
   size = 1 << lg;
-  storeop = lg == 2 ? 0x3e : 0x37;       // i64.store32 / i64.store
-  loadop = lg == 2 ? 0x35 : 0x29;        // i64.load32_u / i64.load
-  if (h == OpMovEvqpGvqp) {              // mov [mem], reg
+  storeop = lg == 0 ? 0x3c : lg == 1 ? 0x3d : lg == 2 ? 0x3e : 0x37;
+  if (h == OpMovEbGb) {                  // mov [mem], r8 (incl. ah/ch/dh/bh)
+    int off = kByteReg[RexRexr(rde)];
+    kind = 0; ysrc = off >> 3; srcsh = (off & 7) * 8;
+  } else if (h == OpMovEvqpGvqp && lg == 1) {  // mov [mem], r16
     kind = 0; ysrc = (int)RexrReg(rde);
-  } else if (h == OpMovImm) {            // mov [mem], imm (0xC7; 0xC6 is lg 0)
+  } else if (h == OpMovImm) {            // mov [mem], imm (0xC6/0xC7, any width)
     kind = 1;
+  } else if (lg != 2 && lg != 3) {
+    return false;                        // 8/16-bit ALU RMW: handler for now
+  } else if (h == OpMovEvqpGvqp) {       // mov [mem], reg
+    kind = 0; ysrc = (int)RexrReg(rde);
   } else if (h == OpAluw) {              // ALU [mem], reg (RMW)
     t = (int)((Opcode(rde) & 070) >> 3);
     if (t == 2 || t == 3) return false;  // adc/sbb need the kAlu leaf: later
     kind = 2; ysrc = (int)RexrReg(rde);
+    loadop = lg == 2 ? 0x35 : 0x29;
   } else if (h == OpAlui) {              // ALU [mem], imm (RMW; cmp = read path)
     t = (int)ModrmReg(rde);
     if (t == 2 || t == 3 || t == ALU_CMP) return false;
     kind = 3;
+    loadop = lg == 2 ? 0x35 : 0x29;
   } else {
     return false;
   }
@@ -829,9 +863,10 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
   if (kind == 0 || kind == 2) RcLoad(b, rc, ysrc);  // reg operand
   struct Rc pre = *rc;
   EmitMemBegin(b, size, true);
-  if (kind == 0) {                       // [HP0] = reg (low 32 / all 64)
+  if (kind == 0) {                       // [HP0] = reg (store low size bytes)
     EGet(b, HP0);
     EGet(b, LOC_GPR + ysrc);
+    if (srcsh) { EConst(b, srcsh); EBin(b, I64_SHRU); }  // ah/ch/dh/bh source
     bput(b, storeop); bleb_u(b, 0); bleb_u(b, 0);
   } else if (kind == 1) {                // [HP0] = imm
     EGet(b, HP0);
