@@ -136,7 +136,7 @@ void OpMovGvqpEvqp(P) {  // pk910: extern for wasmjit inline mov
   }
 }
 
-void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline
+void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 Load8(GetModrmRegisterBytePointerRead1(A)));
   if (IsMakingPath(m)) {
@@ -145,7 +145,7 @@ void OpMovzbGvqpEb(P) {  // pk910: extern for wasmjit inline
   }
 }
 
-void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline
+void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 Load16(GetModrmRegisterWordPointerRead2(A)));
   if (IsMakingPath(m)) {
@@ -154,7 +154,7 @@ void OpMovzwGvqpEw(P) {  // pk910: extern for wasmjit inline
   }
 }
 
-void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline
+void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i8)Load8(GetModrmRegisterBytePointerRead1(A)));
   if (IsMakingPath(m)) {
@@ -164,7 +164,7 @@ void OpMovsbGvqpEb(P) {  // pk910: extern for wasmjit inline
   }
 }
 
-void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline
+void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i16)Load16(GetModrmRegisterWordPointerRead2(A)));
   if (IsMakingPath(m)) {
@@ -174,7 +174,7 @@ void OpMovswGvqpEw(P) {  // pk910: extern for wasmjit inline
   }
 }
 
-void OpMovslGdqpEd(P) {  // pk910: extern for wasmjit inline
+void OpMovslGdqpEd(P) {  // pk910: extern for wasmjit inline (reg + mem-read)
   WriteRegister(rde, RegRexrReg(m, rde),
                 (i32)Load32(GetModrmRegisterWordPointerRead4(A)));
   if (IsMakingPath(m)) {

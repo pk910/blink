@@ -83,7 +83,7 @@ void OpConvert(P);      // cwd/cdq/cqo
 #define PKJIT_LOCAL     (1u << 13)
 #define PKJIT_THRESHOLD 50
 #define PKJIT_MAXINSN   200
-#define PKJIT_SCRATCH   32768
+#define PKJIT_SCRATCH   131072
 
 enum { kWarming = 0, kEmitting = 1, kReady = 2 };
 struct SharedEntry {
@@ -197,6 +197,10 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define LT2 22
 #define LT3 23
 #define FL  24   // cached m->flags (i32)
+#define HP0 25   // i32 scratch: tlb slot / host pointer (memory fast path)
+#define HP1 26   // i32 scratch: offset within page
+#define OFF_TLB   ((u32)offsetof(struct Machine, tlb))
+#define OFF_INVAL ((u32)offsetof(struct Machine, invalidated))
 
 // wasm opcodes
 #define I64_ADD 0x7c
@@ -210,10 +214,16 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_MUL 0x7e
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
+#define I64_NE  0x52
 #define I64_WRAP 0xa7
+#define I64_SHRS 0x87
+#define I64_NE  0x52
 #define I32_OR  0x72
 #define I32_AND 0x71
 #define I32_SHL 0x74
+#define I32_MUL 0x6c
+#define I32_ADD 0x6a
+#define I32_GTU 0x4b
 
 // ── register cache ──────────────────────────────────────────────────────────
 struct Rc {
@@ -327,12 +337,12 @@ static void EmitCond(struct Buf *b, int cc) {
 static void EmitAlu(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
                     int src, bool imm, u64 immv, bool wb) {
   RcLoad(b, rc, dst);
-  if (!imm) RcLoad(b, rc, src);
+  if (!imm && src >= 0) RcLoad(b, rc, src);
   FlagsSpill(b, rc);          // kAlu[adc/sbb] reads CF from m->flags
   EGet(b, 0);                 // m
   EGet(b, LOC_GPR + dst);     // x
   if (imm) EConst(b, (i64)immv);
-  else EGet(b, LOC_GPR + src);  // y
+  else EGet(b, src >= 0 ? LOC_GPR + src : LT3);  // y (src<0: mem value in LT3)
   u32 fidx = (u32)(uintptr_t)kAlu[t][log2];
   bput(b, 0x41); bleb_s(b, (i64)(i32)fidx);   // i32.const kAlu fn idx
   bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 table0 -> i64
@@ -369,6 +379,50 @@ static void EmitBsu(struct Buf *b, struct Rc *rc, int op, int log2, int dst,
   rc->fl_loaded = 0;            // kBsu wrote m->flags; FL cache stale
 }
 
+#define I64_SHRS 0x87
+#define I64_ROTL 0x89
+#define I64_ROTR 0x8a
+
+// Inline shift/rotate as a pure wasm op - VALUE semantics only, so the caller
+// must confirm ALL flags are dead downstream (x86 shifts touch CF/OF/ZF/SF/PF
+// and leave them unchanged for count==0; with dead flags only the value
+// matters). RCL/RCR are excluded (value reads CF); 32-bit rotates excluded
+// (no cheap 32-in-64 rotate). Count masks &63/&31 exactly like x86.
+static void EmitBsuInline(struct Buf *b, struct Rc *rc, int op, int log2,
+                          int dst, bool imm, u64 immv) {
+  bool w32 = (log2 == 2);
+  i64 cmask = w32 ? 31 : 63;
+  RcLoad(b, rc, dst);
+  if (!imm) RcLoad(b, rc, 1);  // CL = RCX low bits
+  // value operand
+  EGet(b, LOC_GPR + dst);
+  if (w32) {
+    if (op == 7) {  // SAR: sign-extend low 32 first
+      EConst(b, 32); EBin(b, I64_SHL);
+      EConst(b, 32); EBin(b, I64_SHRS);
+    } else {
+      EConst(b, 0xffffffff); EBin(b, I64_AND);
+    }
+  }
+  // count operand (masked)
+  if (imm) {
+    EConst(b, (i64)(immv & (u64)cmask));
+  } else {
+    EGet(b, LOC_GPR + 1); EConst(b, cmask); EBin(b, I64_AND);
+  }
+  switch (op) {
+    case 0: EBin(b, I64_ROTL); break;              // rol (64-bit only)
+    case 1: EBin(b, I64_ROTR); break;              // ror (64-bit only)
+    case 5: EBin(b, I64_SHRU); break;              // shr
+    case 7: EBin(b, I64_SHRS); break;              // sar
+    default: EBin(b, I64_SHL); break;              // shl/sal (4/6)
+  }
+  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }  // 32-bit zero-extend
+  ESet(b, LOC_GPR + dst);
+  rc->loaded[dst] = 1;
+  rc->dirty[dst] = 1;
+}
+
 // Decide if this insn is an inlinable register-direct 32/64-bit shift/rotate.
 static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
                       int *dst, bool *imm, u64 *immv) {
@@ -384,38 +438,109 @@ static bool BsuDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *op, int *log2,
   return true;
 }
 
-// dst = areg * (breg | imm), low bits only. Inlined ONLY when CF/OF are dead
-// (imul's only defined flags); i64.mul gives the low 64 = the x86 imul result.
-// 32-bit masks operands + result (imul r32 zero-extends into r64).
+// dst = areg * (breg | imm), low bits only; 32-bit masks operands + result
+// (imul r32 zero-extends into r64). When `need`, also produce imul's EXACT
+// blink flags (divmul.c AluImul): CF = OF = signed-overflow of the product,
+// every other flag (incl. lazy parity byte) untouched. 32-bit overflow test is
+// z != (i64)(i32)z on the exact 64-bit product of sign-extended operands; the
+// 64-bit test needs the high half, computed from four 32-bit partial products
+// (mulhu, then the Hacker's Delight signed adjustment), then hs != lo>>s63.
 static void EmitImul(struct Buf *b, struct Rc *rc, int dst, int areg, int breg,
-                     bool bimm, u64 immv, int log2) {
+                     bool bimm, u64 immv, int log2, int need) {
   bool w32 = (log2 == 2);
-  RcLoad(b, rc, areg);
-  EGet(b, LOC_GPR + areg);
-  if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
-  if (bimm) {
-    EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
-  } else {
-    RcLoad(b, rc, breg);
-    EGet(b, LOC_GPR + breg);
+  if (!need) {  // CF/OF dead: lean path, no flag work
+    RcLoad(b, rc, areg);
+    EGet(b, LOC_GPR + areg);
     if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    if (bimm) {
+      EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
+    } else {
+      RcLoad(b, rc, breg);
+      EGet(b, LOC_GPR + breg);
+      if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    }
+    EBin(b, I64_MUL);
+    if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    ESet(b, LOC_GPR + dst);
+    rc->loaded[dst] = 1;
+    rc->dirty[dst] = 1;
+    return;
   }
-  EBin(b, I64_MUL);
+  RcLoad(b, rc, areg);
+  if (!bimm) RcLoad(b, rc, breg);
+  FlagsEnsure(b, rc);
+  // LT0 = a, LT1 = b|imm (sign-extended for 32-bit so the i64 product is exact)
+  EGet(b, LOC_GPR + areg);
+  if (w32) { EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS); }
+  ESet(b, LT0);
+  if (bimm) {
+    EConst(b, w32 ? (i64)(i32)immv : (i64)immv);  // blink Load32+(i32) sign-ext
+  } else {
+    EGet(b, LOC_GPR + breg);
+    if (w32) { EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS); }
+  }
+  ESet(b, LT1);
+  // LT2 = low product ; dst = LT2 (32-bit: zero-extend low half)
+  EGet(b, LT0); EGet(b, LT1); EBin(b, I64_MUL); ESet(b, LT2);
+  EGet(b, LT2);
   if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
   ESet(b, LOC_GPR + dst);
   rc->loaded[dst] = 1;
   rc->dirty[dst] = 1;
+  // FL = (FL & ~(CF|OF)) | of * 0x801
+  EGet(b, FL); EConstI(b, ~0x801); EBin(b, I32_AND);
+  if (w32) {
+    // of = LT2 != (i64)(i32)LT2
+    EGet(b, LT2);
+    EGet(b, LT2); EConst(b, 32); EBin(b, I64_SHL); EConst(b, 32); EBin(b, I64_SHRS);
+    EBin(b, I64_NE);
+  } else {
+    // LT3 = u = a1*b0 + ((a0*b0) >> 32)   (all partials < 2^64, no overflow)
+    EGet(b, LT0); EConst(b, 32); EBin(b, I64_SHRU);
+    EGet(b, LT1); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_MUL);
+    EGet(b, LT0); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EGet(b, LT1); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_MUL); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD); ESet(b, LT3);
+    // hi(unsigned) = a1*b1 + (u >> 32) + ((a0*b1 + (u & 0xffffffff)) >> 32)
+    EGet(b, LT0); EConst(b, 32); EBin(b, I64_SHRU);
+    EGet(b, LT1); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_MUL);
+    EGet(b, LT3); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD);
+    EGet(b, LT0); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EGet(b, LT1); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_MUL);
+    EGet(b, LT3); EConst(b, 0xffffffff); EBin(b, I64_AND);
+    EBin(b, I64_ADD); EConst(b, 32); EBin(b, I64_SHRU);
+    EBin(b, I64_ADD);
+    // hi(signed) = hi - ((a>>s63)&b) - ((b>>s63)&a)
+    EGet(b, LT0); EConst(b, 63); EBin(b, I64_SHRS);
+    EGet(b, LT1); EBin(b, I64_AND);
+    EBin(b, I64_SUB);
+    EGet(b, LT1); EConst(b, 63); EBin(b, I64_SHRS);
+    EGet(b, LT0); EBin(b, I64_AND);
+    EBin(b, I64_SUB);
+    // of = hs != (lo >>s 63)
+    EGet(b, LT2); EConst(b, 63); EBin(b, I64_SHRS);
+    EBin(b, I64_NE);
+  }
+  EConstI(b, 0x801); EBin(b, I32_MUL);
+  EBin(b, I32_OR);
+  ESet(b, FL);
+  rc->fl_dirty = 1;
 }
 
 // Decide if this insn is an inlinable register-direct 32/64-bit imul. Two forms:
-// OpImulGvqpEvqp reg=reg*rm ; OpImulGvqpEvqpImm reg=rm*imm. Only the low result
-// is produced, so the caller must confirm CF/OF are dead before using this.
+// OpImulGvqpEvqp reg=reg*rm ; OpImulGvqpEvqpImm reg=rm*imm.
 static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
                        int *breg, bool *bimm, u64 *immv, int *log2) {
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;
   if (!IsModrmRegister(rde) || Lock(rde)) return false;  // reg-direct rm only
   *log2 = lg;
+  *dst = 0; *areg = 0; *breg = 0; *bimm = false; *immv = 0;
   if (h == OpImulGvqpEvqp) {        // reg = reg * rm
     *dst = *areg = (int)RexrReg(rde); *breg = (int)RexbRm(rde); *bimm = false;
     return true;
@@ -443,17 +568,24 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
   // inc/dec (keepcf) preserve CF: keep its bit and don't recompute it.
   i32 keep = keepcf ? 0x00fff72f : 0x00fff72e;
-  // x -> LT0
-  RcLoad(b, rc, dst);
-  EGet(b, LOC_GPR + dst);
+  // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
+  if (dst >= 0) {
+    RcLoad(b, rc, dst);
+    EGet(b, LOC_GPR + dst);
+  } else {
+    EGet(b, LT3);
+  }
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT0);
-  // y -> LT1
+  // y -> LT1 (src<0: y is the memory operand value already in LT3)
   if (imm) {
     EConst(b, w32 ? (i64)(u64)(u32)immv : (i64)immv);
-  } else {
+  } else if (src >= 0) {
     RcLoad(b, rc, src);
     EGet(b, LOC_GPR + src);
+    if (w32) { EConst(b, mask); EBin(b, I64_AND); }
+  } else {
+    EGet(b, LT3);
     if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   }
   ESet(b, LT1);
@@ -579,12 +711,217 @@ static bool LeaDecode(nexgen32e_f h, u64 rde, i64 disp, int *dst, int *base,
   return true;
 }
 
+// ── inline memory operands (softmmu TLB fast path) ──────────────────────────
+// The wasm build has NO linear mapping (CAN_64BIT=0): every guest access goes
+// FindPageTableEntry (m->tlb[(page>>12)&31], PAGE_V) -> GetPageAddress ->
+// g_hostpages.p[(entry&PAGE_TA)>>12] + (addr&4095). We inline exactly that TLB
+// hit path for READS; any miss / permission fail / m->invalidated / page cross
+// falls back to the real handler inline, so semantics match by construction.
+// (Writes stay on the handler: SetWriteAddr does fork-COW splitting and the
+// RW lookup path enqueues SMC invalidation - phase 2, not inlined yet.)
+
+// Decode a MEMORY rm operand's effective address parts. Only the flat common
+// case is inlined: long mode, 64-bit addressing, no segment override, no LOCK,
+// userland (!metal: ds/ss/es bases are 0, no ROM aliasing, Cpl always 3).
+static bool MemEaDecode(struct Machine *m, u64 rde, int *base, int *index,
+                        int *scale, bool *hasBase, bool *hasIndex,
+                        bool *riprel) {
+  if (IsModrmRegister(rde) || Lock(rde)) return false;
+  if (m->metal) return false;
+  if (Mode(rde) != XED_MODE_LONG || Eamode(rde) != XED_MODE_LONG) return false;
+  if (Sego(rde)) return false;  // fs/gs override -> handler
+  *base = *index = *scale = 0;
+  *hasBase = *hasIndex = *riprel = false;
+  if (!SibExists(rde)) {
+    if (IsRipRelative(rde)) *riprel = true;
+    else { *hasBase = true; *base = (int)RexbRm(rde); }
+  } else {
+    if (SibHasBase(rde)) { *hasBase = true; *base = (int)RexbBase(rde); }
+    if (SibHasIndex(rde)) {
+      *hasIndex = true;
+      *index = (int)(Rexx(rde) << 3 | SibIndex(rde));
+      *scale = (int)SibScale(rde);
+    }
+  }
+  return true;
+}
+
+// LT3 = disp + base + (index << scale) [+ pc_next when rip-relative].
+static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
+                       int scale, i64 dispv, bool hasBase, bool hasIndex,
+                       bool riprel, u64 pc_next) {
+  EConst(b, dispv + (riprel ? (i64)pc_next : 0));
+  if (hasBase) { RcLoad(b, rc, base); EGet(b, LOC_GPR + base); EBin(b, I64_ADD); }
+  if (hasIndex) {
+    RcLoad(b, rc, index);
+    EGet(b, LOC_GPR + index);
+    if (scale) { EConst(b, (i64)scale); EBin(b, I64_SHL); }
+    EBin(b, I64_ADD);
+  }
+  ESet(b, LT3);
+}
+
+// LT3 holds the guest addr. Opens block $done { block $slow { ... and emits the
+// TLB-hit checks; on the fast path HP0 = host pointer for [addr, addr+size).
+// Any check failing branches to $slow (the handler fallback in EmitMemEnd).
+static void EmitMemBegin(struct Buf *b, int size) {
+  bput(b, 0x02); bput(b, 0x40);   // block $done
+  bput(b, 0x02); bput(b, 0x40);   // block $slow
+  // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
+  EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_INVAL);  // i32.load8_u
+  bput(b, 0x0d); bleb_u(b, 0);    // br_if $slow
+  // HP0 = m + ((addr>>12) & 31)*16   (tlb slot; OFF_TLB applied at each load)
+  EGet(b, LT3); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
+  EConstI(b, 31); bput(b, I32_AND); EConstI(b, 4); bput(b, I32_SHL);
+  EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
+  // tlb.page != (addr & -4096) -> slow
+  EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
+  EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
+  // entry -> LT2; need PAGE_V|PAGE_U|PAGE_HOST with PAGE_RSRV clear
+  // (read perms = LookupAddress2(mask=need=PAGE_U) at Cpl 3; RSRV can't be in
+  // the TLB, checked anyway; !HOST would mean s->real, not inlined)
+  EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB + 8);
+  bput(b, 0x22); bleb_u(b, LT2);  // local.tee
+  EConst(b, (i64)(PAGE_V | PAGE_U | PAGE_HOST | PAGE_RSRV)); EBin(b, I64_AND);
+  EConst(b, (i64)(PAGE_V | PAGE_U | PAGE_HOST));
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
+  // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those)
+  EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
+  if (size > 1) {
+    bput(b, 0x22); bleb_u(b, HP1);  // local.tee
+    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
+  } else {
+    ESet(b, HP1);
+  }
+  // HP0 = g_hostpages.p[(entry & PAGE_TA) >> 12] + HP1
+  EConstI(b, (i32)(uintptr_t)&g_hostpages.p);
+  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p
+  EGet(b, LT2); EConst(b, (i64)PAGE_TA); EBin(b, I64_AND);
+  EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
+  EConstI(b, 2); bput(b, I32_SHL); bput(b, I32_ADD);
+  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p[idx] (page base)
+  EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
+}
+
+// Close the fast path and emit the $slow fallback: spill the PRE-instruction
+// dirty state, run the real handler (ip/oplen set for fault rewind), drain the
+// stash, then RELOAD every local the post-instruction cache state says is
+// valid - so both paths rejoin with the identical compile-time cache state.
+static void EmitMemEnd(struct Buf *b, const struct Rc *pre, const struct Rc *rc,
+                       u64 rde, i64 disp, u64 uimm0, u32 hidx, u64 pc,
+                       u32 oplen) {
+  int r;
+  bput(b, 0x0c); bleb_u(b, 1);    // fast path done: br $done
+  bput(b, 0x0b);                  // end $slow
+  for (r = 0; r < 16; ++r) {      // spill pre-instruction dirty regs
+    if (!pre->dirty[r]) continue;
+    EGet(b, 0); EGet(b, LOC_GPR + r); EStore(b, OFF_WEG + (u32)r * 8);
+  }
+  if (pre->fl_dirty) {
+    EGet(b, 0); EGet(b, FL);
+    bput(b, 0x36); bleb_u(b, 2); bleb_u(b, OFF_FLAGS);  // i32.store m->flags
+  }
+  EGet(b, 0); EConst(b, (i64)pc); EStore(b, OFF_IP);
+  EGet(b, 0); EConstI(b, (i32)oplen);
+  bput(b, 0x3a); bleb_u(b, 0); bleb_u(b, OFF_OPLEN);    // i32.store8
+  EmitHandler(b, rde, disp, uimm0, hidx);
+  EmitCommitStash(b);
+  for (r = 0; r < 16; ++r) {      // resync locals the fast path left valid
+    if (!rc->loaded[r]) continue;
+    EGet(b, 0); ELoad(b, OFF_WEG + (u32)r * 8); ESet(b, LOC_GPR + r);
+  }
+  if (rc->fl_loaded) {
+    EGet(b, 0);
+    bput(b, 0x28); bleb_u(b, 2); bleb_u(b, OFF_FLAGS);  // i32.load m->flags
+    ESet(b, FL);
+  }
+  bput(b, 0x0b);                  // end $done
+}
+
+// Try to inline an instruction whose rm is a MEMORY operand being READ, with
+// a 32/64-bit register destination (or flags-only). Returns false (emitting
+// nothing) if the form isn't covered - caller falls back to the handler.
+static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
+                           nexgen32e_f h, u64 rde, const struct XedDecodedInst *x,
+                           u64 pc_next, u32 oplen) {
+  int lg = (int)RegLog2(rde);
+  int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ; 3 cmp [mem],imm
+  int t = 0, dst = 0, ysrc = 0, size = 0;
+  u8 loadop = 0;
+  bool wb = false, sx32 = false;
+  if (lg != 2 && lg != 3) return false;  // 16-bit dst keeps upper bits: fallback
+  if (h == OpMovGvqpEvqp) {              // mov reg, [mem]
+    kind = 0; dst = (int)RexrReg(rde);
+    size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;  // i64.load32_u / i64.load
+  } else if (h == OpMovzbGvqpEb) {       // movzx reg, byte
+    kind = 0; dst = (int)RexrReg(rde); size = 1; loadop = 0x31;
+  } else if (h == OpMovzwGvqpEw) {       // movzx reg, word
+    kind = 0; dst = (int)RexrReg(rde); size = 2; loadop = 0x33;
+  } else if (h == OpMovsbGvqpEb) {       // movsx reg, byte
+    kind = 0; dst = (int)RexrReg(rde); size = 1; loadop = 0x30; sx32 = lg == 2;
+  } else if (h == OpMovswGvqpEw) {       // movsx reg, word
+    kind = 0; dst = (int)RexrReg(rde); size = 2; loadop = 0x32; sx32 = lg == 2;
+  } else if (h == OpMovslGdqpEd) {       // movsxd reg, dword
+    kind = 0; dst = (int)RexrReg(rde); size = 4; loadop = 0x34; sx32 = lg == 2;
+  } else if (h == OpAluFlip) {           // ALU reg, [mem] (writeback to reg)
+    kind = 1; t = (int)((Opcode(rde) & 070) >> 3); dst = (int)RexrReg(rde);
+    wb = true; size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;
+  } else if (h == OpAluFlipCmp) {        // cmp reg, [mem] (flags only)
+    kind = 1; t = ALU_SUB; dst = (int)RexrReg(rde);
+    size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;
+  } else if (h == OpAluCmp) {            // cmp [mem], reg (flags only)
+    kind = 2; t = ALU_SUB; ysrc = (int)RexrReg(rde);
+    size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;
+  } else if (h == OpAluTest) {           // test [mem], reg (flags only)
+    kind = 2; t = ALU_AND; ysrc = (int)RexrReg(rde);
+    size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;
+  } else if (h == OpAlui && (int)ModrmReg(rde) == ALU_CMP) {  // cmp [mem], imm
+    kind = 3; t = ALU_CMP;
+    size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;
+  } else {
+    return false;
+  }
+  int base, index, scale;
+  bool hb, hi, rip;
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  struct Rc pre = *rc;            // the $slow fallback spills THIS state
+  EmitMemBegin(b, size);
+  EGet(b, HP0);
+  bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);  // load [HP0] (align 0)
+  if (kind == 0) {
+    if (sx32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }  // 32-bit dst ze
+    ESet(b, LOC_GPR + dst);
+    rc->loaded[dst] = 1;
+    rc->dirty[dst] = 1;
+  } else {
+    ESet(b, LT3);                 // memory operand value (addr no longer needed)
+    int need = GetNeededFlags(m, pc_next, CF | ZF | SF | OF | AF | PF);
+    if (kind == 1) {
+      if (t == 2 || t == 3) EmitAlu(b, rc, t, lg, dst, -1, false, 0, wb);
+      else EmitAluInline(b, rc, t, lg, dst, -1, false, 0, wb, false, need);
+    } else if (kind == 2) {
+      EmitAluInline(b, rc, t, lg, -1, ysrc, false, 0, false, false, need);
+    } else {
+      EmitAluInline(b, rc, t, lg, -1, 0, true, x->op.uimm0, false, false, need);
+    }
+  }
+  EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
+             pc_next, oplen);
+  return true;
+}
+
 // Decide if this insn is an inlinable register-direct 32/64-bit mov.
 static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
                       bool *imm, u64 *immv, int *log2) {
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;
   *log2 = lg;
+  *dst = 0; *src = 0; *imm = false; *immv = 0;
+  // every out-param gets a defined value on every true path: callers pass
+  // these (by value) into the emitters, and an indeterminate value there is
+  // poison the optimizer may act on
   if (h == OpMovZvqpIvqp) {  // mov reg, imm
     *dst = (int)RexbSrm(rde); *imm = true; *immv = uimm0;
     return true;
@@ -613,6 +950,7 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
          : h == OpTestAxImm ? ALU_AND
                             : (int)((Opcode(rde) & 070) >> 3);
     *dst = 0;
+    *src = 0;  // unused (imm) but defined: the decoder-out zero-init invariant
     *imm = true;
     *immv = uimm0;
     *wb = (h == OpAluAxImm);
@@ -623,8 +961,11 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
   int lg = RegLog2(rde);
   if (lg != 2 && lg != 3) return false;  // only 32/64-bit
   *log2 = lg;
+  *src = 0;    // defined on every true path (see MovDecode)
+  *immv = 0;
   int op = (int)((Opcode(rde) & 070) >> 3);
   int rm = (int)RexbRm(rde), reg = (int)RexrReg(rde);
+  *t = 0; *dst = 0; *src = 0; *imm = false; *immv = 0; *wb = false;
   if (h == OpAluw) {  // ALU Ev,Gv (add/or/adc/sbb/and/sub/xor), writeback to rm
     *t = op; *dst = rm; *src = reg; *imm = false; *wb = true;
     return true;
@@ -646,7 +987,7 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
     return true;
   }
   if (h == OpAlui) {  // group1 ALU rm, imm; op = ModrmReg
-    *t = (int)ModrmReg(rde); *dst = rm; *imm = true; *immv = uimm0;
+    *t = (int)ModrmReg(rde); *dst = rm; *src = 0; *imm = true; *immv = uimm0;
     *wb = (*t != ALU_CMP);
     return true;
   }
@@ -820,7 +1161,7 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
                    u64 uimm0) {
   if (Lock(rde)) return false;
   int lg = RegLog2(rde);
-  int dr, dsh, sr, ssh, t;
+  int dr = 0, dsh = 0, sr = 0, ssh = 0, t = 0;  // defined (init invariant)
   // 8/16-bit ALU: rm,reg / reg,rm / cmp / test / group1-imm (lg 0 <=> byte)
   if (h == OpAlub || ((h == OpAluw || h == OpAluFlip || h == OpAluCmp ||
                        h == OpAluFlipCmp || h == OpAluTest || h == OpAlui) &&
@@ -982,49 +1323,109 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
 // an all-inline body, is emitted as a wasm `loop` that iterates entirely in wasm
 // (the engine JITs it to ~native) instead of returning to the C dispatcher each
 // iteration. Returns true and fills bb/rc if it emitted one.
+//
+// The pre-pass decodes each insn ONCE into ops[] and the emit loop replays the
+// record. (The original re-decoded the stream in a second pass; the duplicated
+// classification let LLVM jump-thread a "can't happen" decode combination into
+// a literal `unreachable` that fired at runtime - see memory x86-wasm-jit.)
+struct SlOp {
+  u8 kind;                        // kSl* below
+  u8 t, lg, d, s, im, w;          // alu/mov/bsu: op, width, regs, imm?, writeback?
+  u8 lb, li, lsc, lhb, lhi, lrp, llg;  // lea: base/index/scale/flags
+  u8 b;                           // imul: second source reg
+  int need;                       // alu-inline: flags needed downstream
+  u64 iv;                         // immediate value
+  i64 ldv;                        // lea displacement
+  u64 pcn;                        // pc after this insn (lea rip base)
+};
+enum { kSlAluCall, kSlAluInline, kSlMov, kSlLea, kSlBsu, kSlBsuInline,
+       kSlImul };
+#define PKJIT_SLMAX 48  // self-loop insn cap (hot loops are short; bounds ops[])
+
 static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
                          struct Rc *rc) {
   struct XedDecodedInst x;
+  struct SlOp ops[PKJIT_SLMAX];
   u64 pc = ip;
   u16 regs = 0;
   int cc = -1;
   u64 fall = 0;
-  bool ok = true;
-  int n;
-  for (n = 0; n < PKJIT_MAXINSN; ++n) {  // pre-pass: detect + collect regs
-    if (GetInstruction(m, pc, &x)) { ok = false; break; }
+  int n, cnt = 0;
+  for (n = 0; n < PKJIT_SLMAX; ++n) {  // pre-pass: decode + record + collect regs
+    if (GetInstruction(m, pc, &x)) return false;
     u64 rde = x.op.rde;
     u32 ol = Oplength(rde);
-    if (!ol) { ok = false; break; }
+    if (!ol) return false;
     nexgen32e_f h = GetOp(Mopcode(rde));
     u64 pcn = pc + ol;
     if (h == OpJcc) {  // terminator
       int c = (int)(Opcode(rde) & 15);
-      if (c == 0xa || c == 0xb) ok = false;  // JP/JNP need lazy parity
-      else if (n > 0 && (u64)(pcn + x.op.disp) == ip) { cc = c; fall = pcn; }
-      else ok = false;
+      if (c == 0xa || c == 0xb) return false;  // JP/JNP need lazy parity
+      if (!(n > 0 && (u64)(pcn + x.op.disp) == ip)) return false;
+      cc = c;
+      fall = pcn;
       break;
     }
-    int t, lg, d, s;
-    bool im, w;
-    u64 iv;
-    int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
+    struct SlOp *o = &ops[cnt];
+    memset(o, 0, sizeof(*o));
+    o->pcn = pcn;
+    int t = 0, lg = 0, d = 0, s = 0;
+    bool im = false, w = false;
+    u64 iv = 0;
+    int lb = 0, li = 0, lsc = 0; i64 ldv = 0;
+    bool lhb = false, lhi = false, lrp = false, llg = false;
     if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      regs |= 1u << d; if (!im) regs |= 1u << s;
+      o->kind = (t == 2 || t == 3) ? kSlAluCall : kSlAluInline;  // adc/sbb call
+      o->t = t; o->lg = lg; o->d = d; o->s = s; o->im = im; o->w = w; o->iv = iv;
+      o->need = GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF);
+      regs |= 1u << d;
+      if (!im) regs |= 1u << s;
     } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
-      regs |= 1u << d; if (!im) regs |= 1u << s;
+      o->kind = kSlMov;
+      o->d = d; o->s = s; o->im = im; o->iv = iv; o->lg = lg;
+      regs |= 1u << d;
+      if (!im) regs |= 1u << s;
     } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
                          &lrp, &llg, &lg)) {
+      o->kind = kSlLea;
+      o->d = d; o->lb = lb; o->li = li; o->lsc = lsc; o->ldv = ldv;
+      o->lhb = lhb; o->lhi = lhi; o->lrp = lrp; o->llg = llg; o->lg = lg;
       regs |= 1u << d;
       if (lhb) regs |= 1u << lb;
       if (lhi) regs |= 1u << li;
+    } else if (BsuDecode(h, rde, x.op.uimm0, &t, &lg, &d, &im, &iv)) {
+      // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
+      if (!GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF) &&
+          t != 2 && t != 3 && (lg == 3 || t >= 4)) {
+        o->kind = kSlBsuInline;
+      } else {
+        o->kind = kSlBsu;  // exact flags via kBsu leaf
+      }
+      o->t = t; o->lg = lg; o->d = d; o->im = im; o->iv = iv;
+      regs |= 1u << d;
+      if (!im) regs |= 1u << 1;  // CL form reads RCX
+    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg) &&
+               !GetNeededFlags(m, (i64)pcn, CF | OF)) {
+      o->kind = kSlImul;  // imul low result; CF/OF (its only flags) are dead
+      o->d = d; o->s = s; o->b = lb; o->im = im; o->iv = iv; o->lg = lg;
+      regs |= 1u << d;
+      regs |= 1u << s;
+      if (!im) regs |= 1u << lb;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
-      regs |= 1u << (int)RexbRm(rde);
-    } else { ok = false; break; }
+      // inc/dec via kAlu[10/11](x,0): exact flags (AF=0, CF preserved)
+      o->kind = kSlAluCall;
+      o->t = h == OpIncEvqp ? 10 : 11;
+      o->lg = (u8)RegLog2(rde); o->d = (u8)RexbRm(rde);
+      o->im = 1; o->w = 1;
+      regs |= 1u << o->d;
+    } else {
+      return false;
+    }
+    ++cnt;
     pc = pcn;
   }
-  if (!ok || cc < 0) return false;
+  if (cc < 0 || !cnt) return false;
 
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
@@ -1037,32 +1438,35 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   EGet(bb, 0); EConst(bb, (i64)ip); EStore(bb, OFF_IP);
   bput(bb, 0x0c); bleb_u(bb, 2);   // br 2 -> after block
   bput(bb, 0x0b);                  // end if
-  // body (re-decode; RcLoad now no-ops since pre-loaded)
-  pc = ip;
-  for (;;) {
-    GetInstruction(m, pc, &x);
-    u64 rde = x.op.rde;
-    u32 ol = Oplength(rde);
-    nexgen32e_f h = GetOp(Mopcode(rde));
-    if (h == OpJcc) break;
-    int t, lg, d, s;
-    bool im, w;
-    u64 iv;
-    int lb, li, lsc; i64 ldv; bool lhb, lhi, lrp, llg;
-    if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      int need = GetNeededFlags(m, pc + ol, CF | ZF | SF | OF | AF | PF);
-      if (t == 2 || t == 3) EmitAlu(bb, rc, t, lg, d, s, im, iv, w);
-      else EmitAluInline(bb, rc, t, lg, d, s, im, iv, w, false, need);
-    } else if (MovDecode(h, rde, x.op.uimm0, &d, &s, &im, &iv, &lg)) {
-      EmitMov(bb, rc, d, s, im, iv, lg);
-    } else if (LeaDecode(h, rde, x.op.disp, &d, &lb, &li, &lsc, &ldv, &lhb, &lhi,
-                         &lrp, &llg, &lg)) {
-      EmitLea(bb, rc, d, lb, li, lsc, ldv, lhb, lhi, lrp, llg, lg, pc + ol);
-    } else {
-      EmitAlu(bb, rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
-              (int)RexbRm(rde), 0, true, 0, true);
+  // body: replay the recorded ops (RcLoad no-ops since pre-loaded)
+  for (int i = 0; i < cnt; ++i) {
+    struct SlOp *o = &ops[i];
+    switch (o->kind) {
+      case kSlAluCall:
+        EmitAlu(bb, rc, o->t, o->lg, o->d, o->s, o->im, o->iv, o->w);
+        break;
+      case kSlAluInline:
+        EmitAluInline(bb, rc, o->t, o->lg, o->d, o->s, o->im, o->iv, o->w,
+                      false, o->need);
+        break;
+      case kSlMov:
+        EmitMov(bb, rc, o->d, o->s, o->im, o->iv, o->lg);
+        break;
+      case kSlBsu:
+        EmitBsu(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
+        break;
+      case kSlBsuInline:
+        EmitBsuInline(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
+        break;
+      case kSlImul:
+        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg,
+                 0);  // pre-pass admits kSlImul only when CF/OF are dead
+        break;
+      default:  // kSlLea
+        EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
+                o->lrp, o->llg, o->lg, o->pcn);
+        break;
     }
-    pc += ol;
   }
   // condition: loop back if the jcc is taken
   FlagsEnsure(bb, rc);
@@ -1089,15 +1493,14 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   int count = 0;
   bool ip_dirty = false;   // true if m->ip != pc (an inline op advanced pc)
   bool terminated = false;
-  // SELF-LOOP is a WIP: it compiles a hot backward-Jcc loop into a single wasm
-  // `loop` that iterates entirely in wasm (the path to ~native speed). The emitted
-  // module is provably correct in isolation (verified: instantiate + call via
-  // call_indirect reproduces the exact loop result), but blink traps ("unreachable"
-  // in Actor) the SECOND time a self-loop runs in a multi-function guest - a deep
-  // blink/V8 runtime interaction not reproducible outside blink. Gated OFF until
-  // root-caused; the linear path below is correct and already inlines lea/ALU/mov.
-  // Enable with -DPKJIT_SELFLOOP to iterate on it. See memory x86-wasm-jit.
-#ifdef PKJIT_SELFLOOP
+  // SELF-LOOP: a hot backward-Jcc loop with an all-inline body compiles to a
+  // single wasm `loop` that iterates entirely in wasm (~native speed; the alu
+  // bench drops 1059ms -> 16ms). ON by default; -DPKJIT_NO_SELFLOOP disables
+  // for debugging. (The historic 2nd-self-loop "unreachable" crash was
+  // uninit-local poison jump-threaded by -O3 into a literal unreachable in the
+  // old re-decoding body pass - fixed by decode-once replay + defined decode
+  // outs; see memory x86-wasm-jit.)
+#ifndef PKJIT_NO_SELFLOOP
   if (EmitSelfLoop(m, ip, &bb, &rc)) goto assemble;
 #else
   (void)EmitSelfLoop;
@@ -1109,11 +1512,12 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     if (!oplen) break;
     nexgen32e_f h = GetOp(Mopcode(rde));
     pc += oplen;
-    int t, log2, dst, src;
-    bool imm, wb;
-    u64 immv;
-    int lbase, lindex, lscale; i64 ldispv; bool lhb, lhi, lrip, lleg;
-    int iareg, ibreg;
+    int t = 0, log2 = 0, dst = 0, src = 0;
+    bool imm = false, wb = false;
+    u64 immv = 0;
+    int lbase = 0, lindex = 0, lscale = 0; i64 ldispv = 0;
+    bool lhb = false, lhi = false, lrip = false, lleg = false;
+    int iareg = 0, ibreg = 0;
     if (AluDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
                   &wb)) {
       // pc is already past this insn; skip flag emission if all flags are dead.
@@ -1131,12 +1535,19 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
               log2, pc);  // pc already advanced past this insn = rip base
       ip_dirty = true;
     } else if (BsuDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &imm, &immv)) {
-      EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+      // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
+      if (!GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF) &&
+          t != 2 && t != 3 && (log2 == 3 || t >= 4)) {
+        EmitBsuInline(&bb, &rc, t, log2, dst, imm, immv);
+      } else {
+        EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+      }
       ip_dirty = true;
     } else if (ImulDecode(h, rde, xedd.op.uimm0, &dst, &iareg, &ibreg, &imm,
-                          &immv, &log2) &&
-               !GetNeededFlags(m, pc, CF | OF)) {
-      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2);  // CF/OF dead
+                          &immv, &log2)) {
+      // exact CF/OF emitted only if a downstream reader needs them
+      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2,
+               GetNeededFlags(m, pc, CF | OF));
       ip_dirty = true;
     } else if (EmitBW(&bb, &rc, h, rde, xedd.op.uimm0)) {
       // 8/16-bit reg ALU/mov, movzx/movsx, setcc, group3 test/not/neg,
@@ -1149,6 +1560,8 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
       EmitAlu(&bb, &rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
               (int)RexbRm(rde), 0, true, 0, true);
       ip_dirty = true;
+    } else if (TryEmitMemRead(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
+      ip_dirty = true;  // fast path leaves m->ip stale ($slow sets it itself)
     } else {
       RcSpill(&bb, &rc);                    // handler reads regs from memory
       EGet(&bb, 0); EConst(&bb, (i64)pc); EStore(&bb, OFF_IP);  // m->ip = pc
@@ -1188,7 +1601,7 @@ assemble:
   bleb_u(&mb, 1);         // 1 function body
   bleb_u(&mb, body_len);
   bput(&mb, 0x02); bput(&mb, 0x14); bput(&mb, 0x7e);  // 20 i64 (16 GPR + LT0..3)
-  bput(&mb, 0x01); bput(&mb, 0x7f);                   // 1 i32 (FL)
+  bput(&mb, 0x03); bput(&mb, 0x7f);                   // 3 i32 (FL, HP0, HP1)
   bputs(&mb, bb.p, bb.n);
   bput(&mb, 0x0b);        // end
   if (mb.ovf) { free(mem); return false; }
