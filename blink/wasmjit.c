@@ -1100,7 +1100,8 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
         EmitBsuInline(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
         break;
       case kSlImul:
-        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg);
+        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg,
+                 0);  // pre-pass admits kSlImul only when CF/OF are dead
         break;
       default:  // kSlLea
         EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
