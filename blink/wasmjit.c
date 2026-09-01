@@ -32,6 +32,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "blink/alu.h"
 #include "blink/machine.h"
@@ -78,6 +79,11 @@ void OpBsuwi1(P);       // shift/rotate rm16/32/64, 1
 void OpCmov(P);         // cmovcc Gv, Ev (non-parity ccs)
 void OpSax(P);          // cbw/cwde/cdqe
 void OpConvert(P);      // cwd/cdq/cqo
+void OpMovImm(P);       // mov rm, imm (c6/c7)
+void OpNop(P);          // 90 (rex.b = xchg rax,r8; rep = pause)
+void OpXchgZvqp(P);     // xchg rax, reg (91-97)
+void OpXchgGvqpEvqp(P); // xchg rm, reg
+void OpXchgGbEb(P);     // xchg rm8, r8
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -1059,17 +1065,23 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
 // Decide if this insn is an inlinable register-direct 32/64-bit mov.
 static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
                       bool *imm, u64 *immv, int *log2) {
-  int lg = RegLog2(rde);
-  if (lg != 2 && lg != 3) return false;
-  *log2 = lg;
-  *dst = 0; *src = 0; *imm = false; *immv = 0;
+  *dst = 0; *src = 0; *imm = false; *immv = 0; *log2 = 0;
   // every out-param gets a defined value on every true path: callers pass
   // these (by value) into the emitters, and an indeterminate value there is
   // poison the optimizer may act on
-  if (h == OpMovZvqpIvqp) {  // mov reg, imm
+  if (h == OpMovZvqpIvqp) {  // mov reg, imm (b8-bf)
+    // width from Rexw/Osz like WriteRegister: the EVEN opcodes (b8/ba/bc/be
+    // = mov eax/edx/esp/esi!) have RegLog2==0 from the srm byte-op heuristic
+    // and were falling to the handler when keyed off RegLog2.
+    int wlg = (int)WordLog2(rde);
+    if (wlg != 2 && wlg != 3) return false;  // 16-bit merge -> EmitBW
+    *log2 = wlg;
     *dst = (int)RexbSrm(rde); *imm = true; *immv = uimm0;
     return true;
   }
+  int lg = RegLog2(rde);
+  if (lg != 2 && lg != 3) return false;
+  *log2 = lg;
   if (!IsModrmRegister(rde)) return false;  // reg-reg only (memory = later)
   if (h == OpMovEvqpGvqp) {  // mov rm, reg
     *dst = (int)RexbRm(rde); *src = (int)RexrReg(rde); *imm = false;
@@ -1282,6 +1294,24 @@ static void EmitSetcc(struct Buf *b, struct Rc *rc, int cc, int dr, int dsh) {
   EWriteSub(b, rc, dr, dsh, 0);
 }
 
+// xchg: swap two register sub-fields, both written with WriteRegister width
+// semantics (32-bit zero-extends both sides, 8/16-bit merges).
+static void EmitXchg(struct Buf *b, struct Rc *rc, int log2, int ar, int ash,
+                     int br, int bsh) {
+  RcLoad(b, rc, ar);
+  RcLoad(b, rc, br);
+  EGet(b, LOC_GPR + ar);
+  if (ash) { EConst(b, ash); EBin(b, I64_SHRU); }
+  ESet(b, LT2);                    // old a
+  EGet(b, LOC_GPR + br);
+  if (bsh) { EConst(b, bsh); EBin(b, I64_SHRU); }
+  ESet(b, LT3);
+  EWriteSub(b, rc, ar, ash, log2);  // a = old b
+  EGet(b, LT2);
+  ESet(b, LT3);
+  EWriteSub(b, rc, br, bsh, log2);  // b = old a
+}
+
 // cmovcc: dst = (cc ? src : dst), written with WriteRegister width semantics
 // via EWriteSub - so a false 32-bit cmov still zero-extends, 16-bit merges.
 static void EmitCmov(struct Buf *b, struct Rc *rc, int cc, int log2, int dr,
@@ -1358,8 +1388,21 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
     else EmitMovSub(b, rc, 0, rgr, rgs, rmr, rms, false, 0);
     return true;
   }
-  if (h == OpMovZvqpIvqp && lg == 1) {  // mov r16, imm
+  if (h == OpMovZvqpIvqp && (int)WordLog2(rde) == 1) {  // mov r16, imm
     EmitMovSub(b, rc, 1, (int)RexbSrm(rde), 0, 0, 0, true, uimm0);
+    return true;
+  }
+  // mov rm, imm (c6/c7 reg-direct; lg 0 for c6, else osz/rexw width)
+  if (h == OpMovImm && IsModrmRegister(rde)) {
+    if (lg == 0) dr = ByteRegOf((int)RexRexb(rde), &dsh);
+    else dr = (int)RexbRm(rde);
+    if (lg <= 1) {
+      EmitMovSub(b, rc, lg, dr, dsh, 0, 0, true, uimm0);
+    } else {
+      EConst(b, lg == 2 ? (i64)(u64)(u32)uimm0 : (i64)uimm0);
+      ESet(b, LT3);
+      EWriteSub(b, rc, dr, 0, lg);
+    }
     return true;
   }
   if ((h == OpMovEvqpGvqp || h == OpMovGvqpEvqp) && lg == 1 &&
@@ -1409,6 +1452,31 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
       EmitAluSub(b, rc, ALU_NEG, lg, dr, dsh, 0, 0, true, 0, true);
     else  // 0/1: test rm, imm - flags only
       EmitAluSub(b, rc, ALU_AND, lg, dr, dsh, 0, 0, true, uimm0, false);
+    return true;
+  }
+  // nop (90 without rex.b/rep; rex.b makes it xchg rax,r8; rep=3 is pause)
+  if (h == OpNop) {
+    if (Rep(rde) == 3) return false;
+    if (Rexb(rde)) {  // xchg rax, r8
+      EmitXchg(b, rc, (int)WordLog2(rde), 0, 0, (int)RexbSrm(rde), 0);
+      return true;
+    }
+    return true;  // true nop: emit nothing
+  }
+  // xchg reg forms (WriteRegister width semantics both sides)
+  if (h == OpXchgZvqp) {  // 91-97: xchg rax, reg
+    EmitXchg(b, rc, (int)WordLog2(rde), 0, 0, (int)RexbSrm(rde), 0);
+    return true;
+  }
+  if (h == OpXchgGvqpEvqp && IsModrmRegister(rde)) {  // 87 mod3
+    EmitXchg(b, rc, (int)WordLog2(rde), (int)RexrReg(rde), 0,
+             (int)RexbRm(rde), 0);
+    return true;
+  }
+  if (h == OpXchgGbEb && IsModrmRegister(rde)) {  // 86 mod3 (byte)
+    dr = ByteRegOf((int)RexRexr(rde), &dsh);
+    sr = ByteRegOf((int)RexRexb(rde), &ssh);
+    EmitXchg(b, rc, 0, dr, dsh, sr, ssh);
     return true;
   }
   // cmovcc reg,reg (cc 10/11 dispatch to OpCmovp/np, never here)
@@ -1761,6 +1829,16 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     } else if (TryEmitMemWrite(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
       ip_dirty = true;
     } else {
+#ifdef PKJIT_FBPROF
+      { static int fbcnt[0x400], fbtot;
+        fbcnt[Mopcode(rde) & 0x3ff]++;
+        if (++fbtot % 500 == 0) {
+          fprintf(stderr, "FBPROF total=%d:", fbtot);
+          for (int z = 0; z < 0x400; ++z)
+            if (fbcnt[z] > 4) fprintf(stderr, " %03x=%d", z, fbcnt[z]);
+          fprintf(stderr, "\n");
+        } }
+#endif
       RcSpill(&bb, &rc);                    // handler reads regs from memory
       EGet(&bb, 0); EConst(&bb, (i64)pc); EStore(&bb, OFF_IP);  // m->ip = pc
       // m->oplen = this insn's length, so RestoreIp (m->ip -= m->oplen) rewinds
