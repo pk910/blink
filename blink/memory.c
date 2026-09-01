@@ -38,6 +38,10 @@
 #include "blink/util.h"
 #include "blink/x86.h"
 
+#ifdef HAVE_WASM_JIT
+void WasmJitNoteCodeWrite(i64);  // pk910: wasmjit.c stale-block invalidation
+#endif
+
 void SetReadAddr(struct Machine *m, i64 addr, u32 size) {
   if (size) {
     m->readaddr = addr;
@@ -371,6 +375,15 @@ u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
     AddPageToSmcQueue(m, virt);
   }
 #endif
+#ifdef HAVE_WASM_JIT
+  // pk910: the native SMC enqueue above is unreachable on wasm (IsJitDisabled
+  // is constant-true without HAVE_JIT, and the mprotect/segfault catch can't
+  // fire). A guest write to an executable page must still invalidate stale
+  // wasm-JIT blocks; the callee no-ops unless translated code exists there.
+  if ((need & PAGE_RW) && !(entry & PAGE_XD)) {
+    WasmJitNoteCodeWrite(virt);
+  }
+#endif
   if ((host = GetPageAddress(m->system, entry, false))) {
     return host + (virt & 4095);
   } else {
@@ -462,6 +475,11 @@ int VirtualCopy(struct Machine *m, i64 v, char *r, u64 n, bool d) {
       memcpy(r, p, k);
     } else if (!IsRomAddress(m, p)) {
       memcpy(p, r, k);
+#ifdef HAVE_WASM_JIT
+      // pk910: syscall writes (e.g. read() into a code buffer) bypass
+      // LookupAddress2's write path; invalidate stale wasm-JIT blocks too.
+      WasmJitNoteCodeWrite(v);
+#endif
     }
     n -= k;
     r += k;
