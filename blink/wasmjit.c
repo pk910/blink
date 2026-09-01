@@ -55,17 +55,18 @@ void OpJcc(P);          // conditional jump (self-loop terminator detection)
 void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
 void OpBsuwiImm(P);    // shift/rotate rm, imm (kBsu leaf)
 void OpBsuwiCl(P);     // shift/rotate rm, cl
-void OpAluAxImm(P);     // ALU al/ax/eax/rax, imm
-void OpCmpAxImm(P);     // cmp al/ax/eax/rax, imm
-void OpTestAxImm(P);    // test al/ax/eax/rax, imm
-void OpMovEbGb(P);      // mov rm8, r8
-void OpMovGbEb(P);      // mov r8, rm8
-void OpMovZbIb(P);      // mov r8, imm8
-void OpMovzbGvqpEb(P);  // movzx Gv, rm8
+void OpMovzbGvqpEb(P);  // movzx Gv, rm8 (reg + memory-read inlining)
 void OpMovzwGvqpEw(P);  // movzx Gv, rm16
 void OpMovsbGvqpEb(P);  // movsx Gv, rm8
 void OpMovswGvqpEw(P);  // movsx Gv, rm16
 void OpMovslGdqpEd(P);  // movsxd Gv, rm32
+void OpMovImm(P);       // mov rm, imm (0xC6/0xC7; memory-write inlining)
+void OpMovEbGb(P);      // mov rm8, r8 (byte store inlining)
+void OpMovGbEb(P);      // mov r8, rm8 (byte load inlining)
+void OpAluAxImm(P);     // ALU al/ax/eax/rax, imm
+void OpCmpAxImm(P);     // cmp al/ax/eax/rax, imm
+void OpTestAxImm(P);    // test al/ax/eax/rax, imm
+void OpMovZbIb(P);      // mov r8, imm8
 void OpSetcc(P);        // set byte on condition
 void Op0f6(P);          // group3 byte: test/not/neg/mul/div rm8
 void Op0f7(P);          // group3: test/not/neg/mul/div rm16/32/64
@@ -572,8 +573,6 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   i64 mask = w32 ? (i64)0xffffffffLL : (i64)-1;
   int signsh = w32 ? 31 : 63;
   int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
-  // inc/dec (keepcf) preserve CF: keep its bit and don't recompute it.
-  i32 keep = keepcf ? 0x00fff72f : 0x00fff72e;
   // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
   if (dst >= 0) {
     RcLoad(b, rc, dst);
@@ -602,46 +601,64 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT2);
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
-  // DEAD-FLAG ELIMINATION: skip entirely if no downstream reader needs them.
+  // PER-BIT DEAD-FLAG ELIMINATION: recompute only the components some downstream
+  // reader needs (GetNeededFlags mask). Unneeded components keep their stale FL
+  // bits, which is sound by the same oracle: nothing reads them before the next
+  // writer. `needed` bits are x86 flag positions (CF 1<<0 .. OF 1<<11; PF selects
+  // the lazy parity byte at 24-31). A loop tail `sub/cmp + jne` thus emits just
+  // the ZF line instead of all six components.
   if (needed) {
-  FlagsEnsure(b, rc);
-  EGet(b, FL);
-  EConstI(b, keep);
-  EBin(b, I32_AND);  // clears ZF SF OF AF parity (+ CF unless keepcf)
-  // zf<<6
-  EGet(b, LT2); EBin(b, I64_EQZ); EConstI(b, 6); EBin(b, I32_SHL); EBin(b, I32_OR);
-  // sf<<7
-  EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); EBin(b, I64_WRAP);
-  EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
-  if (kind != 0) {  // cf, of, af (logical leaves them 0)
-    if (!keepcf) {  // cf: add z<y ; sub x<z (inc/dec preserve CF)
-      if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
-      else { EGet(b, LT0); EGet(b, LT2); }
-      EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+    i32 clr = 0;  // bits we recompute (for logical CF/OF/AF, clearing IS the value)
+    if (needed & ZF) clr |= ZF;
+    if (needed & SF) clr |= SF;
+    if (needed & PF) clr |= (i32)0xff000000;
+    if ((needed & CF) && !keepcf) clr |= CF;  // inc/dec preserve CF
+    if (needed & OF) clr |= OF;
+    if (needed & AF) clr |= AF;
+    FlagsEnsure(b, rc);
+    EGet(b, FL);
+    EConstI(b, ~clr);
+    EBin(b, I32_AND);
+    if (needed & ZF) {  // zf<<6
+      EGet(b, LT2); EBin(b, I64_EQZ); EConstI(b, 6); EBin(b, I32_SHL);
+      EBin(b, I32_OR);
     }
-    // of<<11
-    if (kind == 1) {  // ((z^x)&(z^y))
-      EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
-      EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
-    } else {  // ((x^y)&(z^x))
-      EGet(b, LT0); EGet(b, LT1); EBin(b, I64_XOR);
-      EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+    if (needed & SF) {  // sf<<7
+      EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); EBin(b, I64_WRAP);
+      EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
     }
-    EBin(b, I64_AND); EConst(b, signsh); EBin(b, I64_SHRU);
-    EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
-    EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
-    // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
-    if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
-                     EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
-    else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
-           EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
-    EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
-  }
-  // parity byte (z & 0xFF) << 24
-  EGet(b, LT2); EConst(b, 0xff); EBin(b, I64_AND); EBin(b, I64_WRAP);
-  EConstI(b, 24); EBin(b, I32_SHL); EBin(b, I32_OR);
-  ESet(b, FL);
-  rc->fl_dirty = 1;
+    if (kind != 0) {  // cf, of, af (logical leaves them cleared = 0)
+      if ((needed & CF) && !keepcf) {  // cf: add z<y ; sub x<z
+        if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
+        else { EGet(b, LT0); EGet(b, LT2); }
+        EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+      }
+      if (needed & OF) {  // of<<11
+        if (kind == 1) {  // ((z^x)&(z^y))
+          EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
+        } else {  // ((x^y)&(z^x))
+          EGet(b, LT0); EGet(b, LT1); EBin(b, I64_XOR);
+          EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+        }
+        EBin(b, I64_AND); EConst(b, signsh); EBin(b, I64_SHRU);
+        EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
+        EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
+      }
+      if (needed & AF) {  // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
+        if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+                         EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
+        else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+               EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
+        EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
+      }
+    }
+    if (needed & PF) {  // parity byte (z & 0xFF) << 24
+      EGet(b, LT2); EConst(b, 0xff); EBin(b, I64_AND); EBin(b, I64_WRAP);
+      EConstI(b, 24); EBin(b, I32_SHL); EBin(b, I32_OR);
+    }
+    ESet(b, FL);
+    rc->fl_dirty = 1;
   }  // if (needed)
   if (wb) {
     EGet(b, LT2);
@@ -770,7 +787,11 @@ static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
 // LT3 holds the guest addr. Opens block $done { block $slow { ... and emits the
 // TLB-hit checks; on the fast path HP0 = host pointer for [addr, addr+size).
 // Any check failing branches to $slow (the handler fallback in EmitMemEnd).
-static void EmitMemBegin(struct Buf *b, int size) {
+// write=true additionally requires PAGE_RW (a fresh-TLB RW entry can't be COW:
+// CowMaybeSplit needs RW clear, so skipping CowSplitRange is equivalent) AND
+// PAGE_XD set (a write to an executable page is the SMC-enqueue case in
+// LookupAddress2 - keep that on the handler).
+static void EmitMemBegin(struct Buf *b, int size, bool write) {
   bput(b, 0x02); bput(b, 0x40);   // block $done
   bput(b, 0x02); bput(b, 0x40);   // block $slow
   // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
@@ -789,8 +810,16 @@ static void EmitMemBegin(struct Buf *b, int size) {
   // the TLB, checked anyway; !HOST would mean s->real, not inlined)
   EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB + 8);
   bput(b, 0x22); bleb_u(b, LT2);  // local.tee
-  EConst(b, (i64)(PAGE_V | PAGE_U | PAGE_HOST | PAGE_RSRV)); EBin(b, I64_AND);
-  EConst(b, (i64)(PAGE_V | PAGE_U | PAGE_HOST));
+  {
+    u64 mask = PAGE_V | PAGE_U | PAGE_HOST | PAGE_RSRV;
+    u64 want = PAGE_V | PAGE_U | PAGE_HOST;
+    if (write) {
+      mask |= PAGE_RW | PAGE_XD;
+      want |= PAGE_RW | PAGE_XD;
+    }
+    EConst(b, (i64)mask); EBin(b, I64_AND);
+    EConst(b, (i64)want);
+  }
   bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
   // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those)
   EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
@@ -852,12 +881,22 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
                            nexgen32e_f h, u64 rde, const struct XedDecodedInst *x,
                            u64 pc_next, u32 oplen) {
   int lg = (int)RegLog2(rde);
-  int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ; 3 cmp [mem],imm
-  int t = 0, dst = 0, ysrc = 0, size = 0;
+  int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ;
+             // 3 cmp [mem],imm ; 4 subword load merged into dst (mov r8/r16)
+  int t = 0, dst = 0, ysrc = 0, size = 0, mergesh = 0;
+  i64 mergemask = 0;
   u8 loadop = 0;
   bool wb = false, sx32 = false;
-  if (lg != 2 && lg != 3) return false;  // 16-bit dst keeps upper bits: fallback
-  if (h == OpMovGvqpEvqp) {              // mov reg, [mem]
+  if (h == OpMovGbEb) {                  // mov r8, [mem] (keeps upper bits)
+    int off = kByteReg[RexRexr(rde)];
+    kind = 4; dst = off >> 3; mergesh = (off & 7) * 8;
+    mergemask = ~((i64)0xff << mergesh); size = 1; loadop = 0x31;
+  } else if (h == OpMovGvqpEvqp && lg == 1) {  // mov r16, [mem] (keeps upper)
+    kind = 4; dst = (int)RexrReg(rde); mergesh = 0;
+    mergemask = ~(i64)0xffff; size = 2; loadop = 0x33;
+  } else if (lg != 2 && lg != 3) {
+    return false;  // remaining 16-bit-dst forms keep upper bits: fallback
+  } else if (h == OpMovGvqpEvqp) {       // mov reg, [mem]
     kind = 0; dst = (int)RexrReg(rde);
     size = 1 << lg; loadop = lg == 2 ? 0x35 : 0x29;  // i64.load32_u / i64.load
   } else if (h == OpMovzbGvqpEb) {       // movzx reg, byte
@@ -892,8 +931,23 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   bool hb, hi, rip;
   if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
   EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (kind == 4) RcLoad(b, rc, dst);  // merge needs the old dst value
   struct Rc pre = *rc;            // the $slow fallback spills THIS state
-  EmitMemBegin(b, size);
+  EmitMemBegin(b, size, false);
+  if (kind == 4) {                // dst = (dst & ~mask) | (load << sh)
+    EGet(b, LOC_GPR + dst);
+    EConst(b, mergemask); EBin(b, I64_AND);
+    EGet(b, HP0);
+    bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);
+    if (mergesh) { EConst(b, mergesh); EBin(b, I64_SHL); }
+    EBin(b, I64_OR);
+    ESet(b, LOC_GPR + dst);
+    rc->loaded[dst] = 1;
+    rc->dirty[dst] = 1;
+    EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
+               pc_next, oplen);
+    return true;
+  }
   EGet(b, HP0);
   bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);  // load [HP0] (align 0)
   if (kind == 0) {
@@ -912,6 +966,81 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
     } else {
       EmitAluInline(b, rc, t, lg, -1, 0, true, x->op.uimm0, false, false, need);
     }
+  }
+  EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
+             pc_next, oplen);
+  return true;
+}
+
+// Try to inline an instruction that WRITES a 32/64-bit MEMORY rm operand:
+// mov [mem],Gv ; mov [mem],imm ; ALU [mem],Gv ; ALU [mem],imm (RMW, not
+// adc/sbb). The fast path requires a fresh TLB entry with RW and XD set (see
+// EmitMemBegin): RW-in-fresh-TLB excludes COW pages, XD-set excludes the SMC
+// path, so skipping SetWriteAddr (watchpoint bookkeeping + CowSplitRange
+// no-op) is semantically identical to the handler.
+static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
+                            nexgen32e_f h, u64 rde,
+                            const struct XedDecodedInst *x, u64 pc_next,
+                            u32 oplen) {
+  int lg = (int)RegLog2(rde);
+  int kind;  // 0 mov [mem],reg ; 1 mov [mem],imm ; 2 alu [mem],reg ; 3 alu [mem],imm
+  int t = 0, ysrc = 0, size, srcsh = 0;
+  u8 storeop, loadop = 0;
+  size = 1 << lg;
+  storeop = lg == 0 ? 0x3c : lg == 1 ? 0x3d : lg == 2 ? 0x3e : 0x37;
+  if (h == OpMovEbGb) {                  // mov [mem], r8 (incl. ah/ch/dh/bh)
+    int off = kByteReg[RexRexr(rde)];
+    kind = 0; ysrc = off >> 3; srcsh = (off & 7) * 8;
+  } else if (h == OpMovEvqpGvqp && lg == 1) {  // mov [mem], r16
+    kind = 0; ysrc = (int)RexrReg(rde);
+  } else if (h == OpMovImm) {            // mov [mem], imm (0xC6/0xC7, any width)
+    kind = 1;
+  } else if (lg != 2 && lg != 3) {
+    return false;                        // 8/16-bit ALU RMW: handler for now
+  } else if (h == OpMovEvqpGvqp) {       // mov [mem], reg
+    kind = 0; ysrc = (int)RexrReg(rde);
+  } else if (h == OpAluw) {              // ALU [mem], reg (RMW)
+    t = (int)((Opcode(rde) & 070) >> 3);
+    if (t == 2 || t == 3) return false;  // adc/sbb need the kAlu leaf: later
+    kind = 2; ysrc = (int)RexrReg(rde);
+    loadop = lg == 2 ? 0x35 : 0x29;
+  } else if (h == OpAlui) {              // ALU [mem], imm (RMW; cmp = read path)
+    t = (int)ModrmReg(rde);
+    if (t == 2 || t == 3 || t == ALU_CMP) return false;
+    kind = 3;
+    loadop = lg == 2 ? 0x35 : 0x29;
+  } else {
+    return false;
+  }
+  int base, index, scale;
+  bool hb, hi, rip;
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (kind == 0 || kind == 2) RcLoad(b, rc, ysrc);  // reg operand
+  struct Rc pre = *rc;
+  EmitMemBegin(b, size, true);
+  if (kind == 0) {                       // [HP0] = reg (store low size bytes)
+    EGet(b, HP0);
+    EGet(b, LOC_GPR + ysrc);
+    if (srcsh) { EConst(b, srcsh); EBin(b, I64_SHRU); }  // ah/ch/dh/bh source
+    bput(b, storeop); bleb_u(b, 0); bleb_u(b, 0);
+  } else if (kind == 1) {                // [HP0] = imm
+    EGet(b, HP0);
+    EConst(b, (i64)x->op.uimm0);
+    bput(b, storeop); bleb_u(b, 0); bleb_u(b, 0);
+  } else {                               // RMW: z = [HP0] OP y ; [HP0] = z
+    EGet(b, HP0);
+    bput(b, loadop); bleb_u(b, 0); bleb_u(b, 0);
+    ESet(b, LT3);                        // x = old memory value
+    int need = GetNeededFlags(m, pc_next, CF | ZF | SF | OF | AF | PF);
+    if (kind == 2) {
+      EmitAluInline(b, rc, t, lg, -1, ysrc, false, 0, false, false, need);
+    } else {
+      EmitAluInline(b, rc, t, lg, -1, 0, true, x->op.uimm0, false, false, need);
+    }
+    EGet(b, HP0);
+    EGet(b, LT2);                        // z (masked to width already)
+    bput(b, storeop); bleb_u(b, 0); bleb_u(b, 0);
   }
   EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
              pc_next, oplen);
@@ -1472,9 +1601,9 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       o->t = t; o->lg = lg; o->d = d; o->im = im; o->iv = iv;
       regs |= 1u << d;
       if (!im) regs |= 1u << 1;  // CL form reads RCX
-    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg) &&
-               !GetNeededFlags(m, (i64)pcn, CF | OF)) {
-      o->kind = kSlImul;  // imul low result; CF/OF (its only flags) are dead
+    } else if (ImulDecode(h, rde, x.op.uimm0, &d, &s, &lb, &im, &iv, &lg)) {
+      o->kind = kSlImul;  // exact CF/OF emitted only if live at pcn
+      o->need = GetNeededFlags(m, (i64)pcn, CF | OF);
       o->d = d; o->s = s; o->b = lb; o->im = im; o->iv = iv; o->lg = lg;
       regs |= 1u << d;
       regs |= 1u << s;
@@ -1527,8 +1656,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
         EmitBsuInline(bb, rc, o->t, o->lg, o->d, o->im, o->iv);
         break;
       case kSlImul:
-        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg,
-                 0);  // pre-pass admits kSlImul only when CF/OF are dead
+        EmitImul(bb, rc, o->d, o->s, o->b, o->im, o->iv, o->lg, o->need);
         break;
       default:  // kSlLea
         EmitLea(bb, rc, o->d, o->lb, o->li, o->lsc, o->ldv, o->lhb, o->lhi,
@@ -1630,6 +1758,8 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
       ip_dirty = true;
     } else if (TryEmitMemRead(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
       ip_dirty = true;  // fast path leaves m->ip stale ($slow sets it itself)
+    } else if (TryEmitMemWrite(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
+      ip_dirty = true;
     } else {
 #ifdef PKJIT_FBPROF
       { static int fbcnt[0x400], fbtot;
