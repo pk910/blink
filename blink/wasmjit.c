@@ -567,8 +567,6 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   i64 mask = w32 ? (i64)0xffffffffLL : (i64)-1;
   int signsh = w32 ? 31 : 63;
   int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
-  // inc/dec (keepcf) preserve CF: keep its bit and don't recompute it.
-  i32 keep = keepcf ? 0x00fff72f : 0x00fff72e;
   // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
   if (dst >= 0) {
     RcLoad(b, rc, dst);
@@ -597,46 +595,64 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT2);
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
-  // DEAD-FLAG ELIMINATION: skip entirely if no downstream reader needs them.
+  // PER-BIT DEAD-FLAG ELIMINATION: recompute only the components some downstream
+  // reader needs (GetNeededFlags mask). Unneeded components keep their stale FL
+  // bits, which is sound by the same oracle: nothing reads them before the next
+  // writer. `needed` bits are x86 flag positions (CF 1<<0 .. OF 1<<11; PF selects
+  // the lazy parity byte at 24-31). A loop tail `sub/cmp + jne` thus emits just
+  // the ZF line instead of all six components.
   if (needed) {
-  FlagsEnsure(b, rc);
-  EGet(b, FL);
-  EConstI(b, keep);
-  EBin(b, I32_AND);  // clears ZF SF OF AF parity (+ CF unless keepcf)
-  // zf<<6
-  EGet(b, LT2); EBin(b, I64_EQZ); EConstI(b, 6); EBin(b, I32_SHL); EBin(b, I32_OR);
-  // sf<<7
-  EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); EBin(b, I64_WRAP);
-  EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
-  if (kind != 0) {  // cf, of, af (logical leaves them 0)
-    if (!keepcf) {  // cf: add z<y ; sub x<z (inc/dec preserve CF)
-      if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
-      else { EGet(b, LT0); EGet(b, LT2); }
-      EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+    i32 clr = 0;  // bits we recompute (for logical CF/OF/AF, clearing IS the value)
+    if (needed & ZF) clr |= ZF;
+    if (needed & SF) clr |= SF;
+    if (needed & PF) clr |= (i32)0xff000000;
+    if ((needed & CF) && !keepcf) clr |= CF;  // inc/dec preserve CF
+    if (needed & OF) clr |= OF;
+    if (needed & AF) clr |= AF;
+    FlagsEnsure(b, rc);
+    EGet(b, FL);
+    EConstI(b, ~clr);
+    EBin(b, I32_AND);
+    if (needed & ZF) {  // zf<<6
+      EGet(b, LT2); EBin(b, I64_EQZ); EConstI(b, 6); EBin(b, I32_SHL);
+      EBin(b, I32_OR);
     }
-    // of<<11
-    if (kind == 1) {  // ((z^x)&(z^y))
-      EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
-      EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
-    } else {  // ((x^y)&(z^x))
-      EGet(b, LT0); EGet(b, LT1); EBin(b, I64_XOR);
-      EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+    if (needed & SF) {  // sf<<7
+      EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); EBin(b, I64_WRAP);
+      EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
     }
-    EBin(b, I64_AND); EConst(b, signsh); EBin(b, I64_SHRU);
-    EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
-    EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
-    // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
-    if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
-                     EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
-    else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
-           EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
-    EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
-  }
-  // parity byte (z & 0xFF) << 24
-  EGet(b, LT2); EConst(b, 0xff); EBin(b, I64_AND); EBin(b, I64_WRAP);
-  EConstI(b, 24); EBin(b, I32_SHL); EBin(b, I32_OR);
-  ESet(b, FL);
-  rc->fl_dirty = 1;
+    if (kind != 0) {  // cf, of, af (logical leaves them cleared = 0)
+      if ((needed & CF) && !keepcf) {  // cf: add z<y ; sub x<z
+        if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
+        else { EGet(b, LT0); EGet(b, LT2); }
+        EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+      }
+      if (needed & OF) {  // of<<11
+        if (kind == 1) {  // ((z^x)&(z^y))
+          EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
+        } else {  // ((x^y)&(z^x))
+          EGet(b, LT0); EGet(b, LT1); EBin(b, I64_XOR);
+          EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
+        }
+        EBin(b, I64_AND); EConst(b, signsh); EBin(b, I64_SHRU);
+        EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
+        EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
+      }
+      if (needed & AF) {  // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
+        if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+                         EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
+        else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+               EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
+        EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
+      }
+    }
+    if (needed & PF) {  // parity byte (z & 0xFF) << 24
+      EGet(b, LT2); EConst(b, 0xff); EBin(b, I64_AND); EBin(b, I64_WRAP);
+      EConstI(b, 24); EBin(b, I32_SHL); EBin(b, I32_OR);
+    }
+    ESet(b, FL);
+    rc->fl_dirty = 1;
   }  // if (needed)
   if (wb) {
     EGet(b, LT2);
