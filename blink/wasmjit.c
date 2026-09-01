@@ -74,6 +74,9 @@ void OpBsubiImm(P);     // shift/rotate rm8, imm
 void OpBsubi1(P);       // shift/rotate rm8, 1
 void OpBsubiCl(P);      // shift/rotate rm8, cl
 void OpBsuwi1(P);       // shift/rotate rm16/32/64, 1
+void OpCmov(P);         // cmovcc Gv, Ev (non-parity ccs)
+void OpSax(P);          // cbw/cwde/cdqe
+void OpConvert(P);      // cwd/cdq/cqo
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -794,6 +797,21 @@ static void EmitSetcc(struct Buf *b, struct Rc *rc, int cc, int dr, int dsh) {
   EWriteSub(b, rc, dr, dsh, 0);
 }
 
+// cmovcc: dst = (cc ? src : dst), written with WriteRegister width semantics
+// via EWriteSub - so a false 32-bit cmov still zero-extends, 16-bit merges.
+static void EmitCmov(struct Buf *b, struct Rc *rc, int cc, int log2, int dr,
+                     int sr) {
+  FlagsEnsure(b, rc);
+  RcLoad(b, rc, dr);
+  RcLoad(b, rc, sr);
+  EGet(b, LOC_GPR + sr);        // taken value
+  EGet(b, LOC_GPR + dr);        // not-taken value (dst unchanged mod width)
+  EmitCond(b, cc);
+  bput(b, 0x1b);                // select
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, 0, log2);
+}
+
 // Decode + emit an inlinable register-direct 8/16-bit op, or a group op the
 // main decoders don't cover at any width (group3 test/not/neg, group5 inc/dec
 // - the dispatch table entry is Op0ff, never OpIncEvqp directly - setcc,
@@ -906,6 +924,30 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
       EmitAluSub(b, rc, ALU_NEG, lg, dr, dsh, 0, 0, true, 0, true);
     else  // 0/1: test rm, imm - flags only
       EmitAluSub(b, rc, ALU_AND, lg, dr, dsh, 0, 0, true, uimm0, false);
+    return true;
+  }
+  // cmovcc reg,reg (cc 10/11 dispatch to OpCmovp/np, never here)
+  if (h == OpCmov && IsModrmRegister(rde)) {
+    int cc = (int)(Opcode(rde) & 15);
+    int wlg = Rexw(rde) ? 3 : !Osz(rde) ? 2 : 1;
+    EmitCmov(b, rc, cc, wlg, (int)RexrReg(rde), (int)RexbRm(rde));
+    return true;
+  }
+  // cbw/cwde/cdqe: rax = sign-extend of its own lower half
+  if (h == OpSax) {
+    int wlg = (int)WordLog2(rde);
+    EmitMovx(b, rc, wlg, 0, 0, 0, wlg - 1, true);
+    return true;
+  }
+  // cwd/cdq/cqo: rdx.sub = sign-fill from rax's top bit
+  if (h == OpConvert) {
+    int wlg = (int)WordLog2(rde);
+    RcLoad(b, rc, 0);
+    EGet(b, LOC_GPR + 0);
+    if (wlg != 3) { EConst(b, 64 - (8 << wlg)); EBin(b, I64_SHL); }
+    EConst(b, 63); EBin(b, I64_SHRS);
+    ESet(b, LT3);
+    EWriteSub(b, rc, 2, 0, wlg);
     return true;
   }
   // shifts/rotates: byte, by-1 and word forms via kBsu leaf (the 32/64-bit

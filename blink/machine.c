@@ -322,11 +322,11 @@ static void TripleOp(P, const nexgen32e_f ops[3]) {
   }
 }
 
-static void OpSax(P) {
+void OpSax(P) {  // pk910: extern for wasmjit inline
   TripleOp(A, kSax);
 }
 
-static void OpConvert(P) {
+void OpConvert(P) {  // pk910: extern for wasmjit inline
   TripleOp(A, kConvert);
 }
 
@@ -1002,7 +1002,7 @@ static void OpCmovImpl(P, bool cond) {
   WriteRegister(rde, RegRexrReg(m, rde), x);
 }
 
-static void OpCmov(P) {
+void OpCmov(P) {  // pk910: extern for wasmjit inline
   cc_f cc;
   cc = GetCc(A);
   OpCmovImpl(A, cc(m));
