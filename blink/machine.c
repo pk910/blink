@@ -635,11 +635,11 @@ static void OpRoAxImm(P, const aluop_f ops[4], const aluop_f fops[4]) {
   }
 }
 
-void OpCmpAxImm(P) {  // pk910: extern for wasmjit inline
+void OpCmpAxImm(P) {  // pk910: extern for wasmjit inline cmp al/ax,imm
   OpRoAxImm(A, kAlu[ALU_SUB], kAluFast[ALU_SUB]);
 }
 
-void OpTestAxImm(P) {  // pk910: extern for wasmjit inline
+void OpTestAxImm(P) {  // pk910: extern for wasmjit inline test al/ax,imm
   OpRoAxImm(A, kAlu[ALU_AND], kAluFast[ALU_AND]);
 }
 
@@ -736,7 +736,7 @@ static void BsuwiConstant(P, u64 y) {
   }
 }
 
-void OpBsuwi1(P) {  // pk910: extern for wasmjit inline
+void OpBsuwi1(P) {  // pk910: extern for wasmjit inline shift-by-1
   BsuwiConstant(A, 1);
 }
 
