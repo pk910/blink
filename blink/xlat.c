@@ -532,6 +532,9 @@ int XlatSocketFamily(int x) {
     XLAT(AF_UNIX_LINUX, AF_UNIX);
     XLAT(AF_INET_LINUX, AF_INET);
     XLAT(AF_INET6_LINUX, AF_INET6);
+#ifdef AF_NETLINK
+    XLAT(AF_NETLINK_LINUX, AF_NETLINK);  // pk910: rtnetlink for ip(8)
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", x);
       errno = ENOPROTOOPT;
@@ -544,6 +547,9 @@ int UnXlatSocketFamily(int x) {
   if (x == AF_UNIX) return AF_UNIX_LINUX;
   if (x == AF_INET) return AF_INET_LINUX;
   if (x == AF_INET6) return AF_INET6_LINUX;
+#ifdef AF_NETLINK
+  if (x == AF_NETLINK) return AF_NETLINK_LINUX;
+#endif
   LOGF("don't know how to translate %s %d", "socket family", x);
   return x;
 }
@@ -1075,6 +1081,20 @@ int XlatSockaddrToHost(struct sockaddr_storage *dst,
       memcpy(&dst_in->sin6_addr, src_in->addr, 16);
       return sizeof(struct sockaddr_in6);
     }
+#ifdef AF_NETLINK
+    case AF_NETLINK_LINUX: {
+      // pk910: sockaddr_nl {u16 family; u16 pad; u32 pid; u32 groups} is the
+      // same 12 bytes on the host, only the family value is translated
+      if (srclen < 12) {
+        LOGF("sockaddr size too small for %s", "sockaddr_nl");
+        return einval();
+      }
+      memset(dst, 0, sizeof(*dst));
+      memcpy(dst, src, 12);
+      dst->ss_family = AF_NETLINK;
+      return 12;
+    }
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", Read16(src->family));
       errno = EAFNOSUPPORT;
@@ -1138,6 +1158,18 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
     dst_in->port = src_in->sin6_port;
     memcpy(dst_in->addr, &src_in->sin6_addr, 16);
     return sizeof(struct sockaddr_in6_linux);
+#ifdef AF_NETLINK
+  } else if (src->sa_family == AF_NETLINK) {
+    // pk910: see XlatSockaddrToHost
+    if (srclen < 12) {
+      LOGF("sockaddr size %d too small for %s", (int)srclen, "sockaddr_nl");
+      return einval();
+    }
+    memset(dst, 0, 12);
+    memcpy(dst, src, 12);
+    Write16((u8 *)dst, AF_NETLINK_LINUX);
+    return 12;
+#endif
   } else {
     LOGF("%s %d not supported yet", "socket family", src->sa_family);
     errno = EAFNOSUPPORT;

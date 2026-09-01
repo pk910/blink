@@ -156,24 +156,42 @@ static int SystemIoctl(int fd, unsigned long request, ...) {
 // back to the main loop. Yield regularly when the process waits for some
 // user input.
 
+// pk910: alarm timers live in the kernel (see SysAlarm/SysSetitimer below)
+extern int js_set_alarm(int ms, int interval_ms);
+
+// pk910: the kernel's poll() is a real blocking wait now (parks this thread,
+// wakes on readiness/timeout), and its read() blocks or honours O_NONBLOCK by
+// itself - so no polling loops and no sleeps here.
 int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-  int ret = VfsPoll(fds, nfds, timeout);
-  if (ret == 0) emscripten_sleep(50);
-  return ret;
+  return VfsPoll(fds, nfds, timeout);
 }
 
 ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
-  // Handle blocking reads by waiting for POLLIN
-  if ((VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) == 0) {
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-    while (em_poll(&pfd, 1, 50) == 0) {
-    }
+  return VfsReadv(fd, iov, iovcnt);
+}
+
+// pk910: one wakeable wait for the guest's poll()/select() loops - the host
+// poll parks the thread until one of the fds is ready or the slice (at most
+// kPollingMs) ends; the caller's probe loop then reports what is ready. Keeps
+// blink's per-fd probing + signal checks, drops the fixed 50ms latency.
+static void PkWaitHostFds(struct pollfd *hfds, size_t n,
+                          const struct timespec *wait) {
+  int ms = wait->tv_sec * 1000 + wait->tv_nsec / 1000000;
+  if (ms < 1) ms = 1;
+  if (n) {
+    poll(hfds, n, ms);
+  } else {
+    nanosleep(wait, 0);
   }
-  size_t ret = VfsReadv(fd, iov, iovcnt);
-  if (ret == -1 && errno == EAGAIN) emscripten_sleep(50);
-  return ret;
+}
+
+static int PkHostFd(struct Machine *m, int fildes) {
+  struct Fd *fd;
+  int host = -1;
+  LOCK(&m->system->fds.lock);
+  if ((fd = GetFd(&m->system->fds, fildes))) host = fd->fildes;
+  UNLOCK(&m->system->fds.lock);
+  return host;
 }
 #endif
 
@@ -4195,6 +4213,36 @@ static int SysGetitimer(struct Machine *m, int which, i64 curvaladdr) {
   return rc;
 }
 
+#ifdef __EMSCRIPTEN__
+static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
+                        i64 oldaddr) {
+  // itimerval_linux: interval {sec u64, usec u64} @0, value {sec, usec} @16
+  int rem;
+  i64 ms = 0, interval_ms = 0;
+  const u8 *nv = 0;
+  u8 ov[32];
+  if ((neuaddr && !(nv = (const u8 *)SchlepR(m, neuaddr, 32))) ||
+      (oldaddr && !IsValidMemory(m, oldaddr, 32, PROT_WRITE))) {
+    return -1;
+  }
+  if (which != 0) return 0;  // ITIMER_VIRTUAL/PROF: accepted, never fire
+  if (nv) {
+    ms = Read64(nv + 16) * 1000 + Read64(nv + 24) / 1000;
+    interval_ms = Read64(nv + 0) * 1000 + Read64(nv + 8) / 1000;
+    if (ms > 2000000000) ms = 2000000000;
+    if (interval_ms > 2000000000) interval_ms = 2000000000;
+    if ((Read64(nv + 16) || Read64(nv + 24)) && ms < 1) ms = 1;
+  }
+  rem = js_set_alarm(nv ? (int)ms : -1, (int)interval_ms);
+  if (oldaddr) {
+    memset(ov, 0, sizeof(ov));
+    Write64(ov + 16, rem / 1000);
+    Write64(ov + 24, (rem % 1000) * 1000);
+    CopyToUserWrite(m, oldaddr, ov, sizeof(ov));
+  }
+  return 0;
+}
+#else
 static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
                         i64 oldaddr) {
   int rc;
@@ -4220,6 +4268,7 @@ static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
   }
   return rc;
 }
+#endif
 
 static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
   struct timespec_linux gt;
@@ -4862,7 +4911,33 @@ static i32 Select(struct Machine *m,          //
     } else {
       wait = FromMilliseconds(kPollingMs);
     }
+#ifdef __EMSCRIPTEN__
+    {
+      // pk910: park on every fd in the sets instead of sleeping blind
+      struct pollfd *whfds;
+      size_t wn = 0;
+      if ((whfds = (struct pollfd *)malloc(sizeof(*whfds) * (nfds + 1)))) {
+        for (fildes = 0; fildes < nfds; ++fildes) {
+          int host;
+          short ev = (FD_ISSET(fildes, &readfds) ? POLLIN : 0) |
+                     (FD_ISSET(fildes, &writefds) ? POLLOUT : 0) |
+                     (FD_ISSET(fildes, &exceptfds) ? POLLPRI : 0);
+          if (!ev) continue;
+          if ((host = PkHostFd(m, fildes)) < 0) continue;
+          whfds[wn].fd = host;
+          whfds[wn].events = ev;
+          whfds[wn].revents = 0;
+          ++wn;
+        }
+        PkWaitHostFds(whfds, wn, &wait);
+        free(whfds);
+      } else {
+        nanosleep(&wait, 0);
+      }
+    }
+#else
     nanosleep(&wait, 0);
+#endif
   }
   if (sigmaskp_guest) {
     m->sigmask = oldmask_guest;
@@ -5007,6 +5082,11 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
             break;
           }
           fildes = Read32(gfds[i].fd);
+          if (fildes < 0) {
+            // pk910: a negative fd is ignored (revents 0), like Linux
+            Write16(gfds[i].revents, 0);
+            continue;
+          }
           LOCK(&m->system->fds.lock);
           if ((fd = GetFd(&m->system->fds, fildes))) {
             unassert(fd->cb);
@@ -5059,7 +5139,35 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
         if (CompareTime(remain, wait) < 0) {
           wait = remain;
         }
+#ifdef __EMSCRIPTEN__
+        {
+          // pk910: park on the polled fds instead of sleeping blind
+          struct pollfd *whfds;
+          size_t wn = 0;
+          if (nfds > 0 && nfds <= 4096 &&
+              (whfds = (struct pollfd *)malloc(sizeof(*whfds) * nfds))) {
+            for (i = 0; i < nfds; ++i) {
+              int host;
+              i32 gfd = Read32(gfds[i].fd);
+              i32 gev = Read16(gfds[i].events);
+              if (gfd < 0) continue;
+              if ((host = PkHostFd(m, gfd)) < 0) continue;
+              whfds[wn].fd = host;
+              whfds[wn].events = ((gev & POLLIN_LINUX) ? POLLIN : 0) |
+                                 ((gev & POLLOUT_LINUX) ? POLLOUT : 0) |
+                                 ((gev & POLLPRI_LINUX) ? POLLPRI : 0);
+              whfds[wn].revents = 0;
+              ++wn;
+            }
+            PkWaitHostFds(whfds, wn, &wait);
+            free(whfds);
+          } else {
+            nanosleep(&wait, 0);
+          }
+        }
+#else
         nanosleep(&wait, 0);
+#endif
       }
       if (rc != -1) {
         CopyToUserWrite(m, fdsaddr, gfds, nfds * sizeof(*gfds));
@@ -5529,9 +5637,22 @@ static int SysGetpgrp(struct Machine *m) {
   return getpgid(0);
 }
 
+#ifdef __EMSCRIPTEN__
+// pk910: the host has no timers that can interrupt a thread parked in the
+// kernel; the kernel keeps the timer and raises SIGALRM in the guest instead
+void EMSCRIPTEN_KEEPALIVE pk_enqueue_signal(int sig) {
+  EnqueueSignal(g_machine, sig);
+}
+
+static int SysAlarm(struct Machine *m, unsigned seconds) {
+  int rem = js_set_alarm(seconds > 2000000 ? 2000000000 : (int)seconds * 1000, 0);
+  return (rem + 999) / 1000;
+}
+#else
 static int SysAlarm(struct Machine *m, unsigned seconds) {
   return alarm(seconds);
 }
+#endif
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
   return setpgid(pid, gid);

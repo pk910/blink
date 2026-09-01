@@ -298,6 +298,82 @@ static int IoctlTiocsti(struct Machine *m, int fildes, i64 addr) {
 }
 #endif
 
+#ifdef __EMSCRIPTEN__
+// pk910: interface ioctls (ifreq/ifconf/rtentry) go to the pk910 kernel's
+// network stack as the raw Linux amd64 struct bytes; blink-lib.js forwards
+// them (js_net_ioctl) and the kernel decodes/encodes the one ABI it owns.
+// Returns 0 or a negative host errno.
+extern int js_net_ioctl(int fd, unsigned long request, void *buf, int len);
+
+#define SIOCADDRT_PK 0x890B
+#define SIOCDELRT_PK 0x890C
+
+static int IoctlNetPassthrough(struct Machine *m, int fildes, u64 request,
+                               i64 addr) {
+  int rc;
+  u8 *buf;
+  size_t len;
+  if (request == SIOCGIFCONF_LINUX) {
+    i32 buflen;
+    i64 bufaddr;
+    const struct ifconf_linux *ifc;
+    if (!(ifc = (const struct ifconf_linux *)SchlepRW(m, addr, sizeof(*ifc)))) {
+      return efault();
+    }
+    buflen = Read32(ifc->len);
+    bufaddr = Read64(ifc->buf);
+    if (buflen < 0 || buflen > 65536) return einval();
+    len = 16 + buflen;
+    if (!(buf = (u8 *)AddToFreeList(m, calloc(1, len)))) return -1;
+    memcpy(buf, ifc, 16);
+    rc = js_net_ioctl(fildes, request, buf, len);
+    if (rc < 0) {
+      errno = -rc;
+      return -1;
+    }
+    if (bufaddr && buflen > 0) {
+      i32 got = Read32(buf);
+      if (got > buflen) got = buflen;
+      if (got > 0 && CopyToUserWrite(m, bufaddr, buf + 16, got) == -1) return -1;
+    }
+    return CopyToUserWrite(m, addr, buf, 4);  // the filled length only
+  }
+  if (request == SIOCADDRT_PK || request == SIOCDELRT_PK) {
+    // struct rtentry (120 bytes) + the rt_dev name when the pointer is set
+    u8 rt[120];
+    i64 devaddr;
+    char name[IFNAMSIZ_LINUX + 1];
+    if (CopyFromUserRead(m, rt, addr, sizeof(rt)) == -1) return -1;
+    devaddr = Read64(rt + 88);
+    memset(name, 0, sizeof(name));
+    if (devaddr) {
+      if (CopyFromUserRead(m, name, devaddr, IFNAMSIZ_LINUX) == -1) return -1;
+      name[IFNAMSIZ_LINUX] = 0;
+    }
+    len = sizeof(rt) + (devaddr ? strlen(name) + 1 : 0);
+    if (!(buf = (u8 *)AddToFreeList(m, calloc(1, len)))) return -1;
+    memcpy(buf, rt, sizeof(rt));
+    if (devaddr) memcpy(buf + sizeof(rt), name, strlen(name) + 1);
+    rc = js_net_ioctl(fildes, request, buf, len);
+    if (rc < 0) {
+      errno = -rc;
+      return -1;
+    }
+    return 0;
+  }
+  // everything else is a struct ifreq (40 bytes)
+  len = 40;
+  if (!(buf = (u8 *)AddToFreeList(m, calloc(1, len)))) return -1;
+  if (CopyFromUserRead(m, buf, addr, len) == -1) return -1;
+  rc = js_net_ioctl(fildes, request, buf, len);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
+  }
+  return CopyToUserWrite(m, addr, buf, len);
+}
+#endif /* __EMSCRIPTEN__ */
+
 int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
   struct Fd *fd;
   int (*tcgetattr_impl)(int, struct termios *);
@@ -403,6 +479,11 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
 #endif /* DISABLE_SOCKETS */
 #endif /* HAVE_SIOCGIFCONF */
     default:
+#ifdef __EMSCRIPTEN__
+      if ((request & 0xff00) == 0x8900 && request != 0x8905) {
+        return IoctlNetPassthrough(m, fildes, request, addr);
+      }
+#endif
       LOGF("missing ioctl %#" PRIx64, request);
       return einval();
   }
