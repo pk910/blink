@@ -54,6 +54,22 @@ void OpJcc(P);          // conditional jump (self-loop terminator detection)
 void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
 void OpBsuwiImm(P);    // shift/rotate rm, imm (kBsu leaf)
 void OpBsuwiCl(P);     // shift/rotate rm, cl
+void OpAluAxImm(P);     // ALU al/ax/eax/rax, imm
+void OpCmpAxImm(P);     // cmp al/ax/eax/rax, imm
+void OpTestAxImm(P);    // test al/ax/eax/rax, imm
+void OpMovEbGb(P);      // mov rm8, r8
+void OpMovGbEb(P);      // mov r8, rm8
+void OpMovZbIb(P);      // mov r8, imm8
+void OpMovzbGvqpEb(P);  // movzx Gv, rm8
+void OpMovzwGvqpEw(P);  // movzx Gv, rm16
+void OpMovsbGvqpEb(P);  // movsx Gv, rm8
+void OpMovswGvqpEw(P);  // movsx Gv, rm16
+void OpMovslGdqpEd(P);  // movsxd Gv, rm32
+void OpSetcc(P);        // set byte on condition
+void Op0f6(P);          // group3 byte: test/not/neg/mul/div rm8
+void Op0f7(P);          // group3: test/not/neg/mul/div rm16/32/64
+void Op0fe(P);          // inc/dec rm8
+void Op0ff(P);          // group5: inc/dec/call/jmp/push rm
 
 // ── config ──────────────────────────────────────────────────────────────────
 #define PKJIT_SHARED    (1u << 15)
@@ -182,6 +198,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_OR  0x84
 #define I64_XOR 0x85
 #define I64_SHRU 0x88
+#define I64_SHRS 0x87
 #define I64_SHL 0x86
 #define I64_MUL 0x7e
 #define I64_LTU 0x54
@@ -580,6 +597,20 @@ static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
 // Decide if this insn is an inlinable register-direct 32/64-bit ALU op.
 static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
                       int *dst, int *src, bool *imm, u64 *immv, bool *wb) {
+  if (h == OpAluAxImm || h == OpCmpAxImm || h == OpTestAxImm) {
+    // ALU rax/eax, imm (no modrm; al/ax forms go through EmitBW instead)
+    int lg = RegLog2(rde);
+    if (lg != 2 && lg != 3) return false;
+    *log2 = lg;
+    *t = h == OpCmpAxImm    ? ALU_SUB
+         : h == OpTestAxImm ? ALU_AND
+                            : (int)((Opcode(rde) & 070) >> 3);
+    *dst = 0;
+    *imm = true;
+    *immv = uimm0;
+    *wb = (h == OpAluAxImm);
+    return true;
+  }
   if (!IsModrmRegister(rde)) return false;  // memory operand -> fallback (M2)
   if (Lock(rde)) return false;
   int lg = RegLog2(rde);
@@ -610,6 +641,253 @@ static bool AluDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *t, int *log2,
   if (h == OpAlui) {  // group1 ALU rm, imm; op = ModrmReg
     *t = (int)ModrmReg(rde); *dst = rm; *imm = true; *immv = uimm0;
     *wb = (*t != ALU_CMP);
+    return true;
+  }
+  return false;
+}
+
+// ── 8/16-bit register-direct ops ────────────────────────────────────────────
+// Byte/word writes do NOT zero-extend: they merge into bits 0..7/0..15 of the
+// 64-bit reg (high-byte regs ah/ch/dh/bh = bits 8..15 of rax..rbx), unlike
+// 32-bit which zero-extends. The arithmetic + flags go through blink's own
+// kAlu[op][log2] leaf (log2 0=8bit 1=16bit) - exact width-specific flags for
+// free; only the operand extract and the writeback merge are done here.
+
+// gpr index + bit shift (0 or 8) of an x86 byte register, from the rex-aware
+// 5-bit index (kByteReg maps it to a byte offset into m->beg = gpr*8 + hi).
+static int ByteRegOf(int k, int *sh) {
+  int off = kByteReg[k];
+  *sh = (off & 7) * 8;
+  return off >> 3;
+}
+
+// write LT3 into GPR r at width log2 (sub-field at bit sh for 8/16-bit).
+// log2 3: raw store; 2: zero-extend; 1/0: mask + merge (upper bits preserved).
+static void EWriteSub(struct Buf *b, struct Rc *rc, int r, int sh, int log2) {
+  if (log2 >= 2) {
+    EGet(b, LT3);
+    if (log2 == 2) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+    ESet(b, LOC_GPR + r);
+  } else {
+    i64 wmask = log2 ? 0xffff : 0xff;
+    RcLoad(b, rc, r);
+    EGet(b, LOC_GPR + r);
+    EConst(b, ~(wmask << sh)); EBin(b, I64_AND);
+    EGet(b, LT3);
+    EConst(b, wmask); EBin(b, I64_AND);
+    if (sh) { EConst(b, sh); EBin(b, I64_SHL); }
+    EBin(b, I64_OR);
+    ESet(b, LOC_GPR + r);
+  }
+  rc->loaded[r] = 1;
+  rc->dirty[r] = 1;
+}
+
+// dst.sub = kAlu[t][log2](m, dst.sub, y) with byte/word merge writeback.
+// Handles any width (used for neg/inc/dec/test-imm at 32/64 too). The leaf
+// truncates its inputs to width and returns the result zero-extended, and
+// writes exact flags to m->flags (FlagsSpill first: adc/sbb/inc/dec read CF).
+static void EmitAluSub(struct Buf *b, struct Rc *rc, int t, int log2, int dr,
+                       int dsh, int sr, int ssh, bool imm, u64 immv, bool wb) {
+  RcLoad(b, rc, dr);
+  if (!imm) RcLoad(b, rc, sr);
+  FlagsSpill(b, rc);            // leaf may read CF from m->flags
+  EGet(b, 0);                   // m
+  EGet(b, LOC_GPR + dr);        // x (leaf truncates to width)
+  if (dsh) { EConst(b, dsh); EBin(b, I64_SHRU); }
+  if (imm) {
+    EConst(b, (i64)immv);
+  } else {
+    EGet(b, LOC_GPR + sr);      // y
+    if (ssh) { EConst(b, ssh); EBin(b, I64_SHRU); }
+  }
+  u32 fidx = (u32)(uintptr_t)kAlu[t][log2];
+  bput(b, 0x41); bleb_s(b, (i64)(i32)fidx);    // i32.const kAlu fn idx
+  bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 -> i64
+  if (wb) {
+    ESet(b, LT3);
+    EWriteSub(b, rc, dr, dsh, log2);
+  } else {
+    bput(b, 0x1a);              // drop (cmp/test: flags only)
+  }
+  rc->fl_loaded = 0;            // leaf wrote m->flags; FL cache stale
+}
+
+// not: dst.sub = ~dst.sub - the only group3 op with NO flag writes, pure wasm.
+static void EmitNotSub(struct Buf *b, struct Rc *rc, int log2, int dr,
+                       int dsh) {
+  RcLoad(b, rc, dr);
+  EGet(b, LOC_GPR + dr);
+  if (dsh) { EConst(b, dsh); EBin(b, I64_SHRU); }
+  EConst(b, -1); EBin(b, I64_XOR);
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, dsh, log2);  // masks to width
+}
+
+// byte/word mov (reg-reg or imm): merge writeback, no flags. log2 is 0 or 1.
+static void EmitMovSub(struct Buf *b, struct Rc *rc, int log2, int dr, int dsh,
+                       int sr, int ssh, bool imm, u64 immv) {
+  if (imm) {
+    EConst(b, (i64)(immv & (log2 ? 0xffff : 0xff)));
+  } else {
+    RcLoad(b, rc, sr);
+    EGet(b, LOC_GPR + sr);
+    if (ssh) { EConst(b, ssh); EBin(b, I64_SHRU); }
+  }
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, dsh, log2);  // masks the value to width
+}
+
+// movzx/movsx: dst = extend(src.sub of width slog2), sign or zero, written at
+// dst width dlog2 (1 merges 16 bits, 2 zero-extends, 3 raw). No flags.
+static void EmitMovx(struct Buf *b, struct Rc *rc, int dlog2, int dr, int sr,
+                     int ssh, int slog2, bool sign) {
+  RcLoad(b, rc, sr);
+  EGet(b, LOC_GPR + sr);
+  if (ssh) { EConst(b, ssh); EBin(b, I64_SHRU); }
+  if (sign) {
+    int k = 64 - (8 << slog2);
+    EConst(b, k); EBin(b, I64_SHL);
+    EConst(b, k); EBin(b, I64_SHRS);
+  } else {
+    EConst(b, slog2 == 0 ? 0xff : slog2 == 1 ? 0xffff : 0xffffffff);
+    EBin(b, I64_AND);
+  }
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, 0, dlog2);
+}
+
+// setcc: dst byte = (cc taken), via EmitCond's FL bit logic. No flags written.
+static void EmitSetcc(struct Buf *b, struct Rc *rc, int cc, int dr, int dsh) {
+  FlagsEnsure(b, rc);
+  EmitCond(b, cc);
+  bput(b, 0xad);                // i64.extend_i32_u
+  ESet(b, LT3);
+  EWriteSub(b, rc, dr, dsh, 0);
+}
+
+// Decode + emit an inlinable register-direct 8/16-bit op, or a group op the
+// main decoders don't cover at any width (group3 test/not/neg, group5 inc/dec
+// - the dispatch table entry is Op0ff, never OpIncEvqp directly - setcc,
+// movzx/movsx). Emits nothing when returning false -> handler fallback.
+static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
+                   u64 uimm0) {
+  if (Lock(rde)) return false;
+  int lg = RegLog2(rde);
+  int dr, dsh, sr, ssh, t;
+  // 8/16-bit ALU: rm,reg / reg,rm / cmp / test / group1-imm (lg 0 <=> byte)
+  if (h == OpAlub || ((h == OpAluw || h == OpAluFlip || h == OpAluCmp ||
+                       h == OpAluFlipCmp || h == OpAluTest || h == OpAlui) &&
+                      lg <= 1)) {
+    if (!IsModrmRegister(rde)) return false;
+    if (h == OpAlub) lg = 0;
+    bool imm = (h == OpAlui);
+    if (imm) t = (int)ModrmReg(rde);
+    else if (h == OpAluCmp || h == OpAluFlipCmp) t = ALU_SUB;
+    else if (h == OpAluTest) t = ALU_AND;
+    else t = (int)((Opcode(rde) & 070) >> 3);
+    bool wb = (h == OpAlub || h == OpAluw || h == OpAluFlip ||
+               (imm && t != ALU_CMP));
+    int rmr, rms = 0, rgr = 0, rgs = 0;
+    if (lg == 0) {
+      rmr = ByteRegOf((int)RexRexb(rde), &rms);
+      if (!imm) rgr = ByteRegOf((int)RexRexr(rde), &rgs);
+    } else {
+      rmr = (int)RexbRm(rde);
+      if (!imm) rgr = (int)RexrReg(rde);
+    }
+    if (h == OpAluFlip || h == OpAluFlipCmp) {
+      dr = rgr; dsh = rgs; sr = rmr; ssh = rms;
+    } else {
+      dr = rmr; dsh = rms; sr = rgr; ssh = rgs;
+    }
+    EmitAluSub(b, rc, t, lg, dr, dsh, sr, ssh, imm, uimm0, wb);
+    return true;
+  }
+  // ALU al/ax,imm (the 32/64-bit forms go through AluDecode's inline path)
+  if (h == OpAluAxImm || h == OpCmpAxImm || h == OpTestAxImm) {
+    if (lg > 1) return false;
+    t = h == OpCmpAxImm    ? ALU_SUB
+        : h == OpTestAxImm ? ALU_AND
+                           : (int)((Opcode(rde) & 070) >> 3);
+    EmitAluSub(b, rc, t, lg, 0, 0, 0, 0, true, uimm0, h == OpAluAxImm);
+    return true;
+  }
+  // 8/16-bit reg-reg/imm mov
+  if (h == OpMovZbIb) {  // mov r8, imm8 (no modrm; srm-encoded reg)
+    dr = ByteRegOf((int)RexRexbSrm(rde), &dsh);
+    EmitMovSub(b, rc, 0, dr, dsh, 0, 0, true, uimm0);
+    return true;
+  }
+  if ((h == OpMovEbGb || h == OpMovGbEb) && IsModrmRegister(rde)) {
+    int rmr, rms, rgr, rgs;
+    rmr = ByteRegOf((int)RexRexb(rde), &rms);
+    rgr = ByteRegOf((int)RexRexr(rde), &rgs);
+    if (h == OpMovEbGb) EmitMovSub(b, rc, 0, rmr, rms, rgr, rgs, false, 0);
+    else EmitMovSub(b, rc, 0, rgr, rgs, rmr, rms, false, 0);
+    return true;
+  }
+  if (h == OpMovZvqpIvqp && lg == 1) {  // mov r16, imm
+    EmitMovSub(b, rc, 1, (int)RexbSrm(rde), 0, 0, 0, true, uimm0);
+    return true;
+  }
+  if ((h == OpMovEvqpGvqp || h == OpMovGvqpEvqp) && lg == 1 &&
+      IsModrmRegister(rde)) {
+    dr = (int)RexbRm(rde); sr = (int)RexrReg(rde);
+    if (h == OpMovGvqpEvqp) { int x = dr; dr = sr; sr = x; }
+    EmitMovSub(b, rc, 1, dr, 0, sr, 0, false, 0);
+    return true;
+  }
+  // movzx / movsx (register-direct). Dst width comes from Rexw/Osz exactly
+  // like WriteRegister does - RegLog2 is the rm SOURCE width for the byte
+  // forms (0f b6/be), so it must not be used for the destination.
+  {
+    int dlg = Rexw(rde) ? 3 : !Osz(rde) ? 2 : 1;
+    if ((h == OpMovzbGvqpEb || h == OpMovsbGvqpEb) && IsModrmRegister(rde)) {
+      sr = ByteRegOf((int)RexRexb(rde), &ssh);
+      EmitMovx(b, rc, dlg, (int)RexrReg(rde), sr, ssh, 0,
+               h == OpMovsbGvqpEb);
+      return true;
+    }
+    if ((h == OpMovzwGvqpEw || h == OpMovswGvqpEw) && IsModrmRegister(rde)) {
+      EmitMovx(b, rc, dlg, (int)RexrReg(rde), (int)RexbRm(rde), 0, 1,
+               h == OpMovswGvqpEw);
+      return true;
+    }
+    if (h == OpMovslGdqpEd && IsModrmRegister(rde)) {  // movsxd
+      EmitMovx(b, rc, dlg, (int)RexrReg(rde), (int)RexbRm(rde), 0, 2, true);
+      return true;
+    }
+  }
+  // setcc reg (cc 10/11 = P/NP can't appear: they dispatch to OpSetp/OpSetnp)
+  if (h == OpSetcc && IsModrmRegister(rde)) {
+    int cc = (int)(Opcode(rde) & 15);
+    if (cc == 10 || cc == 11) return false;
+    dr = ByteRegOf((int)RexRexb(rde), &dsh);
+    EmitSetcc(b, rc, cc, dr, dsh);
+    return true;
+  }
+  // group3 (f6/f7): test rm,imm / not / neg (mul + div -> fallback)
+  if ((h == Op0f6 || h == Op0f7) && IsModrmRegister(rde)) {
+    int sub = (int)ModrmReg(rde);
+    if (sub > 3) return false;
+    if (h == Op0f6) { lg = 0; dr = ByteRegOf((int)RexRexb(rde), &dsh); }
+    else { lg = (int)WordLog2(rde); dr = (int)RexbRm(rde); dsh = 0; }
+    if (sub == 2) EmitNotSub(b, rc, lg, dr, dsh);
+    else if (sub == 3)
+      EmitAluSub(b, rc, ALU_NEG, lg, dr, dsh, 0, 0, true, 0, true);
+    else  // 0/1: test rm, imm - flags only
+      EmitAluSub(b, rc, ALU_AND, lg, dr, dsh, 0, 0, true, uimm0, false);
+    return true;
+  }
+  // inc/dec rm (fe/ff; ff /2../7 call/jmp/push -> fallback)
+  if ((h == Op0fe || h == Op0ff) && IsModrmRegister(rde)) {
+    int sub = (int)ModrmReg(rde);
+    if (sub > 1) return false;
+    if (h == Op0fe) { lg = 0; dr = ByteRegOf((int)RexRexb(rde), &dsh); }
+    else { lg = (int)WordLog2(rde); dr = (int)RexbRm(rde); dsh = 0; }
+    EmitAluSub(b, rc, sub ? ALU_DEC : ALU_INC, lg, dr, dsh, 0, 0, true, 0,
+               true);
     return true;
   }
   return false;
@@ -774,6 +1052,10 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
                           &immv, &log2) &&
                !GetNeededFlags(m, pc, CF | OF)) {
       EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2);  // CF/OF dead
+      ip_dirty = true;
+    } else if (EmitBW(&bb, &rc, h, rde, xedd.op.uimm0)) {
+      // 8/16-bit reg ALU/mov, movzx/movsx, setcc, group3 test/not/neg,
+      // group5 inc/dec (any width)
       ip_dirty = true;
     } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
                (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
