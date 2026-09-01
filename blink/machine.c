@@ -229,7 +229,7 @@ static relegated void OpXlatAlBbb(P) {
   m->al = Load8(ResolveAddress(m, v));
 }
 
-static void OpXchgZvqp(P) {
+void OpXchgZvqp(P) {  // pk910: extern for wasmjit inline
   u64 x, y;
   x = Get64(m->ax);
   y = Get64(RegRexbSrm(m, rde));
@@ -416,7 +416,7 @@ void OpMovZvqpIvqp(P) {  // pk910: extern for wasmjit inline mov
   }
 }
 
-static void OpMovImm(P) {
+void OpMovImm(P) {  // pk910: extern for wasmjit inline
   WriteRegisterOrMemoryBW(rde, GetModrmWriteBW(A), uimm0);
   if (IsMakingPath(m)) {
     Jitter(A,
@@ -1468,7 +1468,7 @@ static void OpUd0GvqpEvqp(P) {
 }
 #endif
 
-static void OpNop(P) {
+void OpNop(P) {  // pk910: extern for wasmjit inline
   if (Rexb(rde)) {
     OpXchgZvqp(A);
   } else if (Rep(rde) == 3) {
