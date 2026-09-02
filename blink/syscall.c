@@ -5431,11 +5431,6 @@ static int SysPause(struct Machine *m) {
 }
 
 static int SysSetsid(struct Machine *m) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
   return setsid();
 }
 
@@ -5524,11 +5519,6 @@ static i32 SysSetresuid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
 #ifdef HAVE_SETRESUID
   return setresuid(real, effective, saved);
 #elif defined(HAVE_SETREUID)
@@ -5548,11 +5538,6 @@ static i32 SysSetresgid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
 #ifdef HAVE_SETRESGID
   return setresgid(real, effective, saved);
 #elif defined(HAVE_SETREGID)
@@ -5569,11 +5554,6 @@ static i32 SysSetresgid(struct Machine *m,  //
 }
 
 static int SysSetreuid(struct Machine *m, u32 real, u32 effective) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
 #ifdef HAVE_SETRESUID
   // If the real user ID is set (i.e., ruid is not -1) or the effective
   // user ID is set to a value not equal to the previous real user ID,
@@ -5591,11 +5571,6 @@ static int SysSetreuid(struct Machine *m, u32 real, u32 effective) {
 }
 
 static int SysSetregid(struct Machine *m, u32 real, u32 effective) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
 #ifdef HAVE_SETRESUID
   if (real != -1 || (effective != -1 && effective != getgid())) {
     if (effective == -1) effective = getegid();
@@ -5673,20 +5648,10 @@ static int SysUmask(struct Machine *m, int mask) {
 }
 
 static int SysSetuid(struct Machine *m, int uid) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
   return setuid(uid);
 }
 
 static int SysSetgid(struct Machine *m, int gid) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
   return setgid(gid);
 }
 
@@ -5716,11 +5681,6 @@ static int SysAlarm(struct Machine *m, unsigned seconds) {
 #endif
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
-#ifdef __EMSCRIPTEN__
-  // pk910: one user, no host ids to change - accept every change of identity
-  // and session (xterm resets its ids and calls setsid before the shell)
-  return 0;
-#endif
   return setpgid(pid, gid);
 }
 
