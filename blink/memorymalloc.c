@@ -52,6 +52,11 @@ struct Allocator {
 
 struct Machine g_bssmachine;
 struct HostPages g_hostpages;
+// pk910: g_hostpages (the COW host-page table + refcounts) is shared by every
+// System in a runtime. With shared-memory fork, many processes allocate/free/
+// refcount pages concurrently, so all access is serialised by this leaf lock
+// (it nests nothing else). Non-atomic refs and the realloc-grow raced otherwise.
+static pthread_mutex_t_ g_hostpageslock = PTHREAD_MUTEX_INITIALIZER_;
 
 static void FillPage(void *p, int c) {
   memset(p, c, 4096);
@@ -74,6 +79,7 @@ static u64 TrackHostPage(u8 *ptr) {
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
   } else {
+    LOCK(&g_hostpageslock);
     if (g_hostpages.n == g_hostpages.c) {
       g_hostpages.c += 1;
       g_hostpages.c += g_hostpages.c >> 1;
@@ -86,6 +92,7 @@ static u64 TrackHostPage(u8 *ptr) {
     entry = g_hostpages.n++;
     g_hostpages.p[entry] = ptr;
     g_hostpages.refs[entry] = 1;  // pk910: one owner until fork shares it
+    UNLOCK(&g_hostpageslock);
     return entry << 12;
   }
 }
@@ -93,18 +100,29 @@ static u64 TrackHostPage(u8 *ptr) {
 // pk910: host-page refcounts drive copy-on-write fork. A page shared between a
 // forked parent and child is freed only when the last owner drops it.
 void IncHostPageRef(u64 entry) {
-  if (!HasLinearMapping()) g_hostpages.refs[(entry & PAGE_TA) >> 12] += 1;
+  if (HasLinearMapping()) return;
+  LOCK(&g_hostpageslock);
+  g_hostpages.refs[(entry & PAGE_TA) >> 12] += 1;
+  UNLOCK(&g_hostpageslock);
 }
 bool DecHostPageRef(u64 entry) {
   size_t i;
+  bool zero;
   if (HasLinearMapping()) return true;
   i = (entry & PAGE_TA) >> 12;
+  LOCK(&g_hostpageslock);
   unassert(g_hostpages.refs[i] > 0);
-  return --g_hostpages.refs[i] == 0;
+  zero = --g_hostpages.refs[i] == 0;
+  UNLOCK(&g_hostpageslock);
+  return zero;
 }
 u32 GetHostPageRef(u64 entry) {
+  u32 r;
   if (HasLinearMapping()) return 1;
-  return g_hostpages.refs[(entry & PAGE_TA) >> 12];
+  LOCK(&g_hostpageslock);
+  r = g_hostpages.refs[(entry & PAGE_TA) >> 12];
+  UNLOCK(&g_hostpageslock);
+  return r;
 }
 
 void FreeAnonymousPage(struct System *s, u8 *page) {
