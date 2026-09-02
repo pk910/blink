@@ -749,7 +749,88 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
   return pid;
 }
 
-int PkForkRemote(struct Machine *);  // pkfork.c: the child in its own worker
+int PkForkRemote(struct Machine *);  // pkfork.c: the child in its own worker (deprecated)
+
+#ifdef __EMSCRIPTEN__
+// pk910 shared-memory fork: the child is a PTHREAD of this same runtime with
+// its own copy-on-write System in the shared linear memory - no snapshot, no
+// copy. js_forkchild asks the kernel to allocate the child pid and clone the fd
+// table; js_hello binds the child pthread's own kernel channel to that pid.
+extern int js_forkchild(void);       // -> child pid, or -errno
+extern int js_hello(int pid, int kind);  // kind: 0 = process (fork child), 1 = thread
+
+struct PkForkArg {
+  struct Machine *m;
+  int pid;
+};
+
+// The forked child's pthread: announce our pid to the kernel (so our brokered
+// channel routes to the child KProc, not the parent's), then run. The machine
+// already carries the parent's registers with rax = 0.
+static void *OnSpawnFork(void *arg) {
+  int rc;
+  struct PkForkArg *fa = (struct PkForkArg *)arg;
+  struct Machine *m = fa->m;
+  int pid = fa->pid;
+  free(fa);
+  m->thread = pthread_self();
+  js_hello(pid, 0);
+  if (!(rc = sigsetjmp(m->onhalt, 1))) {
+    m->canhalt = true;
+    unassert(!pthread_sigmask(SIG_SETMASK, &m->spawn_sigmask, 0));
+  } else if (rc == kMachineFatalSystemSignal) {
+    HandleFatalSystemSignal(m, &g_siginfo);
+  }
+  Blink(m);
+  return 0;
+}
+
+// fork(): COW-clone the address space in place, spawn the child on its own
+// pthread, hand the parent the child's pid. Real fork semantics, zero copy.
+static int PkForkThread(struct Machine *m) {
+  int pid, err;
+  pthread_t thread;
+  pthread_attr_t attr;
+  sigset_t ss, oldss;
+  struct System *child;
+  struct Machine *m2;
+  struct PkForkArg *fa;
+  m->threaded = true;
+  m->system->jit.threaded = true;
+  if (!(child = CloneSystem(m->system))) return enomem();
+  child->jit.threaded = true;
+  sigfillset(&ss);
+  unassert(!pthread_sigmask(SIG_SETMASK, &ss, &oldss));
+  if (!(m2 = NewMachine(child, m))) {
+    unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
+    FreeSystem(child);
+    return eagain();
+  }
+  Write64(m2->ax, 0);           // the child returns 0 from fork
+  m2->spawn_sigmask = oldss;
+  if ((pid = js_forkchild()) < 0) {
+    FreeMachine(m2);            // frees the child System too (last machine)
+    unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
+    errno = -pid;
+    return -1;
+  }
+  fa = (struct PkForkArg *)malloc(sizeof(*fa));
+  fa->m = m2;
+  fa->pid = pid;
+  unassert(!pthread_attr_init(&attr));
+  unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
+  err = pthread_create(&thread, &attr, OnSpawnFork, fa);
+  unassert(!pthread_attr_destroy(&attr));
+  unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
+  if (err) {
+    free(fa);
+    FreeMachine(m2);
+    errno = EAGAIN;
+    return -1;
+  }
+  return pid;
+}
+#endif
 
 // vfork: the child runs in place on a copy-on-write clone of the parent's
 // System until it exits or execs, the parent suspended meanwhile - which is
@@ -794,7 +875,7 @@ static int SysVfork(struct Machine *m) {
 // worker; the parent gets the pid and goes on. Real fork semantics.
 static int SysFork(struct Machine *m) {
 #ifdef __EMSCRIPTEN__
-  return PkForkRemote(m);
+  return PkForkThread(m);
 #else
   return Fork(m, 0, 0, 0);
 #endif
