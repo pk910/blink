@@ -292,7 +292,11 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
     }
     p += ROUNDUP(sizeof(rec) + rec.pathlen, 8);
   }
-  // pages
+  // pages: the root table first (LoadProgram's job in an exec)
+  if ((s->cr3 = AllocatePageTable(s)) == (u64)-1) {
+    fprintf(stderr, "blink: fork restore: no page table root\n");
+    return -1;
+  }
   pages = (const struct PkPage *)p;
   data = p + hdr.npages * sizeof(struct PkPage);
   if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: restore: %llu fds, %llu pages (%llu with data)\n", (unsigned long long)hdr.nfds, (unsigned long long)hdr.npages, (unsigned long long)hdr.ndata);
