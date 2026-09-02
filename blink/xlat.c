@@ -640,6 +640,9 @@ int XlatSocketOptname(int level, int optname) {
 #ifdef SO_REUSEPORT
         XLAT(SO_REUSEPORT_LINUX, SO_REUSEPORT);
 #endif
+#ifdef SO_BINDTODEVICE
+        XLAT(SO_BINDTODEVICE_LINUX, SO_BINDTODEVICE);  // pk910: arping/udhcpc -i
+#endif
 #endif
         default:
           break;
