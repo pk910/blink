@@ -1787,8 +1787,10 @@ static int SysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
   flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
   type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
   if ((type = XlatSocketType(type)) == -1) return -1;
+  // pk910: a packet socket's protocol is an ethertype (htons(ETH_P_*)), not
+  // an IPPROTO_* number; the JS kernel takes it as is
+  if (family != AF_PACKET_LINUX && (protocol = XlatSocketProtocol(protocol)) == -1) return -1;
   if ((family = XlatSocketFamily(family)) == -1) return -1;
-  if ((protocol = XlatSocketProtocol(protocol)) == -1) return -1;
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
   if (flags) LOCK(&m->system->exec_lock);
   if ((fildes = VfsSocket(family, type, protocol)) != -1) {
