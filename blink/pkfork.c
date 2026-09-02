@@ -8,6 +8,7 @@
 // running: fork semantics, not vfork's. (vfork keeps the in-place child in
 // syscall.c: that IS vfork's contract.)
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -259,9 +260,15 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
   const struct PkPage *pages;
   const u8 *data;
   struct System *s = m->system;
-  if (len < sizeof(hdr)) return -1;
+  if (len < sizeof(hdr)) {
+    fprintf(stderr, "blink: fork snapshot too short (%llu)\n", (unsigned long long)len);
+    return -1;
+  }
   memcpy(&hdr, buf, sizeof(hdr));
-  if (hdr.magic != PK_SNAP_MAGIC || hdr.total != len) return -1;
+  if (hdr.magic != PK_SNAP_MAGIC || hdr.total != len) {
+    fprintf(stderr, "blink: fork snapshot header mismatch (magic %llx, total %llu, len %llu)\n", (unsigned long long)hdr.magic, (unsigned long long)hdr.total, (unsigned long long)len);
+    return -1;
+  }
   p = buf + sizeof(hdr);
   memcpy(&cpu, p, sizeof(cpu));
   p += sizeof(cpu);
@@ -290,13 +297,26 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
     const struct PkPage *pg = &pages[i];
     u8 *slot;
     u64 entry, page;
-    if (ReserveVirtual(s, pg->vaddr, 4096, pg->flags, -1, 0, false, true) != pg->vaddr) return -1;
+    i64 got = ReserveVirtual(s, pg->vaddr, 4096, pg->flags, -1, 0, false, true);
+    if (got != pg->vaddr) {
+      fprintf(stderr, "blink: fork restore: cannot map page %llx flags %llx (got %llx, errno %d)\n", (unsigned long long)pg->vaddr, (unsigned long long)pg->flags, (unsigned long long)got, errno);
+      return -1;
+    }
     if (pg->slot == PK_PAGE_RESERVED) continue;
     // fill it in place: allocate the anonymous page the first touch would
-    if (!(slot = LeafSlot(s, pg->vaddr))) return -1;
+    if (!(slot = LeafSlot(s, pg->vaddr))) {
+      fprintf(stderr, "blink: fork restore: no leaf for %llx\n", (unsigned long long)pg->vaddr);
+      return -1;
+    }
     entry = LoadPte(slot);
-    if (!(entry & PAGE_RSRV)) return -1;
-    if ((page = AllocateAnonymousPage(s)) == (u64)-1) return -1;
+    if (!(entry & PAGE_RSRV)) {
+      fprintf(stderr, "blink: fork restore: leaf %llx not reserved (%llx)\n", (unsigned long long)pg->vaddr, (unsigned long long)entry);
+      return -1;
+    }
+    if ((page = AllocateAnonymousPage(s)) == (u64)-1) {
+      fprintf(stderr, "blink: fork restore: out of pages at %llx\n", (unsigned long long)pg->vaddr);
+      return -1;
+    }
     memcpy(FindHostPage(page), data + pg->slot * 4096, 4096);
     StorePte(slot, (page & (PAGE_TA | PAGE_HOST)) | (entry & ~(u64)(PAGE_TA | PAGE_RSRV)));
     s->memstat.committed += 1;
@@ -333,7 +353,10 @@ int PkRestoreFork(struct Machine *m) {
   unsigned len;
   int rc;
   len = js_fork_snapshot_size();
-  if (!len || !(buf = (u8 *)malloc(len))) return -1;
+  if (!len || !(buf = (u8 *)malloc(len))) {
+    fprintf(stderr, "blink: fork restore: no snapshot (%u bytes)\n", len);
+    return -1;
+  }
   js_fork_snapshot_read(buf, len);
   rc = PkRestore(m, buf, len);
   free(buf);
