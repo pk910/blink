@@ -224,7 +224,9 @@ int PkForkRemote(struct Machine *m) {
   u64 len;
   int rc;
   if (!(buf = PkSerialize(m, &len))) return enomem();
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork snapshot %llu bytes\n", (unsigned long long)len);
   rc = js_fork(buf, len);
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork -> %d\n", rc);
   free(buf);
   if (rc < 0) {
     errno = -rc;
@@ -359,6 +361,7 @@ int PkRestoreFork(struct Machine *m) {
   }
   js_fork_snapshot_read(buf, len);
   rc = PkRestore(m, buf, len);
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork restore %s (%u bytes)\n", rc ? "failed" : "ok", len);
   free(buf);
   return rc;
 }
