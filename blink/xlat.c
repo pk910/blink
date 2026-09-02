@@ -535,6 +535,9 @@ int XlatSocketFamily(int x) {
 #ifdef AF_NETLINK
     XLAT(AF_NETLINK_LINUX, AF_NETLINK);  // pk910: rtnetlink for ip(8)
 #endif
+#ifdef AF_PACKET
+    XLAT(AF_PACKET_LINUX, AF_PACKET);  // pk910: packet sockets for udhcpc/arping
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", x);
       errno = ENOPROTOOPT;
@@ -549,6 +552,9 @@ int UnXlatSocketFamily(int x) {
   if (x == AF_INET6) return AF_INET6_LINUX;
 #ifdef AF_NETLINK
   if (x == AF_NETLINK) return AF_NETLINK_LINUX;
+#endif
+#ifdef AF_PACKET
+  if (x == AF_PACKET) return AF_PACKET_LINUX;
 #endif
   LOGF("don't know how to translate %s %d", "socket family", x);
   return x;
@@ -1110,6 +1116,20 @@ int XlatSockaddrToHost(struct sockaddr_storage *dst,
       return 12;
     }
 #endif
+#ifdef AF_PACKET
+    case AF_PACKET_LINUX: {
+      // pk910: sockaddr_ll {u16 family; u16 protocol; i32 ifindex; u16 hatype;
+      // u8 pkttype; u8 halen; u8 addr[8]} is the same 20 bytes on the host
+      if (srclen < 20) {
+        LOGF("sockaddr size too small for %s", "sockaddr_ll");
+        return einval();
+      }
+      memset(dst, 0, sizeof(*dst));
+      memcpy(dst, src, 20);
+      dst->ss_family = AF_PACKET;
+      return 20;
+    }
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", Read16(src->family));
       errno = EAFNOSUPPORT;
@@ -1184,6 +1204,18 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
     memcpy(dst, src, 12);
     Write16((u8 *)dst, AF_NETLINK_LINUX);
     return 12;
+#endif
+#ifdef AF_PACKET
+  } else if (src->sa_family == AF_PACKET) {
+    // pk910: see XlatSockaddrToHost
+    if (srclen < 20) {
+      LOGF("sockaddr size %d too small for %s", (int)srclen, "sockaddr_ll");
+      return einval();
+    }
+    memset(dst, 0, 20);
+    memcpy(dst, src, 20);
+    Write16((u8 *)dst, AF_PACKET_LINUX);
+    return 20;
 #endif
   } else {
     LOGF("%s %d not supported yet", "socket family", src->sa_family);
