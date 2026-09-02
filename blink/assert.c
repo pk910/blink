@@ -32,6 +32,14 @@ void AssertFailed(const char *file, int line, const char *msg) {
   _Thread_local static bool noreentry;
   _Thread_local static char bp[20000];
   WriteErrorString("assertion failed\n");
+#ifdef __EMSCRIPTEN__
+  // pk910: say where before the backtrace machinery (which may assert again)
+  {
+    char where[512];
+    snprintf(where, sizeof(where), "%s:%d: %s\n", file, line, msg);
+    WriteErrorString(where);
+  }
+#endif
   if (!noreentry) {
     noreentry = true;
     FLAG_nologstderr = false;
