@@ -650,13 +650,47 @@ addToLibrary({
     } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_getuid32__proxy: 'none',
-  __syscall_getuid32: function () { return 0; },
+  __syscall_getuid32: function () { try { return ksys('getids', []).uid | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_geteuid32__deps: ['$PKSYS'],
   __syscall_geteuid32__proxy: 'none',
-  __syscall_geteuid32: function () { return 0; },
+  __syscall_geteuid32: function () { try { return ksys('getids', []).euid | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_getgid32__deps: ['$PKSYS'],
   __syscall_getgid32__proxy: 'none',
-  __syscall_getgid32: function () { return 0; },
+  __syscall_getgid32: function () { try { return ksys('getids', []).gid | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_getegid32__deps: ['$PKSYS'],
   __syscall_getegid32__proxy: 'none',
-  __syscall_getegid32: function () { return 0; },
+  __syscall_getegid32: function () { try { return ksys('getids', []).egid | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_setuid32__deps: ['$PKSYS'],
+  __syscall_setuid32__proxy: 'none',
+  __syscall_setuid32: function (uid) { try { ksys('setuid', [uid]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_setgid32__deps: ['$PKSYS'],
+  __syscall_setgid32__proxy: 'none',
+  __syscall_setgid32: function (gid) { try { ksys('setgid', [gid]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_setreuid32__deps: ['$PKSYS'],
+  __syscall_setreuid32__proxy: 'none',
+  __syscall_setreuid32: function (r, e) { try { ksys('setreuid', [r, e]); return 0; } catch (err) { return PKSYS.errS(err); } },
+  __syscall_setregid32__deps: ['$PKSYS'],
+  __syscall_setregid32__proxy: 'none',
+  __syscall_setregid32: function (r, e) { try { ksys('setregid', [r, e]); return 0; } catch (err) { return PKSYS.errS(err); } },
+  __syscall_setresuid32__deps: ['$PKSYS'],
+  __syscall_setresuid32__proxy: 'none',
+  __syscall_setresuid32: function (r, e, s) { try { ksys('setresuid', [r, e, s]); return 0; } catch (err) { return PKSYS.errS(err); } },
+  __syscall_setresgid32__deps: ['$PKSYS'],
+  __syscall_setresgid32__proxy: 'none',
+  __syscall_setresgid32: function (r, e, s) { try { ksys('setresgid', [r, e, s]); return 0; } catch (err) { return PKSYS.errS(err); } },
+  // ── sessions and process groups live in the kernel ──
+  __syscall_setsid__deps: ['$PKSYS'],
+  __syscall_setsid__proxy: 'none',
+  __syscall_setsid: function () { try { return ksys('setsid', []) | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_getsid__deps: ['$PKSYS'],
+  __syscall_getsid__proxy: 'none',
+  __syscall_getsid: function (pid) { try { return ksys('getsid', [pid]) | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_getpgid__deps: ['$PKSYS'],
+  __syscall_getpgid__proxy: 'none',
+  __syscall_getpgid: function (pid) { try { return ksys('getpgid', [pid]) | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_setpgid__deps: ['$PKSYS'],
+  __syscall_setpgid__proxy: 'none',
+  __syscall_setpgid: function (pid, pgid) { try { ksys('setpgid', [pid, pgid]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_pipe2__deps: ['$PKSYS'],
   __syscall_pipe2__proxy: 'none',
   __syscall_pipe2: function (fdptr) { try { var fds = ksys('pipe', []); HEAP32[fdptr >> 2] = fds[0]; HEAP32[(fdptr + 4) >> 2] = fds[1]; return 0; } catch (e) { return PKSYS.errS(e); } },
@@ -695,9 +729,13 @@ addToLibrary({
       }
       // ── ptys: posix_openpt/grantpt/unlockpt/ptsname, job control no-ops ──
       if (op === 0x80045430) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'TIOCGPTN']) | 0; return 0; } // TIOCGPTN
-      if (op === 0x40045431) { ksys('ioctl', [fd, 'TIOCSPTLCK']); return 0; } // TIOCSPTLCK
-      if (op === 0x540e || op === 0x5410 || op === 0x5422 || op === 0x540b) return 0; // TIOCSCTTY, TIOCSPGRP, TIOCNOTTY, TCFLSH
-      if (op === 0x540f) { HEAP32[argp >> 2] = 1; return 0; } // TIOCGPGRP
+      if (op === 0x40045431) { ksys('ioctl', [fd, 'TIOCSPTLCK', HEAP32[argp >> 2] !== 0]); return 0; } // TIOCSPTLCK
+      if (op === 0x540e) { ksys('ioctl', [fd, 'TIOCSCTTY']); return 0; } // TIOCSCTTY
+      if (op === 0x5410) { ksys('ioctl', [fd, 'TIOCSPGRP', HEAP32[argp >> 2]]); return 0; } // TIOCSPGRP
+      if (op === 0x540f) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'TIOCGPGRP']) | 0; return 0; } // TIOCGPGRP
+      if (op === 0x5429) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'TIOCGSID']) | 0; return 0; } // TIOCGSID
+      if (op === 0x5422) { ksys('ioctl', [fd, 'TIOCNOTTY']); return 0; } // TIOCNOTTY
+      if (op === 0x540b) { ksys('ioctl', [fd, 'TCFLSH']); return 0; } // TCFLSH
       if (op === 0x5421) { ksys('ioctl', [fd, 'FIONBIO', HEAP32[argp >> 2] !== 0]); return 0; } // FIONBIO
       if (op === 0x541b) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'FIONREAD']) | 0; return 0; } // FIONREAD
       if (op === 0x8905) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'SIOCATMARK']) | 0; return 0; } // SIOCATMARK

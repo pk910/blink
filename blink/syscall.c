@@ -213,6 +213,19 @@ extern int js_vfork_exec(const char *prog, char **argv, char **envp, int f0, int
 extern int js_vfork_dead(int code);
 extern int js_vfork_wait(int pid, int nohang, int *code_out, unsigned *ru_ms_out);
 extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SHIFT), procs, totalram MB, freeram MB
+// pk910: identity and sessions are the kernel's. emscripten's libc answers
+// the setuid family with EPERM before any syscall and stubs setsid/setpgid,
+// so these go to the kernel directly (blink-lib.js); a negative result is
+// the host errno.
+extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
+extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
+static int PkBridge(int r) {
+  if (r < 0) {
+    errno = -r;
+    return -1;
+  }
+  return r;
+}
 
 static int GetHostFdNum(struct Machine *m, int fildes) {
   struct Fd *fd;
@@ -5431,7 +5444,11 @@ static int SysPause(struct Machine *m) {
 }
 
 static int SysSetsid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(0, 0, 0));
+#else
   return setsid();
+#endif
 }
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
@@ -5519,6 +5536,9 @@ static i32 SysSetresuid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(4, real, effective, saved));
+#else
 #ifdef HAVE_SETRESUID
   return setresuid(real, effective, saved);
 #elif defined(HAVE_SETREUID)
@@ -5532,12 +5552,16 @@ static i32 SysSetresuid(struct Machine *m,  //
   if (real != effective) return enosys();
   return setuid(real);
 #endif
+#endif
 }
 
 static i32 SysSetresgid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(5, real, effective, saved));
+#else
 #ifdef HAVE_SETRESGID
   return setresgid(real, effective, saved);
 #elif defined(HAVE_SETREGID)
@@ -5551,9 +5575,13 @@ static i32 SysSetresgid(struct Machine *m,  //
   if (real != effective) return enosys();
   return setgid(real);
 #endif
+#endif
 }
 
 static int SysSetreuid(struct Machine *m, u32 real, u32 effective) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(2, real, effective, 0));
+#else
 #ifdef HAVE_SETRESUID
   // If the real user ID is set (i.e., ruid is not -1) or the effective
   // user ID is set to a value not equal to the previous real user ID,
@@ -5568,9 +5596,13 @@ static int SysSetreuid(struct Machine *m, u32 real, u32 effective) {
 #else
   return SysSetresuid(m, real, effective, -1);
 #endif
+#endif
 }
 
 static int SysSetregid(struct Machine *m, u32 real, u32 effective) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(3, real, effective, 0));
+#else
 #ifdef HAVE_SETRESUID
   if (real != -1 || (effective != -1 && effective != getgid())) {
     if (effective == -1) effective = getegid();
@@ -5580,6 +5612,7 @@ static int SysSetregid(struct Machine *m, u32 real, u32 effective) {
   }
 #else
   return SysSetresgid(m, real, effective, -1);
+#endif
 #endif
 }
 
@@ -5648,19 +5681,35 @@ static int SysUmask(struct Machine *m, int mask) {
 }
 
 static int SysSetuid(struct Machine *m, int uid) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(0, uid, 0, 0));
+#else
   return setuid(uid);
+#endif
 }
 
 static int SysSetgid(struct Machine *m, int gid) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_setxid(1, gid, 0, 0));
+#else
   return setgid(gid);
+#endif
 }
 
 static int SysGetpgid(struct Machine *m, int pid) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(2, pid, 0));
+#else
   return getpgid(pid);
+#endif
 }
 
 static int SysGetpgrp(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(2, 0, 0));
+#else
   return getpgid(0);
+#endif
 }
 
 #ifdef __EMSCRIPTEN__
@@ -5681,7 +5730,11 @@ static int SysAlarm(struct Machine *m, unsigned seconds) {
 #endif
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(1, pid, gid));
+#else
   return setpgid(pid, gid);
+#endif
 }
 
 static int SysCreat(struct Machine *m, i64 path, int mode) {
