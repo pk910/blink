@@ -387,6 +387,11 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
     unassert(tcsetattr_impl = fd->cb->tcsetattr);
     unassert(tcgetwinsize_impl = fd->cb->tcgetwinsize);
     unassert(tcsetwinsize_impl = fd->cb->tcsetwinsize);
+#ifdef __EMSCRIPTEN__
+    // pk910: the host ioctl wants the host fd - in a forked child the guest
+    // number is a shadow of a different kernel fd
+    fildes = fd->fildes;
+#endif
   } else {
     tcsetattr_impl = 0;
     tcgetattr_impl = 0;
