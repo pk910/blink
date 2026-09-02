@@ -30,6 +30,16 @@
 extern int js_fork(const void *buf, unsigned len);
 extern unsigned js_fork_snapshot_size(void);
 extern void js_fork_snapshot_read(void *buf, unsigned len);
+extern int js_fork_page(unsigned slot, void *dst);  // 4096 bytes of data page `slot` out of the snapshot
+extern void js_fork_snapshot_done(void);
+
+// pages of this process still to be pulled from the snapshot it was restored from
+static unsigned g_snap_pending;
+
+// A reserved page carrying PAGE_SNAP is touched: its bytes come from the snapshot.
+void PkFetchSnapPage(u64 entry, u64 page) {
+  if (js_fork_page((entry & PAGE_TA) >> 12, FindHostPage(page)) == 0 && g_snap_pending && --g_snap_pending == 0) js_fork_snapshot_done();
+}
 
 #define PK_SNAP_MAGIC 0x31304b524f464b50ull  // "PKFORK01"
 #define PK_PAGE_RESERVED ((u64)-1)
@@ -110,13 +120,17 @@ static void WalkTable(struct System *s, struct PkWalk *w, u64 table, int shift, 
       WalkTable(s, w, entry, shift - 9, false, vaddr);
       continue;
     }
-    // a leaf: backed pages carry data, reserved anonymous ones only their flags
-    backed = (entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) != 0;
+    // a leaf: backed pages carry data, reserved anonymous ones only their
+    // flags; a page not yet pulled from our own snapshot is data too
+    backed = (entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_SNAP)) != 0;
     if (w->pages) {
       struct PkPage *p = &w->pages[w->npages];
       p->vaddr = Canonical(vaddr);
       p->flags = entry & PK_PAGE_FLAGS;
-      if (backed) {
+      if ((entry & PAGE_SNAP) && !(entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG))) {
+        p->slot = w->ndata;
+        js_fork_page((entry & PAGE_TA) >> 12, w->data + w->ndata * 4096);
+      } else if (backed) {
         p->slot = w->ndata;
         memcpy(w->data + w->ndata * 4096, GetPageAddress(s, entry & ~(u64)PAGE_RSRV, false), 4096);
       } else {
@@ -252,7 +266,9 @@ static u8 *LeafSlot(struct System *s, i64 vaddr) {
   return NULL;
 }
 
-// Restores a snapshot into `m` (a fresh machine); 0 on success.
+// Restores a snapshot into `m` (a fresh machine) from its prefix (everything
+// but the data pages, which stay in the snapshot and are pulled on first
+// touch); 0 on success.
 static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
   u64 i;
   const u8 *p;
@@ -260,14 +276,13 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
   struct PkCpu cpu;
   struct PkSys sys;
   const struct PkPage *pages;
-  const u8 *data;
   struct System *s = m->system;
   if (len < sizeof(hdr)) {
     fprintf(stderr, "blink: fork snapshot too short (%llu)\n", (unsigned long long)len);
     return -1;
   }
   memcpy(&hdr, buf, sizeof(hdr));
-  if (hdr.magic != PK_SNAP_MAGIC || hdr.total != len) {
+  if (hdr.magic != PK_SNAP_MAGIC || hdr.total - hdr.ndata * 4096 != len) {
     fprintf(stderr, "blink: fork snapshot header mismatch (magic %llx, total %llu, len %llu)\n", (unsigned long long)hdr.magic, (unsigned long long)hdr.total, (unsigned long long)len);
     return -1;
   }
@@ -299,7 +314,7 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
     return -1;
   }
   pages = (const struct PkPage *)p;
-  data = p + hdr.npages * sizeof(struct PkPage);
+  g_snap_pending = 0;
   if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: restore: %llu fds, %llu pages (%llu with data)\n", (unsigned long long)hdr.nfds, (unsigned long long)hdr.npages, (unsigned long long)hdr.ndata);
   for (i = 0; i < hdr.npages; ++i) {
     const struct PkPage *pg = &pages[i];
@@ -313,7 +328,7 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
       return -1;
     }
     if (pg->slot == PK_PAGE_RESERVED) continue;
-    // fill it in place: allocate the anonymous page the first touch would
+    // the bytes stay in the snapshot: mark the reserved leaf with the slot
     if (!(slot = LeafSlot(s, pg->vaddr))) {
       fprintf(stderr, "blink: fork restore: no leaf for %llx\n", (unsigned long long)pg->vaddr);
       return -1;
@@ -323,15 +338,9 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
       fprintf(stderr, "blink: fork restore: leaf %llx not reserved (%llx)\n", (unsigned long long)pg->vaddr, (unsigned long long)entry);
       return -1;
     }
-    if ((page = AllocateAnonymousPage(s)) == (u64)-1) {
-      fprintf(stderr, "blink: fork restore: out of pages at %llx\n", (unsigned long long)pg->vaddr);
-      return -1;
-    }
-    memcpy(FindHostPage(page), data + pg->slot * 4096, 4096);
-    StorePte(slot, (page & (PAGE_TA | PAGE_HOST)) | (entry & ~(u64)(PAGE_TA | PAGE_RSRV)));
-    s->memstat.committed += 1;
-    s->memstat.reserved -= 1;
-    s->rss += 1;
+    StorePte(slot, (entry & ~(u64)PAGE_TA) | ((u64)pg->slot << 12) | PAGE_SNAP);
+    g_snap_pending += 1;
+    (void)page;
   }
   // system
   s->brk = sys.brk;
@@ -362,14 +371,19 @@ int PkRestoreFork(struct Machine *m) {
   u8 *buf;
   unsigned len;
   int rc;
-  len = js_fork_snapshot_size();
-  if (!len || !(buf = (u8 *)malloc(len))) {
-    fprintf(stderr, "blink: fork restore: no snapshot (%u bytes)\n", len);
+  struct PkHdr hdr;
+  unsigned total = js_fork_snapshot_size();
+  if (total < sizeof(hdr)) {
+    fprintf(stderr, "blink: fork restore: no snapshot (%u bytes)\n", total);
     return -1;
   }
+  js_fork_snapshot_read(&hdr, sizeof(hdr));
+  len = hdr.total - hdr.ndata * 4096;  // the prefix; data pages stay in the snapshot
+  if (!(buf = (u8 *)malloc(len))) return -1;
   js_fork_snapshot_read(buf, len);
   rc = PkRestore(m, buf, len);
-  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork restore %s (%u bytes)\n", rc ? "failed" : "ok", len);
+  if (rc == 0 && g_snap_pending == 0) js_fork_snapshot_done();
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork restore %s (%u of %u bytes now, %u pages lazy)\n", rc ? "failed" : "ok", (unsigned)len, total, g_snap_pending);
   free(buf);
   return rc;
 }

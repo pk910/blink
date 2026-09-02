@@ -100,6 +100,7 @@
 #define PAGE_TA    0x0000fffffffff000  // bits used for host, or real address
 #define PAGE_GROW  0x0010000000000000  // for future support of MAP_GROWSDOWN
 #define PAGE_COW   0x0008000000000000  // pk910: copy-on-write shared data page
+#define PAGE_SNAP  0x0002000000000000  // pk910: reserved page whose bytes sit in the fork snapshot (slot in PAGE_TA)
 #define PAGE_MUG   0x0020000000000000  // host page magic mapped individually
 #define PAGE_FILE  0x0040000000000000  // page has tracking bit in s->filemap
 #define PAGE_LOCK  0x0080000000000000  // a bit used to increment lock counts
@@ -484,6 +485,7 @@ int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
+void PkFetchSnapPage(u64 entry, u64 page);  // pk910: pkfork.c
 void FreeAnonymousPage(struct System *, u8 *);
 void IncHostPageRef(u64);      // pk910: bump a shared host page's refcount
 bool DecHostPageRef(u64);      // pk910: drop it; true if it reached zero

@@ -118,7 +118,11 @@ u64 HandlePageFault(struct Machine *m, u8 *pslot, u64 entry) {
         entry = 0;
         break;
       }
-      x = (page & (PAGE_TA | PAGE_HOST)) | (entry & ~(PAGE_TA | PAGE_RSRV));
+#ifdef __EMSCRIPTEN__
+      // pk910: a forked child's page still in the parent's snapshot: pull it now
+      if (entry & PAGE_SNAP) PkFetchSnapPage(entry, page);
+#endif
+      x = (page & (PAGE_TA | PAGE_HOST)) | (entry & ~(PAGE_TA | PAGE_RSRV | PAGE_SNAP));
       if (CasPte(pslot, entry, x)) {
         m->system->memstat.committed += 1;
         m->system->memstat.reserved -= 1;
