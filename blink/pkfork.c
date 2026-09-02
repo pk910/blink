@@ -13,6 +13,8 @@
 
 #include "blink/assert.h"
 #include "blink/builtin.h"
+#include "blink/bus.h"
+#include "blink/errno.h"
 #include "blink/dll.h"
 #include "blink/endian.h"
 #include "blink/fds.h"

@@ -660,37 +660,6 @@ addToLibrary({
   __syscall_getegid32__deps: ['$PKSYS'],
   __syscall_getegid32__proxy: 'none',
   __syscall_getegid32: function () { try { return ksys('getids', []).egid | 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_setuid32__deps: ['$PKSYS'],
-  __syscall_setuid32__proxy: 'none',
-  __syscall_setuid32: function (uid) { try { ksys('setuid', [uid]); return 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_setgid32__deps: ['$PKSYS'],
-  __syscall_setgid32__proxy: 'none',
-  __syscall_setgid32: function (gid) { try { ksys('setgid', [gid]); return 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_setreuid32__deps: ['$PKSYS'],
-  __syscall_setreuid32__proxy: 'none',
-  __syscall_setreuid32: function (r, e) { try { ksys('setreuid', [r, e]); return 0; } catch (err) { return PKSYS.errS(err); } },
-  __syscall_setregid32__deps: ['$PKSYS'],
-  __syscall_setregid32__proxy: 'none',
-  __syscall_setregid32: function (r, e) { try { ksys('setregid', [r, e]); return 0; } catch (err) { return PKSYS.errS(err); } },
-  __syscall_setresuid32__deps: ['$PKSYS'],
-  __syscall_setresuid32__proxy: 'none',
-  __syscall_setresuid32: function (r, e, s) { try { ksys('setresuid', [r, e, s]); return 0; } catch (err) { return PKSYS.errS(err); } },
-  __syscall_setresgid32__deps: ['$PKSYS'],
-  __syscall_setresgid32__proxy: 'none',
-  __syscall_setresgid32: function (r, e, s) { try { ksys('setresgid', [r, e, s]); return 0; } catch (err) { return PKSYS.errS(err); } },
-  // ── sessions and process groups live in the kernel ──
-  __syscall_setsid__deps: ['$PKSYS'],
-  __syscall_setsid__proxy: 'none',
-  __syscall_setsid: function () { try { return ksys('setsid', []) | 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_getsid__deps: ['$PKSYS'],
-  __syscall_getsid__proxy: 'none',
-  __syscall_getsid: function (pid) { try { return ksys('getsid', [pid]) | 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_getpgid__deps: ['$PKSYS'],
-  __syscall_getpgid__proxy: 'none',
-  __syscall_getpgid: function (pid) { try { return ksys('getpgid', [pid]) | 0; } catch (e) { return PKSYS.errS(e); } },
-  __syscall_setpgid__deps: ['$PKSYS'],
-  __syscall_setpgid__proxy: 'none',
-  __syscall_setpgid: function (pid, pgid) { try { ksys('setpgid', [pid, pgid]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_pipe2__deps: ['$PKSYS'],
   __syscall_pipe2__proxy: 'none',
   __syscall_pipe2: function (fdptr) { try { var fds = ksys('pipe', []); HEAP32[fdptr >> 2] = fds[0]; HEAP32[(fdptr + 4) >> 2] = fds[1]; return 0; } catch (e) { return PKSYS.errS(e); } },
@@ -749,6 +718,51 @@ addToLibrary({
   __syscall_poll_nonblocking__deps: ['$PKSYS'],
   __syscall_poll_nonblocking__proxy: 'none',
   __syscall_poll_nonblocking: function (fds, nfds) { try { return PKSYS.poll(fds, nfds, 0); } catch (e) { return PKSYS.errS(e); } },
+
+  // ── pids are the kernel's (emscripten's libc would say 42) ──
+  __syscall_getpid__deps: ['$PKSYS'],
+  __syscall_getpid__proxy: 'none',
+  __syscall_getpid: function () { try { return ksys('getpid', []) | 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_getppid__deps: ['$PKSYS'],
+  __syscall_getppid__proxy: 'none',
+  __syscall_getppid: function () { try { return ksys('getppid', []) | 0; } catch (e) { return PKSYS.errS(e); } },
+
+  // ── identity and sessions: the kernel's, reached from blink's syscall handlers ──
+  // (emscripten's libc answers the setuid family with EPERM before any syscall
+  // and stubs setsid/setpgid, so the host calls never reach a JS import)
+  js_setxid__deps: ['$PKSYS'],
+  js_setxid__proxy: 'none',
+  js_setxid: function (which, a, b, c) {
+    try {
+      var names = ['setuid', 'setgid', 'setreuid', 'setregid', 'setresuid', 'setresgid'];
+      ksys(names[which], which < 2 ? [a] : which < 4 ? [a, b] : [a, b, c]);
+      return 0;
+    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+  },
+  js_session__deps: ['$PKSYS'],
+  js_session__proxy: 'none',
+  js_session: function (which, a, b) {
+    try {
+      switch (which) {
+        case 0: return ksys('setsid', []) | 0;
+        case 1: ksys('setpgid', [a, b]); return 0;
+        case 2: return ksys('getpgid', [a]) | 0;
+        default: return ksys('getsid', [a]) | 0;
+      }
+    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+  },
+
+  // ── fork: the snapshot goes to the kernel, the pid comes back; the child fetches it ──
+  js_fork__deps: ['$PKSYS'],
+  js_fork__proxy: 'none',
+  js_fork: function (buf, len) {
+    if (typeof __pkx === 'undefined') return -52; // ENOSYS
+    try { return __pkx.fork(HEAPU8.slice(buf, buf + len)) | 0; } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+  },
+  js_fork_snapshot_size__proxy: 'none',
+  js_fork_snapshot_size: function () { var s = globalThis.__pkForkSnapshot; return s ? s.length : 0; },
+  js_fork_snapshot_read__proxy: 'none',
+  js_fork_snapshot_read: function (buf, len) { var s = globalThis.__pkForkSnapshot; if (s) HEAPU8.set(s.subarray(0, len), buf); globalThis.__pkForkSnapshot = null; },
 
   // ── vfork / pipe bridge: process-level fork+exec, wired in x86-runtime.js ──
   js_kernel_pipe__proxy: 'none',
