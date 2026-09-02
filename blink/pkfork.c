@@ -292,7 +292,8 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
     }
     p += ROUNDUP(sizeof(rec) + rec.pathlen, 8);
   }
-  // pages: the root table first (LoadProgram's job in an exec)
+  // pages: paging on and the root table first (LoadProgram's job in an exec)
+  s->cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_PG;
   if ((s->cr3 = AllocatePageTable(s)) == (u64)-1) {
     fprintf(stderr, "blink: fork restore: no page table root\n");
     return -1;
