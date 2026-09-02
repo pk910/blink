@@ -21,6 +21,7 @@
 #include "blink/builtin.h"
 
 bool FLAG_zero;
+bool FLAG_restore;
 bool FLAG_wantjit;
 bool FLAG_nolinear;
 bool FLAG_noconnect;

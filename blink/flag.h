@@ -5,6 +5,7 @@
 #include "blink/types.h"
 
 extern bool FLAG_zero;
+extern bool FLAG_restore;  // pk910: continue a forked child from a snapshot
 extern bool FLAG_wantjit;
 extern bool FLAG_nolinear;
 extern bool FLAG_noconnect;

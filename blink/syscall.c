@@ -748,11 +748,13 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
   return pid;
 }
 
-static int SysFork(struct Machine *m) {
+int PkForkRemote(struct Machine *);  // pkfork.c: the child in its own worker
+
+// vfork: the child runs in place on a copy-on-write clone of the parent's
+// System until it exits or execs, the parent suspended meanwhile - which is
+// vfork's contract, and cheap. (fork is SysFork below: a real process.)
+static int SysVfork(struct Machine *m) {
 #ifdef PK_FORK
-  // copy-on-write real fork: clone the parent into a private child System,
-  // snapshot the parent CPU, shadow-dup its fds, and run the child in place
-  // until it exits/execs (ForkRestoreParent then resumes the parent)
   struct ForkFrame *f;
   struct System *child;
   struct Dll *e;
@@ -787,9 +789,14 @@ static int SysFork(struct Machine *m) {
 #endif
 }
 
-static int SysVfork(struct Machine *m) {
-  // TODO: Parent should be stopped while child is running.
-  return SysFork(m);
+// fork: a snapshot of this machine becomes a new kernel process in its own
+// worker; the parent gets the pid and goes on. Real fork semantics.
+static int SysFork(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return PkForkRemote(m);
+#else
+  return Fork(m, 0, 0, 0);
+#endif
 }
 
 static void *OnSpawn(void *arg) {

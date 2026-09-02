@@ -90,7 +90,7 @@ Toolchain: " BUILD_TOOLCHAIN "\n\
 Revision: #" BLINK_COMMITS " " BLINK_GITSHA "\n\
 Config: ./configure MODE=" BUILD_MODE " " CONFIG_ARGUMENTS "\n"
 
-#define OPTS "hvjemZs0L:C:"
+#define OPTS "hvjemZs0RL:C:"
 
 _Alignas(1) static const char USAGE[] =
     " [-" OPTS "] PROG [ARGS...]\n"
@@ -202,6 +202,31 @@ static void ProgramLimit(struct System *s, int hresource, int gresource) {
   }
 }
 
+static int Exec(char *, char *, char **, char **);
+#ifdef __EMSCRIPTEN__
+int PkRestoreFork(struct Machine *);
+
+// pk910: a forked child. Same first-time setup as Exec, but the address
+// space, registers and fd list come from the parent's snapshot instead of
+// an ELF; the machine then continues after the fork syscall with rax = 0.
+static int RestoreFork(char *execfn) {
+  struct Machine *m;
+  unassert((g_machine = m = NewMachine(NewSystem(XED_MACHINE_MODE_LONG), 0)));
+#ifdef HAVE_JIT
+  if (FLAG_nojit) DisableJit(&m->system->jit);
+#endif
+  m->system->exec = Exec;
+  SetupCod(m);
+  if (PkRestoreFork(m)) {
+    WriteErrorString("blink: cannot restore the forked child\n");
+    exit(EXIT_FAILURE);
+  }
+  ProgramLimit(m->system, RLIMIT_NOFILE, RLIMIT_NOFILE_LINUX);
+  (void)execfn;
+  Blink(m);
+}
+#endif
+
 static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   int i;
   sigset_t oldmask;
@@ -280,6 +305,9 @@ static void GetOpts(int argc, char *argv[]) {
     switch (opt) {
       case '0':
         FLAG_zero = true;
+        break;
+      case 'R':
+        FLAG_restore = true;
         break;
       case 'j':
         FLAG_nojit = true;
@@ -392,6 +420,9 @@ int main(int argc, char *argv[]) {
 #endif
   HandleSigs();
   InitBus();
+#ifdef __EMSCRIPTEN__
+  if (FLAG_restore) return RestoreFork(argv[optind_]);
+#endif
   if (!Commandv(argv[optind_], g_pathbuf, sizeof(g_pathbuf))) {
     WriteErrorString(argv[0]);
     WriteErrorString(": command not found: ");
