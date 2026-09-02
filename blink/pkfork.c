@@ -295,11 +295,14 @@ static int PkRestore(struct Machine *m, const u8 *buf, u64 len) {
   // pages
   pages = (const struct PkPage *)p;
   data = p + hdr.npages * sizeof(struct PkPage);
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: restore: %llu fds, %llu pages (%llu with data)\n", (unsigned long long)hdr.nfds, (unsigned long long)hdr.npages, (unsigned long long)hdr.ndata);
   for (i = 0; i < hdr.npages; ++i) {
     const struct PkPage *pg = &pages[i];
     u8 *slot;
     u64 entry, page;
-    i64 got = ReserveVirtual(s, pg->vaddr, 4096, pg->flags, -1, 0, false, true);
+    i64 got;
+    if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: restore page %llx flags %llx %s\n", (unsigned long long)pg->vaddr, (unsigned long long)pg->flags, pg->slot == PK_PAGE_RESERVED ? "reserved" : "data");
+    got = ReserveVirtual(s, pg->vaddr, 4096, pg->flags, -1, 0, false, true);
     if (got != pg->vaddr) {
       fprintf(stderr, "blink: fork restore: cannot map page %llx flags %llx (got %llx, errno %d)\n", (unsigned long long)pg->vaddr, (unsigned long long)pg->flags, (unsigned long long)got, errno);
       return -1;
