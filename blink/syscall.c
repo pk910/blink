@@ -4468,7 +4468,14 @@ static int SigsuspendPolyfill(struct Machine *m, u64 mask) {
 #endif
       } else {
         ts = FromNanoseconds(nanos);
+#ifdef __EMSCRIPTEN__
+        // pk910: park in the kernel (interruptible, drains pending signals
+        // on return) instead of emscripten's host nanosleep, which neither
+        emscripten_sleep(nanos / 1000000 + 1);
+        if (0) {
+#else
         if (nanosleep(&ts, 0)) {
+#endif
           unassert(errno == EINTR);
           continue;
         }
@@ -5459,6 +5466,12 @@ static int SysTgkill(struct Machine *m, int pid, int tid, int sig) {
 
 static int SysPause(struct Machine *m) {
   int rc;
+#ifdef __EMSCRIPTEN__
+  // pk910: wait for a signal the kernel way (see SigsuspendPolyfill)
+  while (!CheckInterrupt(m, false)) emscripten_sleep(10);
+  errno = EINTR;
+  return -1;
+#endif
   NORESTART(rc, pause());
   return rc;
 }

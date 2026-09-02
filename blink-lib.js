@@ -775,6 +775,17 @@ addToLibrary({
       return 0;
     } catch (e) { if (e && e.__exit) throw e; return -1; }
   },
+  js_exec__deps: ['$PKSYS'],
+  js_exec__proxy: 'none',
+  js_exec: function (prog, argv, envp) {
+    if (typeof __pkx === 'undefined') return -52; // ENOSYS
+    var args = [];
+    var env = {};
+    var i;
+    for (i = 0; ; i++) { var p = HEAPU32[(argv >> 2) + i]; if (!p) break; args.push(UTF8ToString(p)); }
+    for (i = 0; ; i++) { var q = HEAPU32[(envp >> 2) + i]; if (!q) break; var kv = UTF8ToString(q); var eq = kv.indexOf('='); if (eq > 0) env[kv.slice(0, eq)] = kv.slice(eq + 1); }
+    return __pkx.exec(UTF8ToString(prog), args, env);
+  },
   js_vfork_exec__proxy: 'none',
   js_vfork_exec: function (prog, argv, envp, f0, f1, f2) {
     if (typeof __pkx === 'undefined') return -52; // ENOSYS (WASI)
