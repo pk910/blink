@@ -85,6 +85,9 @@ addToLibrary({
   },
 
   // ── direct-ksys support object (one per thread; holds per-thread state) ──
+  // the runtime's ksys hands kernel-raised guest signals (alarm) to blink's
+  // per-thread Machine through this hook once the wasm is up
+  $PKSYS__postset: "globalThis.__pkEnqueueSignal = function (sig) { if (typeof _pk_enqueue_signal === 'function') _pk_enqueue_signal(sig); };",
   $PKSYS: {
     _dec: null,
     _enc: null,
@@ -108,7 +111,14 @@ addToLibrary({
     // emscripten (WASI) errno numbering; a recognized name is an expected result
     wasiErrno: function (err) {
       var name = String((err && err.message) || err).split(':')[0];
-      var map = { ENOENT: 44, EACCES: 2, EISDIR: 31, ENOTDIR: 54, EEXIST: 20, EPERM: 63, ENOSPC: 51, EBADF: 8, EPIPE: 64, EINVAL: 28, ESPIPE: 70, ENOTTY: 59 };
+      var map = {
+        ENOENT: 44, EACCES: 2, EISDIR: 31, ENOTDIR: 54, EEXIST: 20, EPERM: 63, ENOSPC: 51, EBADF: 8, EPIPE: 64, EINVAL: 28, ESPIPE: 70, ENOTTY: 59,
+        // sockets (WASI numbering; blink XlatErrno's them to Linux)
+        EAGAIN: 6, EINPROGRESS: 26, EALREADY: 7, ECONNREFUSED: 14, ECONNRESET: 15, ECONNABORTED: 13, EADDRINUSE: 3, EADDRNOTAVAIL: 4,
+        ENOTSOCK: 57, EAFNOSUPPORT: 5, EPROTONOSUPPORT: 66, ESOCKTNOSUPPORT: 66, EOPNOTSUPP: 138, ENOTSUP: 58, EHOSTUNREACH: 23, ENETUNREACH: 40, ENETDOWN: 39,
+        ETIMEDOUT: 73, EISCONN: 30, ENOTCONN: 53, EMSGSIZE: 35, ENOBUFS: 42, EDESTADDRREQ: 17, ENOPROTOOPT: 50, EINTR: 27, ENODEV: 43, ENXIO: 60,
+        ESRCH: 71, ENOSYS: 52, ESHUTDOWN: 15, EFAULT: 21, EIO: 29,
+      };
       return map[name] || 29; // default EIO
     },
     // a kernel SysError (.sys) is an expected errno; anything else is a bug in
@@ -132,7 +142,7 @@ addToLibrary({
       return base === '/' ? '/' + p : base + '/' + p;
     },
     writeStat: function (buf, st) {
-      var typeBits = st.type === 'dir' ? 0o40000 : st.type === 'char' ? 0o20000 : st.type === 'fifo' ? 0o10000 : st.type === 'link' ? 0o120000 : 0o100000;
+      var typeBits = st.type === 'dir' ? 0o40000 : st.type === 'char' ? 0o20000 : st.type === 'fifo' ? 0o10000 : st.type === 'link' ? 0o120000 : st.type === 'sock' ? 0o140000 : 0o100000;
       var mode = typeBits | (st.mode & 0o7777);
       var secs = BigInt(Math.floor((st.mtime || 0) / 1000));
       HEAPU32[buf >> 2] = 910; // dev
@@ -245,15 +255,232 @@ addToLibrary({
       }
       return pos;
     },
-    poll: function (fds, nfds) {
-      var ready = 0;
-      for (var i = 0; i < nfds; i++) {
+    // pollfd (wasm32): i32 fd, i16 events, i16 revents. The kernel parks the
+    // thread until something is ready or the timeout passes (-1 = forever).
+    poll: function (fds, nfds, timeout) {
+      var reqs = [];
+      var i;
+      for (i = 0; i < nfds; i++) {
         var base = fds + i * 8;
-        var revents = HEAP16[(base + 4) >> 1] & 0x0005; // POLLIN|POLLOUT
-        HEAP16[(base + 6) >> 1] = revents;
-        if (revents) ready++;
+        reqs.push({ fd: HEAP32[base >> 2], events: HEAP16[(base + 4) >> 1] & 0xffff });
+      }
+      var revents = ksys('poll', [reqs, timeout === undefined ? -1 : timeout]);
+      var ready = 0;
+      for (i = 0; i < nfds; i++) {
+        HEAP16[(fds + i * 8 + 6) >> 1] = revents[i] | 0;
+        if (revents[i]) ready++;
       }
       return ready;
+    },
+    // ── sockets: host (wasm32 musl) sockaddr layouts <-> the kernel's SockAddr JSON ──
+    // IPv6 text forms (RFC 5952 out, every RFC 4291 form in)
+    ip6ToStr: function (b, off) {
+      var i, g = [];
+      var mapped = true;
+      for (i = 0; i < 10; i++) if (b[off + i] !== 0) mapped = false;
+      if (mapped && b[off + 10] === 0xff && b[off + 11] === 0xff) return '::ffff:' + b[off + 12] + '.' + b[off + 13] + '.' + b[off + 14] + '.' + b[off + 15];
+      for (i = 0; i < 16; i += 2) g.push((b[off + i] << 8) | b[off + i + 1]);
+      var bestStart = -1, bestLen = 0;
+      for (i = 0; i < 8; ) {
+        if (g[i] !== 0) { i++; continue; }
+        var j = i;
+        while (j < 8 && g[j] === 0) j++;
+        if (j - i > bestLen) { bestStart = i; bestLen = j - i; }
+        i = j;
+      }
+      if (bestLen < 2) bestStart = -1;
+      var hex = function (v) { return v.toString(16); };
+      if (bestStart < 0) return g.map(hex).join(':');
+      return g.slice(0, bestStart).map(hex).join(':') + '::' + g.slice(bestStart + bestLen).map(hex).join(':');
+    },
+    ip6FromStr: function (s) {
+      var out = new Uint8Array(16);
+      var text = String(s).replace(/%.*$/, '');
+      if (text.charAt(0) === '[') text = text.slice(1, -1);
+      var parseGroups = function (part) {
+        if (part === '') return [];
+        var res = [];
+        var pieces = part.split(':');
+        for (var i = 0; i < pieces.length; i++) {
+          var p = pieces[i];
+          if (i === pieces.length - 1 && p.indexOf('.') >= 0) {
+            var q = p.split('.');
+            if (q.length !== 4) return null;
+            var a = (parseInt(q[0], 10) << 8) | parseInt(q[1], 10), c = (parseInt(q[2], 10) << 8) | parseInt(q[3], 10);
+            res.push(a, c);
+            continue;
+          }
+          if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null;
+          res.push(parseInt(p, 16));
+        }
+        return res;
+      };
+      var dbl = text.indexOf('::');
+      var groups;
+      if (dbl >= 0) {
+        var head = parseGroups(text.slice(0, dbl)), tail = parseGroups(text.slice(dbl + 2));
+        if (!head || !tail || head.length + tail.length > 7) return null;
+        groups = head.concat(new Array(8 - head.length - tail.length).fill(0), tail);
+      } else {
+        groups = parseGroups(text);
+        if (!groups || groups.length !== 8) return null;
+      }
+      for (var k = 0; k < 8; k++) { out[k * 2] = (groups[k] >> 8) & 0xff; out[k * 2 + 1] = groups[k] & 0xff; }
+      return out;
+    },
+    readSockaddr: function (ptr, len) {
+      if (!ptr || len < 2) return { fam: 'unspec' };
+      var fam = HEAPU16[ptr >> 1];
+      if (fam === 2) {
+        if (len < 16) throw Object.assign(new Error('EINVAL: short sockaddr_in'), { sys: true });
+        return { fam: 'inet', addr: HEAPU8[ptr + 4] + '.' + HEAPU8[ptr + 5] + '.' + HEAPU8[ptr + 6] + '.' + HEAPU8[ptr + 7], port: (HEAPU8[ptr + 2] << 8) | HEAPU8[ptr + 3] };
+      }
+      if (fam === 10) {
+        // sockaddr_in6: family, port (BE), flowinfo, addr[16], scope_id
+        if (len < 28) throw Object.assign(new Error('EINVAL: short sockaddr_in6'), { sys: true });
+        return { fam: 'inet6', addr: PKSYS.ip6ToStr(HEAPU8, ptr + 8), port: (HEAPU8[ptr + 2] << 8) | HEAPU8[ptr + 3], flowinfo: HEAPU32[(ptr + 4) >> 2], scope: HEAPU32[(ptr + 24) >> 2] };
+      }
+      if (fam === 1) {
+        var end = ptr + Math.min(len, 110);
+        var start = ptr + 2;
+        var abstract = HEAPU8[start] === 0 && end > start + 1;
+        var p = abstract ? start + 1 : start;
+        var q = p;
+        while (q < end && HEAPU8[q] !== 0) q++;
+        var path = PKSYS.dec().decode(HEAPU8.slice(p, q));
+        return { fam: 'unix', path: abstract ? '@' + path : path };
+      }
+      if (fam === 16) return { fam: 'netlink', pid: HEAPU32[(ptr + 4) >> 2], groups: HEAPU32[(ptr + 8) >> 2] };
+      if (fam === 17) {
+        // sockaddr_ll: family, protocol (BE), ifindex, hatype, pkttype, halen, addr[8]
+        if (len < 20) throw Object.assign(new Error('EINVAL: short sockaddr_ll'), { sys: true });
+        var halen = Math.min(HEAPU8[ptr + 11], 8);
+        var mac = [];
+        for (var k = 0; k < halen; k++) mac.push((HEAPU8[ptr + 12 + k] < 16 ? '0' : '') + HEAPU8[ptr + 12 + k].toString(16));
+        return { fam: 'packet', protocol: (HEAPU8[ptr + 2] << 8) | HEAPU8[ptr + 3], ifindex: HEAP32[(ptr + 4) >> 2], hatype: HEAPU16[(ptr + 8) >> 1], pkttype: HEAPU8[ptr + 10], addr: mac.join(':') };
+      }
+      if (fam === 0) return { fam: 'unspec' };
+      throw Object.assign(new Error('EAFNOSUPPORT: address family ' + fam), { sys: true });
+    },
+    // writes into the caller's buffer (capacity *lenPtr), stores the full size in *lenPtr
+    writeSockaddr: function (ptr, lenPtr, a) {
+      if (!ptr || !lenPtr) return;
+      var cap = HEAPU32[lenPtr >> 2];
+      var buf;
+      if (!a || a.fam === 'unspec') { buf = new Uint8Array(16); }
+      else if (a.fam === 'inet') {
+        buf = new Uint8Array(16);
+        buf[0] = 2; buf[2] = (a.port >> 8) & 0xff; buf[3] = a.port & 0xff;
+        var parts = String(a.addr).split('.');
+        for (var i = 0; i < 4; i++) buf[4 + i] = parseInt(parts[i], 10) & 0xff;
+      } else if (a.fam === 'inet6') {
+        buf = new Uint8Array(28);
+        buf[0] = 10; buf[2] = (a.port >> 8) & 0xff; buf[3] = a.port & 0xff;
+        var bytes = PKSYS.ip6FromStr(a.addr) || new Uint8Array(16);
+        buf.set(bytes, 8);
+        var scope = a.scope >>> 0;
+        buf[24] = scope & 0xff; buf[25] = (scope >> 8) & 0xff; buf[26] = (scope >> 16) & 0xff; buf[27] = (scope >>> 24) & 0xff;
+      } else if (a.fam === 'unix') {
+        var abstract = a.path.charAt(0) === '@';
+        var pathBytes = PKSYS.enc().encode(abstract ? a.path.slice(1) : a.path);
+        buf = new Uint8Array(2 + (abstract ? 1 : 0) + pathBytes.length + 1);
+        buf[0] = 1;
+        buf.set(pathBytes, abstract ? 3 : 2);
+      } else if (a.fam === 'packet') {
+        buf = new Uint8Array(20);
+        buf[0] = 17; buf[2] = (a.protocol >> 8) & 0xff; buf[3] = a.protocol & 0xff;
+        var ifi = a.ifindex | 0;
+        buf[4] = ifi & 0xff; buf[5] = (ifi >> 8) & 0xff; buf[6] = (ifi >> 16) & 0xff; buf[7] = (ifi >>> 24) & 0xff;
+        var hat = a.hatype | 0;
+        buf[8] = hat & 0xff; buf[9] = (hat >> 8) & 0xff;
+        buf[10] = a.pkttype | 0;
+        var macBytes = String(a.addr || '').split(':').filter(function (x) { return x !== ''; }).map(function (x) { return parseInt(x, 16) & 0xff; });
+        buf[11] = Math.min(macBytes.length, 8);
+        for (var m = 0; m < buf[11]; m++) buf[12 + m] = macBytes[m];
+      } else if (a.fam === 'netlink') {
+        buf = new Uint8Array(12);
+        buf[0] = 16;
+        buf[4] = a.pid & 0xff; buf[5] = (a.pid >> 8) & 0xff; buf[6] = (a.pid >> 16) & 0xff; buf[7] = (a.pid >>> 24) & 0xff;
+        buf[8] = a.groups & 0xff; buf[9] = (a.groups >> 8) & 0xff; buf[10] = (a.groups >> 16) & 0xff; buf[11] = (a.groups >>> 24) & 0xff;
+      } else { buf = new Uint8Array(16); }
+      HEAPU8.set(buf.subarray(0, Math.min(cap, buf.length)), ptr);
+      HEAPU32[lenPtr >> 2] = buf.length;
+    },
+    // msghdr (wasm32): name @0, namelen @4, iov @8, iovlen @12, control @16, controllen @20, flags @24
+    gather: function (iov, iovcnt) {
+      var parts = [];
+      var total = 0;
+      for (var i = 0; i < iovcnt; i++) {
+        var p = HEAPU32[(iov + i * 8) >> 2];
+        var l = HEAPU32[(iov + i * 8 + 4) >> 2];
+        if (l) { parts.push(HEAPU8.slice(p, p + l)); total += l; }
+      }
+      var out = new Uint8Array(total);
+      var o = 0;
+      for (var j = 0; j < parts.length; j++) { out.set(parts[j], o); o += parts[j].length; }
+      return out;
+    },
+    scatter: function (iov, iovcnt, data) {
+      var off = 0;
+      for (var i = 0; i < iovcnt && off < data.length; i++) {
+        var p = HEAPU32[(iov + i * 8) >> 2];
+        var l = HEAPU32[(iov + i * 8 + 4) >> 2];
+        var n = Math.min(l, data.length - off);
+        HEAPU8.set(data.subarray(off, off + n), p);
+        off += n;
+      }
+      return off;
+    },
+    iovTotal: function (iov, iovcnt) {
+      var t = 0;
+      for (var i = 0; i < iovcnt; i++) t += HEAPU32[(iov + i * 8 + 4) >> 2];
+      return t;
+    },
+    // getsockopt/setsockopt value marshaling: ints, timeval (16 bytes, Linux
+    // amd64 layout passed through by blink), linger (8 bytes), raw bytes
+    readOptVal: function (level, name, ptr, len) {
+      if (level === 58 && name === 1 && len >= 32) return Array.from(HEAPU8.subarray(ptr, ptr + 32)); // ICMP6_FILTER
+      // multicast memberships are structs (ip_mreq/ip_mreqn/ipv6_mreq), not ints
+      if ((level === 0 && (name === 35 || name === 36 || name === 39 || name === 40)) || (level === 41 && (name === 20 || name === 21))) return Array.from(HEAPU8.subarray(ptr, ptr + len));
+      if (level === 1 && name === 13 && len >= 8) return { on: HEAP32[ptr >> 2], linger: HEAP32[(ptr + 4) >> 2] };
+      if (level === 1 && (name === 20 || name === 21) && len >= 8) return { sec: HEAP32[ptr >> 2], usec: len >= 16 ? HEAP32[(ptr + 8) >> 2] : HEAP32[(ptr + 4) >> 2] };
+      if (len === 4) return HEAP32[ptr >> 2];
+      if (len === 1) return HEAPU8[ptr];
+      if (len === 2) return HEAP16[ptr >> 1];
+      if (len === 8) return HEAP32[ptr >> 2];
+      return Array.prototype.slice.call(HEAPU8.slice(ptr, ptr + len));
+    },
+    writeOptVal: function (v, ptr, lenPtr) {
+      var cap = HEAPU32[lenPtr >> 2];
+      if (v !== null && typeof v === 'object' && 'on' in v) {
+        if (cap >= 8) { HEAP32[ptr >> 2] = v.on; HEAP32[(ptr + 4) >> 2] = v.linger; HEAPU32[lenPtr >> 2] = 8; }
+        return;
+      }
+      if (v !== null && typeof v === 'object' && 'sec' in v) {
+        if (cap >= 16) { HEAP32[ptr >> 2] = v.sec; HEAP32[(ptr + 4) >> 2] = 0; HEAP32[(ptr + 8) >> 2] = v.usec; HEAP32[(ptr + 12) >> 2] = 0; HEAPU32[lenPtr >> 2] = 16; }
+        else if (cap >= 8) { HEAP32[ptr >> 2] = v.sec; HEAP32[(ptr + 4) >> 2] = v.usec; HEAPU32[lenPtr >> 2] = 8; }
+        return;
+      }
+      if (Array.isArray(v) || (v && v.buffer)) {
+        var bytes = v instanceof Uint8Array ? v : Uint8Array.from(v);
+        HEAPU8.set(bytes.subarray(0, cap), ptr);
+        HEAPU32[lenPtr >> 2] = Math.min(cap, bytes.length);
+        return;
+      }
+      if (typeof v === 'string') v = PKSYS.wasiErrno(v); // SO_ERROR: an errno name
+      if (cap >= 4) { HEAP32[ptr >> 2] = v | 0; HEAPU32[lenPtr >> 2] = 4; }
+      else if (cap >= 1) { HEAPU8[ptr] = v & 0xff; HEAPU32[lenPtr >> 2] = 1; }
+    },
+    // SIOC* request numbers -> names the kernel knows (see net/abi/ioctl.ts)
+    siocName: function (req) {
+      var names = {
+        0x890b: 'SIOCADDRT', 0x890c: 'SIOCDELRT', 0x8910: 'SIOCGIFNAME', 0x8912: 'SIOCGIFCONF', 0x8913: 'SIOCGIFFLAGS', 0x8914: 'SIOCSIFFLAGS',
+        0x8915: 'SIOCGIFADDR', 0x8916: 'SIOCSIFADDR', 0x8917: 'SIOCGIFDSTADDR', 0x8918: 'SIOCSIFDSTADDR', 0x8919: 'SIOCGIFBRDADDR', 0x891a: 'SIOCSIFBRDADDR',
+        0x891b: 'SIOCGIFNETMASK', 0x891c: 'SIOCSIFNETMASK', 0x891d: 'SIOCGIFMETRIC', 0x891e: 'SIOCSIFMETRIC', 0x8921: 'SIOCGIFMTU', 0x8922: 'SIOCSIFMTU',
+        0x8924: 'SIOCSIFHWADDR', 0x8927: 'SIOCGIFHWADDR', 0x8933: 'SIOCGIFINDEX', 0x8942: 'SIOCGIFTXQLEN', 0x8943: 'SIOCSIFTXQLEN', 0x8970: 'SIOCGIFMAP', 0x8971: 'SIOCSIFMAP',
+        0x8936: 'SIOCDIFADDR', 0x8953: 'SIOCDARP', 0x8954: 'SIOCGARP', 0x8955: 'SIOCSARP',
+      };
+      return names[req] || ('SIOC_' + req.toString(16));
     },
     applyTermios: function (data) {
       PKSYS.termios = { c_iflag: data.c_iflag, c_oflag: data.c_oflag, c_cflag: data.c_cflag, c_lflag: data.c_lflag, c_cc: data.c_cc || PKSYS.termios.c_cc };
@@ -415,8 +642,12 @@ addToLibrary({
   __syscall_dup3: function (fd, newfd) { try { return ksys('dup', [fd, newfd]); } catch (e) { return PKSYS.errS(e); } },
   __syscall_fcntl64__deps: ['$PKSYS'],
   __syscall_fcntl64__proxy: 'none',
-  __syscall_fcntl64: function (fd, cmd) {
-    try { if (cmd === 0 || cmd === 1030) return ksys('dup', [fd]); return ksys('fcntl', [fd, cmd]); } catch (e) { return PKSYS.errS(e); }
+  __syscall_fcntl64: function (fd, cmd, varargs) {
+    try {
+      if (cmd === 0 || cmd === 1030) return ksys('dup', [fd]);
+      var arg = varargs ? HEAP32[varargs >> 2] : 0;
+      return ksys('fcntl', [fd, cmd, arg]);
+    } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_getuid32__proxy: 'none',
   __syscall_getuid32: function () { return 0; },
@@ -435,6 +666,7 @@ addToLibrary({
   __syscall_ioctl__proxy: 'none',
   __syscall_ioctl: function (fd, op, varargs) {
     try {
+      op = op >>> 0; // requests with bit 31 set (TIOCGPTN) arrive as negative ints
       var argp = HEAPU32[varargs >> 2];
       if (op === 0x5401 || op === 0x5402 || op === 0x5403 || op === 0x5404 || op === 0x5413) {
         if (ksys('fstat', [fd]).type !== 'char') return -25; // ENOTTY
@@ -451,20 +683,34 @@ addToLibrary({
         PKSYS.applyTermios({ c_iflag: HEAPU32[argp >> 2], c_oflag: HEAPU32[(argp + 4) >> 2], c_cflag: HEAPU32[(argp + 8) >> 2], c_lflag: HEAPU32[(argp + 12) >> 2], c_cc: cc });
         return 0;
       }
-      if (op === 0x5413) {
-        var sz = PKSYS.winsize();
+      if (op === 0x5413) { // TIOCGWINSZ: the fd's own tty (a pty master answers for its slave)
+        var sz;
+        try { var s = ksys('ioctl', [fd, 'size']); sz = [s.rows, s.cols]; } catch (e) { if (e && e.__exit) throw e; sz = PKSYS.winsize(); }
         HEAP16[argp >> 1] = sz[0]; HEAP16[(argp + 2) >> 1] = sz[1]; HEAP16[(argp + 4) >> 1] = 0; HEAP16[(argp + 6) >> 1] = 0;
         return 0;
       }
+      if (op === 0x5414) { // TIOCSWINSZ
+        ksys('ioctl', [fd, 'TIOCSWINSZ', { rows: HEAP16[argp >> 1], cols: HEAP16[(argp + 2) >> 1] }]);
+        return 0;
+      }
+      // ── ptys: posix_openpt/grantpt/unlockpt/ptsname, job control no-ops ──
+      if (op === 0x80045430) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'TIOCGPTN']) | 0; return 0; } // TIOCGPTN
+      if (op === 0x40045431) { ksys('ioctl', [fd, 'TIOCSPTLCK']); return 0; } // TIOCSPTLCK
+      if (op === 0x540e || op === 0x5410 || op === 0x5422 || op === 0x540b) return 0; // TIOCSCTTY, TIOCSPGRP, TIOCNOTTY, TCFLSH
+      if (op === 0x540f) { HEAP32[argp >> 2] = 1; return 0; } // TIOCGPGRP
+      if (op === 0x5421) { ksys('ioctl', [fd, 'FIONBIO', HEAP32[argp >> 2] !== 0]); return 0; } // FIONBIO
+      if (op === 0x541b) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'FIONREAD']) | 0; return 0; } // FIONREAD
+      if (op === 0x8905) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'SIOCATMARK']) | 0; return 0; } // SIOCATMARK
       return -25; // ENOTTY
     } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_poll__deps: ['$PKSYS'],
   __syscall_poll__proxy: 'none',
-  __syscall_poll: function (fds, nfds) { try { return PKSYS.poll(fds, nfds); } catch (e) { return PKSYS.errS(e); } },
+  __syscall_poll: function (fds, nfds, timeout) { try { return PKSYS.poll(fds, nfds, timeout); } catch (e) { return PKSYS.errS(e); } },
+  // emscripten's poll() routes a zero timeout through this probe import
   __syscall_poll_nonblocking__deps: ['$PKSYS'],
   __syscall_poll_nonblocking__proxy: 'none',
-  __syscall_poll_nonblocking: function (fds, nfds) { try { return PKSYS.poll(fds, nfds); } catch (e) { return PKSYS.errS(e); } },
+  __syscall_poll_nonblocking: function (fds, nfds) { try { return PKSYS.poll(fds, nfds, 0); } catch (e) { return PKSYS.errS(e); } },
 
   // ── vfork / pipe bridge: process-level fork+exec, wired in x86-runtime.js ──
   js_kernel_pipe__proxy: 'none',
@@ -498,11 +744,170 @@ addToLibrary({
     return __pkx.deadChild(code);
   },
   js_vfork_wait__proxy: 'none',
-  js_vfork_wait: function (pid, nohang, code_out) {
+  js_vfork_wait: function (pid, nohang, code_out, ru_out) {
     if (typeof __pkx === 'undefined') return -12; // ECHILD (WASI)
     var r = __pkx.vwait(pid, !!nohang);
     if (r.err) return -r.err;
     HEAP32[code_out >> 2] = r.code | 0;
+    // the child's user/system time in ms (wait4's rusage): what `time` prints
+    if (ru_out) { HEAPU32[ru_out >> 2] = r.rusage ? Math.round(r.rusage.utime) >>> 0 : 0; HEAPU32[(ru_out + 4) >> 2] = r.rusage ? Math.round(r.rusage.stime) >>> 0 : 0; }
     return r.pid | 0;
+  },
+
+  // sysinfo(2): uptime, load average, process count and memory from the kernel
+  js_sysinfo__deps: ['$PKSYS'],
+  js_sysinfo__proxy: 'none',
+  js_sysinfo: function (out) {
+    try {
+      var i = ksys('sysinfo', []);
+      var loads = i.loads || [0, 0, 0];
+      HEAPU32[out >> 2] = Math.floor((i.uptimeMs || 0) / 1000);
+      HEAPU32[(out + 4) >> 2] = Math.round(loads[0] * 65536);
+      HEAPU32[(out + 8) >> 2] = Math.round(loads[1] * 65536);
+      HEAPU32[(out + 12) >> 2] = Math.round(loads[2] * 65536);
+      HEAPU32[(out + 16) >> 2] = i.procs | 0;
+      var total = i.heapLimit ? Math.floor(i.heapLimit / 1048576) : 4096;
+      var used = i.heapUsed ? Math.floor(i.heapUsed / 1048576) : 0;
+      HEAPU32[(out + 20) >> 2] = total;
+      HEAPU32[(out + 24) >> 2] = Math.max(0, total - used);
+    } catch (e) { if (e && e.__exit) throw e; }
+  },
+
+  // ── sockets: host fd == kernel fd, the kernel's network stack does the rest ──
+  __syscall_socket__deps: ['$PKSYS'],
+  __syscall_socket__proxy: 'none',
+  __syscall_socket: function (domain, type, protocol) {
+    try { return ksys('socket', [domain, type & 0xf, protocol, { nonblock: (type & 2048) !== 0 }]); } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_socketpair__deps: ['$PKSYS'],
+  __syscall_socketpair__proxy: 'none',
+  __syscall_socketpair: function (domain, type, protocol, fds) {
+    try {
+      var r = ksys('socketpair', [domain, type]);
+      HEAP32[fds >> 2] = r[0];
+      HEAP32[(fds + 4) >> 2] = r[1];
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_bind__deps: ['$PKSYS'],
+  __syscall_bind__proxy: 'none',
+  __syscall_bind: function (fd, addr, len) {
+    try { ksys('bind', [fd, PKSYS.readSockaddr(addr, len)]); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_connect__deps: ['$PKSYS'],
+  __syscall_connect__proxy: 'none',
+  __syscall_connect: function (fd, addr, len) {
+    try { ksys('connect', [fd, PKSYS.readSockaddr(addr, len)]); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_listen__deps: ['$PKSYS'],
+  __syscall_listen__proxy: 'none',
+  __syscall_listen: function (fd, backlog) {
+    try { ksys('listen', [fd, backlog]); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_accept4__deps: ['$PKSYS'],
+  __syscall_accept4__proxy: 'none',
+  __syscall_accept4: function (fd, addr, addrlen, flags) {
+    try {
+      var r = ksys('accept', [fd, { nonblock: (flags & 2048) !== 0 }]);
+      if (addr && addrlen) PKSYS.writeSockaddr(addr, addrlen, r.peer);
+      return r.fd;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_getsockname__deps: ['$PKSYS'],
+  __syscall_getsockname__proxy: 'none',
+  __syscall_getsockname: function (fd, addr, addrlen) {
+    try { PKSYS.writeSockaddr(addr, addrlen, ksys('getsockname', [fd])); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_getpeername__deps: ['$PKSYS'],
+  __syscall_getpeername__proxy: 'none',
+  __syscall_getpeername: function (fd, addr, addrlen) {
+    try { PKSYS.writeSockaddr(addr, addrlen, ksys('getpeername', [fd])); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_shutdown__deps: ['$PKSYS'],
+  __syscall_shutdown__proxy: 'none',
+  __syscall_shutdown: function (fd, how) {
+    try { ksys('shutdown', [fd, how]); return 0; } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_sendto__deps: ['$PKSYS'],
+  __syscall_sendto__proxy: 'none',
+  __syscall_sendto: function (fd, buf, len, flags, addr, alen) {
+    try {
+      var to = addr && alen ? PKSYS.readSockaddr(addr, alen) : undefined;
+      return ksys('sendto', [fd, HEAPU8.slice(buf, buf + len), { to: to, flags: flags }]);
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_recvfrom__deps: ['$PKSYS'],
+  __syscall_recvfrom__proxy: 'none',
+  __syscall_recvfrom: function (fd, buf, len, flags, addr, alen) {
+    try {
+      var r = ksys('recvfrom', [fd, len, { flags: flags }]);
+      if (r === null) return 0;
+      HEAPU8.set(r.data.subarray(0, len), buf);
+      if (addr && alen) PKSYS.writeSockaddr(addr, alen, r.from);
+      return (flags & 32) && r.trunc ? r.trunc : r.data.length; // MSG_TRUNC reports the full length
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_sendmsg__deps: ['$PKSYS'],
+  __syscall_sendmsg__proxy: 'none',
+  __syscall_sendmsg: function (fd, msg, flags) {
+    try {
+      var name = HEAPU32[msg >> 2];
+      var namelen = HEAPU32[(msg + 4) >> 2];
+      var data = PKSYS.gather(HEAPU32[(msg + 8) >> 2], HEAP32[(msg + 12) >> 2]);
+      var to = name && namelen ? PKSYS.readSockaddr(name, namelen) : undefined;
+      return ksys('sendto', [fd, data, { to: to, flags: flags }]);
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_recvmsg__deps: ['$PKSYS'],
+  __syscall_recvmsg__proxy: 'none',
+  __syscall_recvmsg: function (fd, msg, flags) {
+    try {
+      var name = HEAPU32[msg >> 2];
+      var iov = HEAPU32[(msg + 8) >> 2];
+      var iovcnt = HEAP32[(msg + 12) >> 2];
+      var total = PKSYS.iovTotal(iov, iovcnt);
+      var r = ksys('recvfrom', [fd, total, { flags: flags }]);
+      if (r === null) { HEAPU32[(msg + 20) >> 2] = 0; HEAP32[(msg + 24) >> 2] = 0; return 0; }
+      var n = PKSYS.scatter(iov, iovcnt, r.data);
+      if (name) PKSYS.writeSockaddr(name, msg + 4, r.from); // bounded by msg_namelen, which gets the full size
+      HEAPU32[(msg + 20) >> 2] = 0; // no control data
+      HEAP32[(msg + 24) >> 2] = r.trunc ? 32 : 0; // MSG_TRUNC
+      return (flags & 32) && r.trunc ? r.trunc : n;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_getsockopt__deps: ['$PKSYS'],
+  __syscall_getsockopt__proxy: 'none',
+  __syscall_getsockopt: function (fd, level, optname, optval, optlen) {
+    try {
+      var v = ksys('getsockopt', [fd, level, optname]);
+      PKSYS.writeOptVal(v, optval, optlen);
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  __syscall_setsockopt__deps: ['$PKSYS'],
+  __syscall_setsockopt__proxy: 'none',
+  __syscall_setsockopt: function (fd, level, optname, optval, optlen) {
+    try {
+      ksys('setsockopt', [fd, level, optname, PKSYS.readOptVal(level, optname, optval, optlen)]);
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  // alarm(2)/setitimer(ITIMER_REAL) from the blink patch: the kernel keeps the
+  // timer and raises SIGALRM in the guest (see raiseGuestSignal in kernel.ts)
+  js_set_alarm__deps: ['$PKSYS'],
+  js_set_alarm__proxy: 'none',
+  js_set_alarm: function (ms, intervalMs) {
+    try { return ksys('alarm', [ms, intervalMs]) | 0; } catch (e) { if (e && e.__exit) throw e; return 0; }
+  },
+  // interface ioctls from the blink patch (ioctl.c IoctlNetPassthrough): the
+  // guest's Linux amd64 struct bytes go to the kernel's stack and come back
+  js_net_ioctl__deps: ['$PKSYS'],
+  js_net_ioctl__proxy: 'none',
+  js_net_ioctl: function (fd, request, buf, len) {
+    try {
+      var r = ksys('ioctl', [fd, PKSYS.siocName(request >>> 0), HEAPU8.slice(buf, buf + len)]);
+      if (r && r.length) HEAPU8.set(r.subarray(0, len), buf);
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
   },
 });

@@ -485,9 +485,10 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       }
       // pk910: ptys (posix_openpt/unlockpt/ptsname) and the controlling-tty
       // requests, forwarded to the kernel glue with the linux numbers
-      if (request == 0x80045430) return IoctlGetInt32(m, fildes, 0x80045430, addr);  // TIOCGPTN
-      if (request == 0x40045431) return IoctlSetInt32(m, fildes, 0x40045431, addr);  // TIOCSPTLCK
-      if (request == 0x540e || request == 0x5422) return 0;  // TIOCSCTTY, TIOCNOTTY
+      // (requests with bit 31 set arrive sign-extended: compare the low 32 bits)
+      if ((u32)request == 0x80045430u) return IoctlGetInt32(m, fildes, 0x80045430u, addr);  // TIOCGPTN
+      if ((u32)request == 0x40045431u) return IoctlSetInt32(m, fildes, 0x40045431u, addr);  // TIOCSPTLCK
+      if ((u32)request == 0x540e || (u32)request == 0x5422) return 0;  // TIOCSCTTY, TIOCNOTTY
 #endif
       LOGF("missing ioctl %#" PRIx64, request);
       return einval();
