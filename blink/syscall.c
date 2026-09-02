@@ -218,6 +218,7 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 // so these go to the kernel directly (blink-lib.js); a negative result is
 // the host errno.
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
+extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image
 extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
 static int PkBridge(int r) {
   if (r < 0) {
@@ -3891,6 +3892,18 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
     }
     ForkRestoreParent(m);
     return pid;
+  }
+#endif
+#ifdef __EMSCRIPTEN__
+  {
+    // a real process execs: the kernel swaps this worker for the new image
+    // under the same pid (scripts and JS programs included). Close-on-exec
+    // fds go first, as blink's own exec path does. Returns only on failure.
+    int rc;
+    SysCloseExec(m->system);
+    rc = js_exec(prog, argv, envp);
+    errno = rc < 0 ? -rc : EIO;
+    return -1;
   }
 #endif
   LOCK(&m->system->exec_lock);
