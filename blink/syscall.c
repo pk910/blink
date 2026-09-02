@@ -220,6 +220,7 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
 extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image (deprecated)
 extern int js_exec_resolve(const char *prog, char *buf, int buflen);  // execve: kernel resolves+bookkeeps, returns the real path for in-place exec
+extern void js_procexit(int code);  // exit_group: notify the kernel, then this pthread ends (worker reclaimed)
 extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
 static int PkBridge(int r) {
   if (r < 0) {
@@ -647,6 +648,14 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
       HaltMachine(m, kMachineExitTrap);
     }
     FreeMachine(m);
+#ifdef __EMSCRIPTEN__
+    // Shared runtime: this process is a pthread and its System is now freed.
+    // Tell the kernel it exited, then end ONLY this pthread so the pool worker is
+    // reclaimed. Never ShutdownJit()/exit() here - those are runtime-global and
+    // would tear down the whole heap group (the parent and its fork siblings).
+    js_procexit(rc);
+    pthread_exit(0);
+#else
 #ifdef HAVE_JIT
     ShutdownJit();
 #endif
@@ -656,6 +665,7 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
     }
 #endif
     exit(rc);
+#endif
   }
 }
 
