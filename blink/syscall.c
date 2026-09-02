@@ -211,7 +211,8 @@ static int PkHostFd(struct Machine *m, int fildes) {
 extern int js_kernel_pipe(int *out);
 extern int js_vfork_exec(const char *prog, char **argv, char **envp, int f0, int f1, int f2);
 extern int js_vfork_dead(int code);
-extern int js_vfork_wait(int pid, int nohang, int *code_out);
+extern int js_vfork_wait(int pid, int nohang, int *code_out, unsigned *ru_ms_out);
+extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SHIFT), procs, totalram MB, freeram MB
 
 static int GetHostFdNum(struct Machine *m, int fildes) {
   struct Fd *fd;
@@ -3898,9 +3899,10 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
 #ifdef PK_FORK
   {
     int code = 0;
+    unsigned ru[2] = {0, 0};
     (void)wstatus;
     (void)hrusage;
-    rc = js_vfork_wait(pid, !!(options & WNOHANG), &code);
+    rc = js_vfork_wait(pid, !!(options & WNOHANG), &code, ru);
     if (rc < 0) {
       errno = -rc;
       return -1;
@@ -3911,7 +3913,12 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
       CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
     }
     if (opt_out_rusage_addr) {
+      // pk910: the child's user/system time from the kernel's accounting (ms)
       memset(&grusage, 0, sizeof(grusage));
+      Write64(grusage.utime.sec, ru[0] / 1000);
+      Write64(grusage.utime.usec, (ru[0] % 1000) * 1000);
+      Write64(grusage.stime.sec, ru[1] / 1000);
+      Write64(grusage.stime.usec, (ru[1] % 1000) * 1000);
       CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
     }
     return rc;
@@ -4060,9 +4067,26 @@ static int SysPrlimit(struct Machine *m, i32 pid, i32 resource,
 
 static int SysSysinfo(struct Machine *m, i64 siaddr) {
   struct sysinfo_linux si;
+#ifdef __EMSCRIPTEN__
+  // pk910: the box's uptime, load average, process count and memory come from the JS kernel
+  unsigned v[7] = {0, 0, 0, 0, 0, 0, 0};
+  js_sysinfo(v);
+  memset(&si, 0, sizeof(si));
+  Write64(si.uptime, v[0]);
+  Write64(si.loads[0], v[1]);
+  Write64(si.loads[1], v[2]);
+  Write64(si.loads[2], v[3]);
+  Write16(si.procs, v[4]);
+  Write64(si.totalram, (u64)v[5] << 20);
+  Write64(si.freeram, (u64)v[6] << 20);
+  Write32(si.mem_unit, 1);
+  CopyToUserWrite(m, siaddr, &si, sizeof(si));
+  return 0;
+#else
   if (sysinfo_linux(&si) == -1) return -1;
   CopyToUserWrite(m, siaddr, &si, sizeof(si));
   return 0;
+#endif
 }
 
 static i64 SysGetcwd(struct Machine *m, i64 bufaddr, i64 size) {
