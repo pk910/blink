@@ -218,7 +218,8 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 // so these go to the kernel directly (blink-lib.js); a negative result is
 // the host errno.
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
-extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image
+extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image (deprecated)
+extern int js_exec_resolve(const char *prog, char *buf, int buflen);  // execve: kernel resolves+bookkeeps, returns the real path for in-place exec
 extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
 static int PkBridge(int r) {
   if (r < 0) {
@@ -3989,13 +3990,23 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
 #endif
 #ifdef __EMSCRIPTEN__
   {
-    // a real process execs: the kernel swaps this worker for the new image
-    // under the same pid (scripts and JS programs included). Close-on-exec
-    // fds go first, as blink's own exec path does. Returns only on failure.
-    int rc;
-    SysCloseExec(m->system);
-    rc = js_exec(prog, argv, envp);
-    errno = rc < 0 ? -rc : EIO;
+    // In-place exec: the kernel resolves the binary path (busybox multicall,
+    // /proc/self/exe) and does bookkeeping (name, exePath, suid) WITHOUT swapping
+    // the worker - a fork child shares the group's runtime, so a swap would tear
+    // the whole tree down. Then blink loads the new image on THIS pthread with
+    // the guest's own argv/envp; the channel and pid stay, so the new image's
+    // syscalls keep routing to the same process. Only amd64 ELF is emulatable in
+    // place (scripts/JS programs return ENOEXEC). Returns only on failure.
+    char resolved[1024];
+    int rc = js_exec_resolve(prog, resolved, sizeof(resolved));
+    if (rc < 0) {
+      errno = -rc;
+      return -1;
+    }
+    LOCK(&m->system->exec_lock);
+    ExecveBlink(m, resolved, argv, envp);  // never returns on success
+    UNLOCK(&m->system->exec_lock);
+    errno = ENOEXEC;  // ExecveBlink returned: not an emulatable image
     return -1;
   }
 #endif
