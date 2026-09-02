@@ -549,6 +549,12 @@ static int GetElfHeader(char ehdr[64], const char *prog, const char *image) {
   return -1;
 }
 
+// g_progname is a process-wide label used only for crash/debug dumps, but
+// LoadProgram rewrites it on every exec. With concurrent processes in one wasm
+// runtime (shared-memory fork), two execs racing here double-free it and corrupt
+// the heap. Serialise the update.
+static pthread_mutex_t_ g_prognamelock = PTHREAD_MUTEX_INITIALIZER_;
+
 static void FreeProgName(void) {
   free(g_progname);
 }
@@ -739,8 +745,10 @@ void LoadProgram(struct Machine *m, char *execfn, char *prog, char **args,
     elf->at_phdr = 0;
     elf->at_base = -1;
     elf->at_phent = 56;
+    LOCK(&g_prognamelock);
     free(g_progname);
     g_progname = strdup(prog);
+    UNLOCK(&g_prognamelock);
     SYS_LOGF("LoadProgram %s", prog);
     if ((fd = VfsOpen(AT_FDCWD, prog, O_RDONLY, 0)) == -1 ||
         VfsFstat(fd, &st) == -1 || CheckExecutableFile(prog, &st) == -1 ||

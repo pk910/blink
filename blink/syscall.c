@@ -859,7 +859,15 @@ static int PkForkThread(struct Machine *m) {
 // System until it exits or execs, the parent suspended meanwhile - which is
 // vfork's contract, and cheap. (fork is SysFork below: a real process.)
 static int SysVfork(struct Machine *m) {
-#ifdef PK_FORK
+#ifdef __EMSCRIPTEN__
+  // Implement vfork as a real fork (the standard, safe substitution): the child
+  // gets its own COW address space and runs as a pthread. This avoids the
+  // in-place ForkFrame path below, whose g_forks[]/g_forkdepth globals are NOT
+  // safe when multiple processes vfork concurrently in one shared runtime (they
+  // race in ForkRestoreParent -> double free). A vfork child only exec/_exits,
+  // so a private COW copy is indistinguishable to correct programs.
+  return PkForkThread(m);
+#elif defined(PK_FORK)
   struct ForkFrame *f;
   struct System *child;
   struct Dll *e;
