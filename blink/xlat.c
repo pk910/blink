@@ -590,6 +590,12 @@ int XlatSocketLevel(int x, int *level) {
     CASE(SOL_IPV6_LINUX, res = IPPROTO_IPV6);
     CASE(SOL_TCP_LINUX, res = IPPROTO_TCP);
     CASE(SOL_UDP_LINUX, res = IPPROTO_UDP);
+#ifdef __EMSCRIPTEN__
+    // pk910: ping6's ICMP6_FILTER and raw ICMP_FILTER live at these levels;
+    // the wasm host (musl) numbers them like Linux and the JS kernel decodes them
+    CASE(SOL_ICMPV6_LINUX, res = SOL_ICMPV6_LINUX);
+    CASE(SOL_RAW_LINUX, res = SOL_RAW_LINUX);
+#endif
     default:
       LOGF("%s %d not supported yet", "socket level", x);
       return einval();
@@ -599,6 +605,15 @@ int XlatSocketLevel(int x, int *level) {
 }
 
 int XlatSocketOptname(int level, int optname) {
+#ifdef __EMSCRIPTEN__
+  // pk910: the wasm host is musl with Linux option numbers and the options
+  // end up in the JS kernel untranslated, so IPv6 / ICMPv6 / raw options
+  // (IPV6_V6ONLY, IPV6_UNICAST_HOPS, ICMP6_FILTER, ...) pass through as is
+  if (level == SOL_IPV6_LINUX || level == SOL_ICMPV6_LINUX ||
+      level == SOL_RAW_LINUX) {
+    return optname;
+  }
+#endif
   switch (level) {
     case SOL_SOCKET_LINUX:
       switch (optname) {

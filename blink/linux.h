@@ -355,6 +355,8 @@
 #define SOL_TCP_LINUX    6
 #define SOL_UDP_LINUX    17
 #define SOL_IPV6_LINUX   41
+#define SOL_ICMPV6_LINUX 58   // pk910
+#define SOL_RAW_LINUX    255  // pk910
 
 #define IPPROTO_IP_LINUX     0
 #define IPPROTO_ICMP_LINUX   1
