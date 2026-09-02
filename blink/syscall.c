@@ -801,11 +801,23 @@ static int PkForkThread(struct Machine *m) {
   child->jit.threaded = true;
   sigfillset(&ss);
   unassert(!pthread_sigmask(SIG_SETMASK, &ss, &oldss));
-  if (!(m2 = NewMachine(child, m))) {
+  // A fork child is a new PROCESS, not a thread of the parent, so it gets a
+  // fresh main-thread machine on the cloned System (NewMachine asserts that a
+  // machine's parent shares its System). Its CPU state is copied from the parent
+  // by hand, the way the old snapshot restore did, but fork returns 0.
+  if (!(m2 = NewMachine(child, 0))) {
     unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
     FreeSystem(child);
     return eagain();
   }
+  memcpy(m2->beg, m->beg, sizeof(m2->beg));
+  memcpy(m2->xmm, m->xmm, sizeof(m2->xmm));
+  memcpy(&m2->fpu, &m->fpu, sizeof(m2->fpu));
+  memcpy(m2->seg, m->seg, sizeof(m2->seg));  // aliases fs/gs (union): TLS bases
+  m2->ip = m->ip;
+  m2->sigmask = m->sigmask;
+  m2->flags = m->flags;
+  m2->mxcsr = m->mxcsr;
   Write64(m2->ax, 0);           // the child returns 0 from fork
   m2->spawn_sigmask = oldss;
   if ((pid = js_forkchild()) < 0) {
