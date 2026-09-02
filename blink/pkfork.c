@@ -9,6 +9,7 @@
 // syscall.c: that IS vfork's contract.)
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -232,15 +233,23 @@ static u8 *PkSerialize(struct Machine *m, u64 *len) {
   return buf;
 }
 
+static double PkMs(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
+
 // fork(): the snapshot goes to the kernel, the child's pid comes back.
 int PkForkRemote(struct Machine *m) {
   u8 *buf;
   u64 len;
   int rc;
+  double t0 = PkMs(), t1, t2;
   if (!(buf = PkSerialize(m, &len))) return enomem();
-  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork snapshot %llu bytes\n", (unsigned long long)len);
+  t1 = PkMs();
   rc = js_fork(buf, len);
-  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork -> %d\n", rc);
+  t2 = PkMs();
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork -> %d: snapshot %llu bytes in %.1f ms, kernel round trip %.1f ms\n", rc, (unsigned long long)len, t1 - t0, t2 - t1);
   free(buf);
   if (rc < 0) {
     errno = -rc;
@@ -377,12 +386,14 @@ int PkRestoreFork(struct Machine *m) {
     fprintf(stderr, "blink: fork restore: no snapshot (%u bytes)\n", total);
     return -1;
   }
+  double t0 = PkMs();
   js_fork_snapshot_read(&hdr, sizeof(hdr));
   len = hdr.total - hdr.ndata * 4096;  // the prefix; data pages stay in the snapshot
   if (!(buf = (u8 *)malloc(len))) return -1;
   js_fork_snapshot_read(buf, len);
   rc = PkRestore(m, buf, len);
   if (rc == 0 && g_snap_pending == 0) js_fork_snapshot_done();
+  if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork restore took %.1f ms\n", PkMs() - t0);
   if (getenv("PK_FORK_DEBUG")) fprintf(stderr, "blink: fork restore %s (%u of %u bytes now, %u pages lazy)\n", rc ? "failed" : "ok", (unsigned)len, total, g_snap_pending);
   free(buf);
   return rc;

@@ -617,8 +617,12 @@ addToLibrary({
   __syscall_faccessat__deps: ['$PKSYS'],
   __syscall_faccessat__proxy: 'none',
   __syscall_faccessat: function (dirfd, path) { try { ksys('stat', [PKSYS.atPath(dirfd, path)]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_readlinkat__deps: ['$PKSYS'],
   __syscall_readlinkat__proxy: 'none',
-  __syscall_readlinkat: function () { return -22; }, // EINVAL: no symlinks in the VFS
+  __syscall_readlinkat: function (dirfd, path, buf, bufsize) {
+    // the kernel answers for /proc/<pid>/fd/<n>; anything else is EINVAL (no symlinks in the VFS)
+    try { var b = PKSYS.enc().encode(ksys('readlink', [UTF8ToString(path)])); var n = Math.min(b.length, bufsize); HEAPU8.set(b.subarray(0, n), buf); return n; } catch (e) { return PKSYS.errS(e); }
+  },
   __syscall_symlinkat__proxy: 'none',
   __syscall_symlinkat: function () { return -1; }, // EPERM
   __syscall_linkat__proxy: 'none',
@@ -762,7 +766,18 @@ addToLibrary({
   js_fork_snapshot_size__proxy: 'none',
   js_fork_snapshot_size: function () { var s = globalThis.__pkForkSnapshot; return s ? s.length : 0; },
   js_fork_snapshot_read__proxy: 'none',
-  js_fork_snapshot_read: function (buf, len) { var s = globalThis.__pkForkSnapshot; if (s) HEAPU8.set(s.subarray(0, len), buf); globalThis.__pkForkSnapshot = null; },
+  js_fork_snapshot_read: function (buf, len) { var s = globalThis.__pkForkSnapshot; if (s) HEAPU8.set(s.subarray(0, len), buf); },
+  // data pages stay in the (shared) snapshot until a page is touched
+  js_fork_page__proxy: 'none',
+  js_fork_page: function (slot, dst) {
+    var s = globalThis.__pkForkSnapshot;
+    if (!s) return -1;
+    var off = globalThis.__pkForkDataOffset + slot * 4096;
+    HEAPU8.set(s.subarray(off, off + 4096), dst);
+    return 0;
+  },
+  js_fork_snapshot_done__proxy: 'none',
+  js_fork_snapshot_done: function () { globalThis.__pkForkSnapshot = null; },
 
   // ── vfork / pipe bridge: process-level fork+exec, wired in x86-runtime.js ──
   js_kernel_pipe__proxy: 'none',
