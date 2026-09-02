@@ -361,8 +361,8 @@ static int IoctlNetPassthrough(struct Machine *m, int fildes, u64 request,
     }
     return 0;
   }
-  // everything else is a struct ifreq (40 bytes)
-  len = 40;
+  // everything else is a struct ifreq (40 bytes); the ARP cache calls carry a struct arpreq (68)
+  len = (request == 0x8953 || request == 0x8954 || request == 0x8955) ? 68 : 40;
   if (!(buf = (u8 *)AddToFreeList(m, calloc(1, len)))) return -1;
   if (CopyFromUserRead(m, buf, addr, len) == -1) return -1;
   rc = js_net_ioctl(fildes, request, buf, len);
