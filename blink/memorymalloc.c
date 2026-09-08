@@ -714,7 +714,9 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
     pagesize = FLAG_pagesize;
     real = mug = FindHostPage(entry);
     while ((uintptr_t)mug & (pagesize - 1)) mug -= 4096;
-    unassert(!Munmap(mug, real - mug + size));
+    // pk910 probe: under emscripten, munmap of a sub-range of an existing
+    // host mapping returns EINVAL. Leaking the host page beats aborting.
+    if (Munmap(mug, real - mug + size)) { /* host cannot unmap a sub-range */ }
     if (entry & PAGE_RSRV) {
       s->memstat.reserved -= 1;
     } else {
