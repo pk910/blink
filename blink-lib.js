@@ -194,7 +194,7 @@ addToLibrary({
       HEAPU32[(buf + 8) >> 2] = st.nlink >>> 0; // nlink
       HEAPU32[(buf + 12) >> 2] = st.uid >>> 0; // uid
       HEAPU32[(buf + 16) >> 2] = st.gid >>> 0; // gid
-      HEAPU32[(buf + 20) >> 2] = 0; // rdev
+      HEAPU32[(buf + 20) >> 2] = (st.rdev || 0) >>> 0; // rdev: the device's own (major, minor)
       HEAP64[(buf + 24) >> 3] = BigInt(size); // size
       HEAP32[(buf + 32) >> 2] = 4096; // blksize
       HEAP32[(buf + 36) >> 2] = Math.ceil(size / 512); // blocks
@@ -833,6 +833,34 @@ addToLibrary({
   // ── identity and sessions: the kernel's, reached from blink's syscall handlers ──
   // (emscripten's libc answers the setuid family with EPERM before any syscall
   // and stubs setsid/setpgid, so the host calls never reach a JS import)
+  // blink's own diagnostics: the kernel's ring buffer, not the guest's stderr
+  js_klog__deps: ['$PKSYS'],
+  js_klog__proxy: 'none',
+  js_klog: function (ptr) {
+    if (typeof globalThis.ksys !== 'function') return; // before the channel is up
+    try {
+      // blink stamps its own "E<time>:file:line:tid " prefix; dmesg already
+      // carries the time and the unit, so drop it and keep the message
+      var m = PKSYS.cstr(ptr).replace(/\n+$/, '').replace(/^[EI][0-9T:.-]+:[^\s:]+:\d+:\d+ /, '');
+      ksys('klog', [m.slice(0, 500)]);
+    } catch (e) { /* nothing better to do */ }
+  },
+
+  // syslog(2): the ring buffer is the kernel's, and so is the clearing. Types
+  // 2/3/4 fill the guest's buffer and return the byte count; the rest answer
+  // with a number (10 = buffer size, 9 = bytes waiting).
+  js_klogctl__deps: ['$PKSYS'],
+  js_klogctl__proxy: 'none',
+  js_klogctl: function (type, buf, len) {
+    try {
+      var r = ksys('klogctl', [type | 0, len | 0]);
+      if (typeof r === 'number') return r;
+      var b = PKSYS.enc().encode(String(r === null || r === undefined ? '' : r));
+      var n = Math.min(b.length, len | 0);
+      HEAPU8.set(b.subarray(0, n), buf);
+      return n;
+    } catch (e) { return PKSYS.errS(e); }
+  },
   js_uname__deps: ['$PKSYS'],
   js_uname__proxy: 'none',
   js_uname: function (buf) {

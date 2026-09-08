@@ -165,7 +165,14 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
          "code=%d "
          "faultaddr=%#" PRIx64 ")",
          DescribeSignal(sig), m->ip, code, m->faultaddr);
-    PrintDiagnostics(m);
+#ifdef __EMSCRIPTEN__
+    // pk910: the line above is what Linux logs for a segfault, and it now goes
+    // to the kernel's ring buffer (log.c). The rest - guest backtrace, the
+    // whole page table - is a debugging tool, not something to put in dmesg on
+    // every crash; BLINK_DIAGNOSTICS=1 in the environment asks for it.
+    if (getenv("BLINK_DIAGNOSTICS"))
+#endif
+      PrintDiagnostics(m);
   }
   if ((syssig = XlatSignal(sig)) == -1) syssig = SIGKILL;
   FreeMachine(m);
