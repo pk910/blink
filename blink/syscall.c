@@ -3310,6 +3310,100 @@ static int SysFstatat(struct Machine *m, i32 dirfd, i64 pathaddr, i64 staddr,
   return rc;
 }
 
+// statx(2): the same stat laid out the way modern glibc and coreutils ask for
+// it. They call it directly (ls -R, stat, anything built against statx) and a
+// kernel without it gives ENOSYS, which they do not fall back from.
+struct statx_timestamp_linux {
+  u8 sec[8];
+  u8 nsec[4];
+  u8 pad_[4];
+};
+struct statx_linux {
+  u8 mask[4];
+  u8 blksize[4];
+  u8 attributes[8];
+  u8 nlink[4];
+  u8 uid[4];
+  u8 gid[4];
+  u8 mode[2];
+  u8 pad0_[2];
+  u8 ino[8];
+  u8 size[8];
+  u8 blocks[8];
+  u8 attributes_mask[8];
+  struct statx_timestamp_linux atime, btime, ctime, mtime;
+  u8 rdev_major[4];
+  u8 rdev_minor[4];
+  u8 dev_major[4];
+  u8 dev_minor[4];
+  u8 mnt_id[8];
+  u8 dio_mem_align[4];
+  u8 dio_offset_align[4];
+  u8 spare_[96];
+};
+#define STATX_BASIC_STATS_LINUX 0x7ff
+
+static void StatxTime(struct statx_timestamp_linux *dst, const struct timespec_linux *src) {
+  Write64(dst->sec, Read64(src->sec));
+  Write32(dst->nsec, Read64(src->nsec));
+  Write32(dst->pad_, 0);
+}
+
+static int SysStatx(struct Machine *m, i32 dirfd, i64 pathaddr, i32 flags, u32 mask, i64 bufaddr) {
+  int rc;
+  u64 dev;
+  struct stat st;
+  const char *path;
+  struct stat_linux g;
+  struct statx_linux x;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  if ((flags & AT_EMPTY_PATH_LINUX) && !*path) {
+    rc = VfsFstat(dirfd, &st);
+  } else {
+    flags &= ~AT_EMPTY_PATH_LINUX;
+    rc = VfsStat(GetDirFildes(dirfd), path, &st, XlatFstatatFlags(flags));
+  }
+  if (rc == -1) return -1;
+  XlatStatToLinux(&g, &st);
+  memset(&x, 0, sizeof(x));
+  Write32(x.mask, STATX_BASIC_STATS_LINUX);  // everything but a birth time
+  Write32(x.blksize, Read64(g.blksize));
+  Write32(x.nlink, Read64(g.nlink));
+  Write32(x.uid, Read32(g.uid));
+  Write32(x.gid, Read32(g.gid));
+  Write16(x.mode, Read32(g.mode));
+  Write64(x.ino, Read64(g.ino));
+  Write64(x.size, Read64(g.size));
+  Write64(x.blocks, Read64(g.blocks));
+  StatxTime(&x.atime, &g.atim);
+  StatxTime(&x.ctime, &g.ctim);
+  StatxTime(&x.mtime, &g.mtim);
+  dev = Read64(g.dev);
+  Write32(x.dev_major, ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffull));
+  Write32(x.dev_minor, (dev & 0xff) | ((dev >> 12) & ~0xffull));
+  dev = Read64(g.rdev);
+  Write32(x.rdev_major, ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffull));
+  Write32(x.rdev_minor, (dev & 0xff) | ((dev >> 12) & ~0xffull));
+  (void)mask;
+  return CopyToUserWrite(m, bufaddr, &x, sizeof(x));
+}
+
+// Extended attributes: the VFS has none, which on Linux is ENOTSUP, the
+// answer a filesystem without xattr support gives. ls -Z, cp -a and friends
+// know that one; ENOSYS from a missing syscall they report as an error.
+static i64 SysGetxattr(struct Machine *m, i64 a, i64 b, i64 c, i64 d) {
+  return enotsup();
+}
+static i64 SysSetxattr(struct Machine *m, i64 a, i64 b, i64 c, i64 d, i64 e) {
+  return enotsup();
+}
+static i64 SysListxattr(struct Machine *m, i64 a, i64 b, i64 c) {
+  return enotsup();
+}
+static i64 SysRemovexattr(struct Machine *m, i64 a, i64 b) {
+  return enotsup();
+}
+
 static int XlatFchownatFlags(int x) {
   int res = 0;
   if (x & AT_SYMLINK_FOLLOW_LINUX) {
@@ -6350,6 +6444,19 @@ void OpSyscall(P) {
     SYSCALL(4, 0x101, "openat", SysOpenat, STRACE_OPENAT);
     SYSCALL(3, 0x102, "mkdirat", SysMkdirat, STRACE_MKDIRAT);
     SYSCALL(4, 0x106, "fstatat", SysFstatat, STRACE_FSTATAT);
+    SYSCALL(5, 0x14C, "statx", SysStatx, STRACE_5);
+    SYSCALL(5, 0x0BC, "setxattr", SysSetxattr, STRACE_5);
+    SYSCALL(5, 0x0BD, "lsetxattr", SysSetxattr, STRACE_5);
+    SYSCALL(5, 0x0BE, "fsetxattr", SysSetxattr, STRACE_5);
+    SYSCALL(4, 0x0BF, "getxattr", SysGetxattr, STRACE_4);
+    SYSCALL(4, 0x0C0, "lgetxattr", SysGetxattr, STRACE_4);
+    SYSCALL(4, 0x0C1, "fgetxattr", SysGetxattr, STRACE_4);
+    SYSCALL(3, 0x0C2, "listxattr", SysListxattr, STRACE_3);
+    SYSCALL(3, 0x0C3, "llistxattr", SysListxattr, STRACE_3);
+    SYSCALL(3, 0x0C4, "flistxattr", SysListxattr, STRACE_3);
+    SYSCALL(2, 0x0C5, "removexattr", SysRemovexattr, STRACE_2);
+    SYSCALL(2, 0x0C6, "lremovexattr", SysRemovexattr, STRACE_2);
+    SYSCALL(2, 0x0C7, "fremovexattr", SysRemovexattr, STRACE_2);
     SYSCALL(3, 0x107, "unlinkat", SysUnlinkat, STRACE_UNLINKAT);
     SYSCALL(4, 0x108, "renameat", SysRenameat, STRACE_RENAMEAT);
     SYSCALL(5, 0x109, "linkat", SysLinkat, STRACE_LINKAT);
