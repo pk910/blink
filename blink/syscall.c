@@ -1646,6 +1646,14 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
   bool fixedmap;
   i64 newautomap;
   if (!IsValidAddrSize(virt, size)) return einval();
+  // pk910: a Linux process owns the LOW canonical half only; the high half is
+  // the kernel's and a fixed mmap there always fails. IsValidAddrSize accepts
+  // it because it sign-extends bit 47, so 0xffffffffffff0000 reads as a valid
+  // negative address - and Wine's virtual_init probes upward until an mmap
+  // fails, so it concluded it had a flat 64-bit space ("host addr space limit:
+  // 0xffffffffffff0000") and put its view block where nothing can ever be
+  // mapped. Refusing the kernel half makes the probe stop where Linux does.
+  if (virt < 0 || (u64)virt + (u64)size > (u64)FLAG_vaspace + 4096) return enomem();
   if (flags & MAP_GROWSDOWN_LINUX) return enotsup();
   if ((key = Prot2Page(prot)) == (u64)-1) return einval();
   CleanseMemory(m->system, size);

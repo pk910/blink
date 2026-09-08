@@ -896,8 +896,16 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
   // could ever grow to can never be backed - handing it out means the guest
   // dies of SIGSEGV the moment its allocator writes a header into it. Refusing
   // here is what turns that into malloc() returning NULL, which is a thing the
-  // guest can act on. (Linux with overcommit_memory=0 refuses the same way.)
-  if (size > 0 && (u64)size > emscripten_get_heap_max() - emscripten_get_heap_size()) {
+  // guest can act on.
+  //
+  // Two things this must NOT do, both learned from Wine. A PROT_NONE mapping is
+  // address space and nothing else: it cannot be written, Linux never charges
+  // it against commit, and Wine reserves 34 GB of it in one call at startup
+  // (virtual_init), so only a mapping the guest can touch is measured. And the
+  // measure is the ceiling the heap could EVER reach, not what is free right
+  // now: memory gets freed, and a mapping made today may be touched later.
+  if (size > 0 && (flags & (PAGE_U | PAGE_RW)) &&
+      (u64)size > emscripten_get_heap_max()) {
     return enomem();
   }
 #endif
