@@ -360,6 +360,11 @@ static struct System *CloneSystem(struct System *p) {
     return 0;
   }
   c->cr3 = cr3;
+  // pk910: CloneLeaf just cleared PAGE_RW on the parent's shared anon PTEs, but
+  // every parent thread has its own m->tlb and would happily keep writing
+  // through a cached pre-fork writable entry, straight into the page the child
+  // now shares. drop the parent's tlbs before anyone runs again.
+  InvalidateSystem(p, true, false);
   c->brk = p->brk;
   c->automap = p->automap;
   c->codestart = p->codestart;
