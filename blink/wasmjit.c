@@ -2211,6 +2211,10 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
   struct Buf pb;
   n = RDiscover(m, ip, bs);
   if (n < 1) return false;
+  // A degenerate entry block (nothing decodable at ip) would compile to a region
+  // that only stores m->ip = ip and returns, and the dispatcher would call it
+  // again forever. Let the linear path fail instead, so the interpreter faults.
+  if (bs[0].end <= bs[0].start) return false;
   RLayout(bs, 0, order, &nl);
   if (nl < 1) return false;
   for (i = 0; i < nl; ++i) {  // predecessor counts + loop shape
