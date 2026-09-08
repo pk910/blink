@@ -218,6 +218,9 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 // so these go to the kernel directly (blink-lib.js); a negative result is
 // the host errno.
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
+extern int js_getxid(int which);                 // pk910: 0 uid 1 euid 2 gid 3 egid, from the kernel's credentials
+extern int js_getgroups(int size, int *out);   // pk910: the kernel's supplementary groups (size 0 = count)
+extern int js_setgroups(int size, const int *in);
 extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image (deprecated)
 extern int js_exec_resolve(const char *prog, char *buf, int buflen);  // execve: kernel resolves+bookkeeps, returns the real path for in-place exec
 extern void js_procexit(int code);  // exit_group: notify the kernel, then this pthread ends (worker reclaimed)
@@ -5622,20 +5625,39 @@ static int SysGetppid(struct Machine *m) {
   return getppid();
 }
 
+// pk910: under emscripten the host libc's geteuid()/getegid() collapse to the
+// real ids, so a setuid image would report itself unprivileged. The kernel
+// owns the credentials; ask it.
 static int SysGetuid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return js_getxid(0);
+#else
   return getuid();
+#endif
 }
 
 static int SysGetgid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return js_getxid(2);
+#else
   return getgid();
+#endif
 }
 
 static int SysGeteuid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return js_getxid(1);
+#else
   return geteuid();
+#endif
 }
 
 static int SysGetegid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return js_getxid(3);
+#else
   return getegid();
+#endif
 }
 
 static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
@@ -5643,6 +5665,21 @@ static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
   u8 i32buf[4];
   int i, ngroups;
   long ngroups_max;
+#ifdef __EMSCRIPTEN__
+  // pk910: the host libc's getgroups is a stub; the kernel owns the credentials
+  {
+    int *gs;
+    if (!size) return js_getgroups(0, 0);
+    if (!IsValidMemory(m, addr, (size_t)size * 4, PROT_WRITE)) return -1;
+    if (!(gs = (int *)AddToFreeList(m, malloc(size * sizeof(int))))) return -1;
+    if ((ngroups = js_getgroups(size, gs)) < 0) return ngroups;
+    for (i = 0; i < ngroups; ++i) {
+      Write32(i32buf, gs[i]);
+      CopyToUserWrite(m, addr + (size_t)i * 4, i32buf, 4);
+    }
+    return ngroups;
+  }
+#endif
   if (!size) {
     return getgroups(0, 0);
   } else {
@@ -5670,6 +5707,19 @@ static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
 }
 
 static i32 SysSetgroups(struct Machine *m, i32 size, i64 addr) {
+#ifdef __EMSCRIPTEN__
+  {
+    int i, *gs;
+    const u8 *group_linux;
+    if (size < 0) return einval();
+    if (!(group_linux = (const u8 *)SchlepR(m, addr, (size_t)size * 4)) ||
+        !(gs = (int *)AddToFreeList(m, malloc((size + 1) * sizeof(int))))) {
+      return -1;
+    }
+    for (i = 0; i < size; ++i) gs[i] = Read32(group_linux + (size_t)i * 4);
+    return js_setgroups(size, gs);
+  }
+#endif
 #ifdef HAVE_SETGROUPS
   int i;
   gid_t *group;

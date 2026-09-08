@@ -655,10 +655,12 @@ addToLibrary({
       return 0;
     } catch (e) { return PKSYS.errS(e); }
   },
+  __syscall_fchown32__deps: ['$PKSYS'],
   __syscall_fchown32__proxy: 'none',
-  __syscall_fchown32: function () { return 0; },
+  __syscall_fchown32: function (fd, uid, gid) { try { ksys('chown', [ksys('fdpath', [fd]), uid | 0, gid | 0]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_fchownat__deps: ['$PKSYS'],
   __syscall_fchownat__proxy: 'none',
-  __syscall_fchownat: function () { return 0; },
+  __syscall_fchownat: function (dirfd, path, uid, gid, flags) { try { ksys('chown', [PKSYS.atPath(dirfd, path), uid | 0, gid | 0, (flags & 0x100) !== 0]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_umask__deps: ['$PKSYS'],
   __syscall_umask__proxy: 'none',
   __syscall_umask: function (m) { var prev = PKSYS.umaskVal; PKSYS.umaskVal = m & 0o777; return prev; },
@@ -760,6 +762,36 @@ addToLibrary({
   // ── identity and sessions: the kernel's, reached from blink's syscall handlers ──
   // (emscripten's libc answers the setuid family with EPERM before any syscall
   // and stubs setsid/setpgid, so the host calls never reach a JS import)
+  js_getxid__deps: ['$PKSYS'],
+  js_getxid__proxy: 'none',
+  js_getxid: function (which) {
+    try {
+      var ids = ksys('getids', []);
+      return (which === 0 ? ids.uid : which === 1 ? ids.euid : which === 2 ? ids.gid : ids.egid) | 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  js_getgroups__deps: ['$PKSYS'],
+  js_getgroups__proxy: 'none',
+  js_getgroups: function (size, out) {
+    // getgroups(2) for the kernel's credentials: size 0 asks how many
+    try {
+      var groups = ksys('getids', []).groups || [];
+      if (size === 0) return groups.length;
+      if (size < groups.length) return -22; // EINVAL
+      for (var i = 0; i < groups.length; i++) HEAP32[(out + i * 4) >> 2] = groups[i];
+      return groups.length;
+    } catch (e) { return PKSYS.errS(e); }
+  },
+  js_setgroups__deps: ['$PKSYS'],
+  js_setgroups__proxy: 'none',
+  js_setgroups: function (size, list) {
+    try {
+      var gs = [];
+      for (var i = 0; i < size; i++) gs.push(HEAP32[(list + i * 4) >> 2]);
+      ksys('setgroups', [gs]);
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
   js_setxid__deps: ['$PKSYS'],
   js_setxid__proxy: 'none',
   js_setxid: function (which, a, b, c) {
