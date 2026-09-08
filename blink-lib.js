@@ -106,6 +106,7 @@ addToLibrary({
       c_iflag: 0o25156 & 0xffff, c_oflag: 5, c_cflag: 191, c_lflag: 35387,
       c_cc: [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     },
+    onlcrActive: true,
     dec: function () { return PKSYS._dec || (PKSYS._dec = new TextDecoder()); },
     enc: function () { return PKSYS._enc || (PKSYS._enc = new TextEncoder()); },
     // emscripten (WASI) errno numbering; a recognized name is an expected result
@@ -499,6 +500,13 @@ addToLibrary({
       var wantRaw = (data.c_lflag & 2) === 0; // ICANON cleared = raw
       if (wantRaw !== PKSYS.rawActive) {
         try { ksys('ioctl', [0, 'raw', wantRaw]); PKSYS.rawActive = wantRaw; } catch (e) { if (e && e.__exit) throw e; }
+      }
+      // OPOST|ONLCR: the tty adds the carriage return to a bare \n. Curses
+      // programs read termios back and emit bare newlines when it is on, so
+      // the tty has to mean it (raw mode above already cleared it).
+      var wantOnlcr = (data.c_oflag & 1) !== 0 && (data.c_oflag & 4) !== 0;
+      if (wantOnlcr !== PKSYS.onlcrActive) {
+        try { ksys('ioctl', [0, 'onlcr', wantOnlcr]); PKSYS.onlcrActive = wantOnlcr; } catch (e) { if (e && e.__exit) throw e; }
       }
       return 0;
     },
