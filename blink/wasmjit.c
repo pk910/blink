@@ -38,6 +38,7 @@
 #include "blink/machine.h"
 #include "blink/modrm.h"
 #include "blink/flags.h"
+#include "blink/fpu.h"
 #include "blink/rde.h"
 
 extern int pk_jit_install(const void *bytes, int len, int first_compile);
@@ -232,6 +233,8 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define HP0 25   // i32 scratch: tlb slot / host pointer (memory fast path)
 #define HP1 26   // i32 scratch: offset within page
 #define TG  27   // i32: region block-dispatch target (br_table index)
+#define IT  TG   // sse scratch: safe to alias TG, which every path writes before the
+                 // br_table reads it (region entry and EmitGoto backward edges)
 #define OFF_TLB   ((u32)offsetof(struct Machine, tlb))
 #define OFF_INVAL ((u32)offsetof(struct Machine, invalidated))
 
@@ -1103,6 +1106,726 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
   return true;
 }
 
+// ── SSE / SSE2 via the wasm 128-bit SIMD proposal ───────────────────────────
+// blink keeps the guest's xmm file as a plain `u8 xmm[16][16]` inside struct
+// Machine, so an xmm operand is a v128.load/v128.store at a fixed offset from
+// local 0 and most SSE2 opcodes are one wasm SIMD instruction. Everything here
+// is emitted only when the wasm result is provably bit-identical to blink's own
+// leaf; anything mxcsr-dependent, MMX, x87 or LOCKed keeps the handler.
+//
+// Semantics notes that decided what is in and what is out:
+//   * blink's float leaves are plain C `x + y` on doubles, compiled by
+//     emscripten to the SAME f64.add this emits - identical NaN payloads,
+//     identical rounding, no mxcsr consulted. So scalar/packed add/sub/mul/div
+//     inline exactly. min/max use a C ternary with x86-unlike NaN rules and are
+//     left alone; sqrt/rcp/rsqrt likewise.
+//   * ucomis* never touches mxcsr, so it inlines whole. comis* clears/sets
+//     mxcsr's IE and can HaltMachine on unordered, so only its ORDERED path is
+//     inlined (mxcsr &= ~IE is two instructions) and unordered bails.
+//   * variable-count vector shifts (psrlw xmm,xmm) mask the count &width in
+//     wasm but saturate to "all zero" on x86, so they stay on the handler.
+//     The imm8 forms fold the count at compile time and are exact.
+#define OFF_XMM   ((u32)offsetof(struct Machine, xmm))
+#define OFF_MXCSR ((u32)offsetof(struct Machine, mxcsr))
+
+// 0xfd-prefixed opcodes (numbers verified against binaryen's assembler)
+#define V_LOAD        0
+#define V_STORE       11
+#define V_CONST       12
+#define V_SHUFFLE     13
+#define V_I8_EQ       35
+#define V_I16_EQ      45
+#define V_I32_EQ      55
+#define V_I8_GT_S     39
+#define V_I16_GT_S    49
+#define V_I32_GT_S    59
+#define V_NOT         77
+#define V_AND         78
+#define V_ANDNOT      79
+#define V_OR          80
+#define V_XOR         81
+#define V_LOAD32_ZERO 92
+#define V_LOAD64_ZERO 93
+#define V_I8_BITMASK  100
+#define V_I8_SHL      107
+#define V_I8_ADD      110
+#define V_I8_SUB      113
+#define V_I16_SHL     139
+#define V_I16_SHR_S   140
+#define V_I16_SHR_U   141
+#define V_I16_ADD     142
+#define V_I16_SUB     145
+#define V_I32_SHL     171
+#define V_I32_SHR_S   172
+#define V_I32_SHR_U   173
+#define V_I32_ADD     174
+#define V_I32_SUB     177
+#define V_I64_SHL     203
+#define V_I64_SHR_U   205
+#define V_I64_ADD     206
+#define V_I64_SUB     209
+#define V_I64_EQ      214
+#define V_F32_ADD     228
+#define V_F32_SUB     229
+#define V_F32_MUL     230
+#define V_F32_DIV     231
+#define V_F64_ADD     240
+#define V_F64_SUB     241
+#define V_F64_MUL     242
+#define V_F64_DIV     243
+
+static void ESimd(struct Buf *b, u32 op) { bput(b, 0xfd); bleb_u(b, op); }
+// 0xfd memory op: align 0 (a hint only, so always sound) + byte offset
+static void ESimdMem(struct Buf *b, u32 op, u32 off) {
+  ESimd(b, op);
+  bleb_u(b, 0);
+  bleb_u(b, off);
+}
+static void EXmmLoad(struct Buf *b, int r) {  // push xmm[r] as v128
+  EGet(b, 0);
+  ESimdMem(b, V_LOAD, OFF_XMM + (u32)r * 16);
+}
+// scalar access to a field inside xmm[r]. EXmmSt is the raw memarg (the caller
+// must already have pushed the base address AND the value); EXmmLd pushes the
+// base itself. (i64.load 0x29, f64.load 0x2b, i32.load 0x28, i64.store 0x37...)
+static void EXmmSt(struct Buf *b, u8 op, int r, u32 off) {
+  bput(b, op);
+  bleb_u(b, 0);
+  bleb_u(b, OFF_XMM + (u32)r * 16 + off);
+}
+static void EXmmLd(struct Buf *b, u8 op, int r, u32 off) {
+  EGet(b, 0);
+  EXmmSt(b, op, r, off);
+}
+
+// Runtime probe: does this engine accept a module using v128? All browsers and
+// node have shipped SIMD since 2021, but a compile failure would silently turn
+// every SSE-carrying block into an interpreter block, so check once.
+static const u8 kSimdProbe[] = {
+    0x0a, 0x0b, 0x01, 0x09, 0x00,      // code section, 1 body, 9 bytes, 0 locals
+    0x20, 0x00,                        // local.get 0
+    0xfd, 0x00, 0x00, 0x00,            // v128.load align=0 off=0
+    0x1a,                              // drop
+    0x0b,                              // end
+};
+static int g_simd;  // 0 unknown, 1 yes, -1 no
+static bool WasmSimdOk(void) {
+  u8 mod[sizeof(kPrefix) + sizeof(kSimdProbe)];
+  if (g_simd) return g_simd > 0;
+  memcpy(mod, kPrefix, sizeof(kPrefix));
+  memcpy(mod + sizeof(kPrefix), kSimdProbe, sizeof(kSimdProbe));
+  g_simd = pk_jit_install(mod, (int)sizeof(mod), 0) > 0 ? 1 : -1;
+  return g_simd > 0;
+}
+
+// A modrm operand that is either an xmm register or an inlined memory access.
+struct SseMem {
+  bool ismem;   // memory operand: HP0 holds the host pointer on the fast path
+  bool open;    // a $done/$slow pair is open and must be closed
+  struct Rc pre;
+};
+
+// Open the fast path for an SSE instruction. `size` is the access width (0 =
+// no memory access at all, register form). `bail` forces the $done/$slow pair
+// even for a register form, so the body can br_if out to the handler.
+// `align16` adds the GetXmmAddress alignment requirement (it raises SIGSEGV on
+// a misaligned address - that stays the handler's job).
+static bool SseMemBegin(struct Machine *m, struct Buf *b, struct Rc *rc,
+                        u64 rde, const struct XedDecodedInst *x, u64 pc_next,
+                        int size, bool write, bool align16, bool bail,
+                        struct SseMem *sm) {
+  int base, index, scale;
+  bool hb, hi, rip;
+  sm->ismem = !IsModrmRegister(rde);
+  sm->open = false;
+  if (!sm->ismem) {
+    sm->pre = *rc;
+    if (bail) {
+      bput(b, 0x02); bput(b, 0x40);  // block $done
+      bput(b, 0x02); bput(b, 0x40);  // block $slow
+      sm->open = true;
+    }
+    return true;
+  }
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  sm->pre = *rc;
+  EmitMemBegin(b, size, write);
+  sm->open = true;
+  if (align16) {  // misaligned -> handler (which faults exactly like the interp)
+    EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+    EConst(b, 0); bput(b, I64_NE);
+    bput(b, 0x0d); bleb_u(b, 0);  // br_if $slow
+  }
+  return true;
+}
+
+static void SseMemEnd(struct Buf *b, struct SseMem *sm, const struct Rc *rc,
+                      u64 rde, const struct XedDecodedInst *x, nexgen32e_f h,
+                      u64 pc_next, u32 oplen) {
+  if (!sm->open) return;
+  EmitMemEnd(b, &sm->pre, rc, rde, x->op.disp, x->op.uimm0,
+             (u32)(uintptr_t)h, pc_next, oplen);
+}
+
+// Push the W (rm) operand. `simd` selects the 0xfd prefix; `off` is the byte
+// offset inside the operand (0 for whole-operand loads).
+static void ESseSrc(struct Buf *b, struct SseMem *sm, int rm, u32 op, int simd,
+                    u32 off) {
+  if (sm->ismem) {
+    EGet(b, HP0);
+    if (simd) ESimd(b, op); else bput(b, (u8)op);
+    bleb_u(b, 0);
+    bleb_u(b, off);
+  } else {
+    EGet(b, 0);
+    if (simd) ESimd(b, op); else bput(b, (u8)op);
+    bleb_u(b, 0);
+    bleb_u(b, OFF_XMM + (u32)rm * 16 + off);
+  }
+}
+
+// Push the address the W operand is stored through (mem: HP0; reg: m, with the
+// caller putting OFF_XMM+rm*16 in the store's offset immediate).
+static void ESseDstAddr(struct Buf *b, struct SseMem *sm) {
+  EGet(b, sm->ismem ? HP0 : 0);
+}
+static void ESseDstOff(struct Buf *b, struct SseMem *sm, u8 op, int rm,
+                       u32 off) {
+  bput(b, op);
+  bleb_u(b, 0);
+  bleb_u(b, sm->ismem ? off : OFF_XMM + (u32)rm * 16 + off);
+}
+
+// i8x16.shuffle lane vector for the punpck family (a = dst, b = src; wasm lanes
+// 0..15 pick from a, 16..31 from b).
+static void EShuffleLanes(struct Buf *b, const u8 *lanes) {
+  ESimd(b, V_SHUFFLE);
+  bputs(b, lanes, 16);
+}
+
+// Emit the ucomis/comis flag update from two raw operand bit patterns already
+// in LT0 (dst) and LT1 (src). dbl selects f64 vs f32.
+static void EmitComisFlags(struct Buf *b, struct Rc *rc, int dbl, int isucomis) {
+  u8 rein = dbl ? 0xbf : 0xbe;  // f64.reinterpret_i64 / f32.reinterpret_i32
+  u8 clt = dbl ? 0x63 : 0x5d;   // f64.lt / f32.lt
+  u8 cge = dbl ? 0x66 : 0x60;   // f64.ge / f32.ge
+  int i;
+  // IT = ordered = (x >= y) | (x < y)  (both false exactly when either is NaN)
+  for (i = 0; i < 2; ++i) {
+    EGet(b, LT0);
+    if (!dbl) bput(b, I64_WRAP);
+    bput(b, rein);
+    EGet(b, LT1);
+    if (!dbl) bput(b, I64_WRAP);
+    bput(b, rein);
+    bput(b, i ? clt : cge);
+  }
+  bput(b, I32_OR);
+  ESet(b, IT);
+  if (!isucomis) {  // comis: the unordered path sets mxcsr IE and may halt
+    EGet(b, IT);
+    bput(b, 0x45);                // i32.eqz
+    bput(b, 0x0d); bleb_u(b, 0);  // br_if $slow
+    // m->mxcsr &= ~kMxcsrIe
+    EGet(b, 0);
+    EGet(b, 0);
+    bput(b, 0x28); bleb_u(b, 2); bleb_u(b, OFF_MXCSR);
+    EConstI(b, ~(i32)kMxcsrIe);
+    bput(b, I32_AND);
+    bput(b, 0x36); bleb_u(b, 2); bleb_u(b, OFF_MXCSR);
+  }
+  // FL = (FL & ~(CF|ZF|SF|OF|parity)) | cf | zf<<6 | ord<<24
+  // ordered: zf = (x==y), cf = (x<y), PF=0 (lazy byte 1), SF=OF=0
+  // unordered: zf = cf = 1, PF=1 (lazy byte 0), SF=OF=0
+  FlagsEnsure(b, rc);
+  EGet(b, FL);
+  EConstI(b, ~(i32)(CF | ZF | SF | OF | (i32)0xff000000));
+  bput(b, I32_AND);
+  // cf
+  EGet(b, LT0); if (!dbl) bput(b, I64_WRAP); bput(b, rein);
+  EGet(b, LT1); if (!dbl) bput(b, I64_WRAP); bput(b, rein);
+  bput(b, clt);
+  EGet(b, IT); bput(b, 0x45); bput(b, I32_OR);  // | !ordered
+  bput(b, I32_OR);
+  // zf << 6
+  EGet(b, LT0); if (!dbl) bput(b, I64_WRAP); bput(b, rein);
+  EGet(b, LT1); if (!dbl) bput(b, I64_WRAP); bput(b, rein);
+  bput(b, dbl ? 0x61 : 0x5b);                   // f64.eq / f32.eq
+  EGet(b, IT); bput(b, 0x45); bput(b, I32_OR);  // | !ordered
+  EConstI(b, 6); bput(b, I32_SHL);
+  bput(b, I32_OR);
+  // lazy parity byte = ordered (GetParity(1) == false, GetParity(0) == true)
+  EGet(b, IT); EConstI(b, 24); bput(b, I32_SHL);
+  bput(b, I32_OR);
+  ESet(b, FL);
+  rc->fl_dirty = 1;
+}
+
+// Try to emit one SSE/SSE2 instruction as inline wasm SIMD. Returns false
+// (having emitted nothing) when the form is not covered.
+static bool TryEmitSse(struct Machine *m, struct Buf *b, struct Rc *rc,
+                       nexgen32e_f h, u64 rde,
+                       const struct XedDecodedInst *x, u64 pc_next, u32 oplen) {
+  static const u8 kUnpcklbw[16] = {0, 16, 1, 17, 2, 18, 3,  19,
+                                   4, 20, 5, 21, 6, 22, 7,  23};
+  static const u8 kUnpckhbw[16] = {8,  24, 9,  25, 10, 26, 11, 27,
+                                   12, 28, 13, 29, 14, 30, 15, 31};
+  static const u8 kUnpcklwd[16] = {0, 1, 16, 17, 2, 3, 18, 19,
+                                   4, 5, 20, 21, 6, 7, 22, 23};
+  static const u8 kUnpckhwd[16] = {8,  9,  24, 25, 10, 11, 26, 27,
+                                   12, 13, 28, 29, 14, 15, 30, 31};
+  static const u8 kUnpckldq[16] = {0, 1, 2, 3, 16, 17, 18, 19,
+                                   4, 5, 6, 7, 20, 21, 22, 23};
+  static const u8 kUnpckhdq[16] = {8,  9,  10, 11, 24, 25, 26, 27,
+                                   12, 13, 14, 15, 28, 29, 30, 31};
+  static const u8 kUnpcklqdq[16] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                    16, 17, 18, 19, 20, 21, 22, 23};
+  static const u8 kUnpckhqdq[16] = {8,  9,  10, 11, 12, 13, 14, 15,
+                                    24, 25, 26, 27, 28, 29, 30, 31};
+  struct SseMem sm;
+  u8 lanes[16];
+  int mop = (int)Mopcode(rde);
+  int reg = (int)RexrReg(rde);
+  int rm = (int)RexbRm(rde);
+  int rep = (int)Rep(rde);
+  int osz = Osz(rde) ? 1 : 0;
+  int i, k;
+  u32 vop = 0;
+  if (mop < 0x100 || mop > 0x1ff) return false;
+  if (Lock(rde)) return false;
+  if (m->metal) return false;
+  // a redundant rep+osz prefix pair: blink resolves it per opcode (some switch
+  // on Rep|Osz, some test Rep first, some Osz first), and no compiler emits it,
+  // so do not try to reproduce the precedence - hand it to the handler.
+  if (rep && osz) return false;
+  if (!WasmSimdOk()) return false;
+
+  switch (mop) {
+    // ── 128-bit moves ───────────────────────────────────────────────────────
+    case 0x110:    // movups/movupd/movsd/movss  xmm <- W
+    case 0x128:    // movaps/movapd              xmm <- W (16-byte aligned)
+    case 0x16f: {  // movdqa (66) / movdqu (f3)  xmm <- W
+      int size = 16, align = 0;
+      if (mop == 0x110) {
+        if (rep == 2) size = 8;                      // movsd
+        else if (rep == 3) size = 4;                 // movss
+      } else if (mop == 0x128) {
+        align = 1;
+      } else {                                       // 0x16f
+        if (osz) align = 1;                          // movdqa
+        else if (rep != 3) return false;             // no prefix = MMX
+      }
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, size, false, align, false,
+                       &sm)) {
+        return false;
+      }
+      if (size == 16) {
+        EGet(b, 0);
+        ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+        ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      } else if (sm.ismem) {  // movsd/movss from memory zero-fill the rest
+        EGet(b, 0);
+        EGet(b, HP0);
+        ESimdMem(b, size == 8 ? V_LOAD64_ZERO : V_LOAD32_ZERO, 0);
+        ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      } else {  // register source: only the low 8/4 bytes move
+        EGet(b, 0);
+        ESseSrc(b, &sm, rm, size == 8 ? 0x29 : 0x28, 0, 0);
+        EXmmSt(b, size == 8 ? 0x37 : 0x36, reg, 0);
+      }
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+    case 0x111:    // movups/movupd/movsd/movss  W <- xmm
+    case 0x129:    // movaps/movapd              W <- xmm (aligned)
+    case 0x12b:    // movntps/movntpd            M <- xmm (aligned)
+    case 0x17f:    // movdqa/movdqu              W <- xmm
+    case 0x1e7: {  // movntdq                    M <- xmm (aligned)
+      int size = 16, align = 0;
+      if (mop == 0x111) {
+        if (rep == 2) size = 8;
+        else if (rep == 3) size = 4;
+      } else if (mop == 0x129 || mop == 0x12b) {
+        align = 1;
+      } else if (mop == 0x1e7) {
+        if (!osz) return false;  // MMX
+        align = 1;
+      } else {  // 0x17f
+        if (osz) align = 1;
+        else if (rep != 3) return false;  // MMX
+      }
+      if ((mop == 0x12b || mop == 0x1e7) && IsModrmRegister(rde)) return false;
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, size, true, align, false,
+                       &sm)) {
+        return false;
+      }
+      ESseDstAddr(b, &sm);
+      if (size == 16) {
+        EXmmLoad(b, reg);
+        ESimdMem(b, V_STORE, sm.ismem ? 0 : OFF_XMM + (u32)rm * 16);
+      } else {
+        EXmmLd(b, size == 8 ? 0x29 : 0x28, reg, 0);
+        ESseDstOff(b, &sm, size == 8 ? 0x37 : 0x36, rm, 0);
+      }
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+    case 0x17e: {  // movq xmm<-W (f3) ; movd/movq r/m<-xmm (66)
+      if (rep == 3) {  // MovqVqWq: xmm[reg] = zero-extended low 8 of W
+        if (!SseMemBegin(m, b, rc, rde, x, pc_next, 8, false, 0, false, &sm)) {
+          return false;
+        }
+        if (sm.ismem) {
+          EGet(b, 0);
+          EGet(b, HP0);
+          ESimdMem(b, V_LOAD64_ZERO, 0);
+          ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+        } else {
+          EGet(b, 0);
+          ESseSrc(b, &sm, rm, 0x29, 0, 0);
+          EXmmSt(b, 0x37, reg, 0);
+          EGet(b, 0); EConst(b, 0); EXmmSt(b, 0x37, reg, 8);
+        }
+        SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+        return true;
+      }
+      if (!osz) return false;  // MMX
+      // MovqEqpVdq / MovdEdVdq: r/m64 (or r/m32) <- xmm[reg]
+      if (IsModrmRegister(rde)) {  // GPR destination: always a full 64-bit write
+        EXmmLd(b, Rexw(rde) ? 0x29 : 0x35, reg, 0);  // i64.load / load32_u
+        ESet(b, LOC_GPR + rm);
+        RcMark(rc, rm);
+        RcDirty(rc, rm);
+        return true;
+      }
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, Rexw(rde) ? 8 : 4, true, 0,
+                       false, &sm)) {
+        return false;
+      }
+      EGet(b, HP0);
+      EXmmLd(b, Rexw(rde) ? 0x29 : 0x28, reg, 0);
+      bput(b, Rexw(rde) ? 0x37 : 0x36); bleb_u(b, 0); bleb_u(b, 0);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+    case 0x16e: {  // movd/movq xmm <- r/m32/64
+      if (!osz) return false;  // MMX
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, Rexw(rde) ? 8 : 4, false, 0,
+                       false, &sm)) {
+        return false;
+      }
+      EGet(b, 0); EConst(b, 0); EXmmSt(b, 0x37, reg, 8);  // zero high qword
+      EGet(b, 0);
+      if (sm.ismem) {
+        EGet(b, HP0);
+        bput(b, Rexw(rde) ? 0x29 : 0x35); bleb_u(b, 0); bleb_u(b, 0);
+      } else {
+        RcLoad(b, rc, rm);
+        EGet(b, LOC_GPR + rm);
+        if (!Rexw(rde)) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+      }
+      EXmmSt(b, 0x37, reg, 0);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+    case 0x1d6: {  // movq W <- xmm (66 only; f2/f3 are MMX)
+      if (!osz) return false;
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, 8, true, 0, false, &sm)) {
+        return false;
+      }
+      ESseDstAddr(b, &sm);
+      EXmmLd(b, 0x29, reg, 0);
+      ESseDstOff(b, &sm, 0x37, rm, 0);
+      if (!sm.ismem) {  // register form also zeroes the destination's high half
+        EGet(b, 0); EConst(b, 0); EXmmSt(b, 0x37, rm, 8);
+      }
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── bitwise (andps/andnps/orps/xorps read 16 unaligned bytes) ───────────
+    case 0x154: vop = V_AND; goto vbin_unaligned;
+    case 0x156: vop = V_OR; goto vbin_unaligned;
+    case 0x157: vop = V_XOR; goto vbin_unaligned;
+    case 0x155:  // andnps/andnpd: dst = ~dst & src
+      vop = V_ANDNOT;
+      goto vbin_unaligned;
+
+    // ── SSE2 integer (66 prefix = xmm; no prefix = MMX -> handler) ──────────
+    case 0x1db: vop = V_AND; goto vbin_aligned;    // pand
+    case 0x1eb: vop = V_OR; goto vbin_aligned;     // por
+    case 0x1ef: vop = V_XOR; goto vbin_aligned;    // pxor
+    case 0x1df: vop = V_ANDNOT; goto vbin_aligned; // pandn: ~dst & src
+    case 0x174: vop = V_I8_EQ; goto vbin_aligned;
+    case 0x175: vop = V_I16_EQ; goto vbin_aligned;
+    case 0x176: vop = V_I32_EQ; goto vbin_aligned;
+    case 0x164: vop = V_I8_GT_S; goto vbin_aligned;
+    case 0x165: vop = V_I16_GT_S; goto vbin_aligned;
+    case 0x166: vop = V_I32_GT_S; goto vbin_aligned;
+    case 0x1f8: vop = V_I8_SUB; goto vbin_aligned;
+    case 0x1f9: vop = V_I16_SUB; goto vbin_aligned;
+    case 0x1fa: vop = V_I32_SUB; goto vbin_aligned;
+    case 0x1fb: vop = V_I64_SUB; goto vbin_aligned;
+    case 0x1fc: vop = V_I8_ADD; goto vbin_aligned;
+    case 0x1fd: vop = V_I16_ADD; goto vbin_aligned;
+    case 0x1fe: vop = V_I32_ADD; goto vbin_aligned;
+    case 0x1d4: vop = V_I64_ADD; goto vbin_aligned;
+
+    vbin_aligned:
+    vbin_unaligned: {
+      // OpSse reads its source through GetXmmAddress (16-byte aligned or
+      // SIGSEGV); the 0f54..0f57 bitwise group reads it unaligned instead.
+      int align = (mop >= 0x154 && mop <= 0x157) ? 0 : 1;
+      bool rev = (vop == V_ANDNOT);  // wasm andnot(a,b) = a & ~b
+      if (align && !osz) return false;  // integer forms without 66 are MMX
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, 16, false, align, false,
+                       &sm)) {
+        return false;
+      }
+      EGet(b, 0);
+      if (rev) {
+        ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+        EXmmLoad(b, reg);
+      } else {
+        EXmmLoad(b, reg);
+        ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+      }
+      ESimd(b, vop);
+      ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── punpck* (66 only) ───────────────────────────────────────────────────
+    case 0x160: case 0x161: case 0x162: case 0x16c:
+    case 0x168: case 0x169: case 0x16a: case 0x16d: {
+      const u8 *sh;
+      if (!osz) return false;  // MMX
+      switch (mop) {
+        case 0x160: sh = kUnpcklbw; break;
+        case 0x161: sh = kUnpcklwd; break;
+        case 0x162: sh = kUnpckldq; break;
+        case 0x16c: sh = kUnpcklqdq; break;
+        case 0x168: sh = kUnpckhbw; break;
+        case 0x169: sh = kUnpckhwd; break;
+        case 0x16a: sh = kUnpckhdq; break;
+        default:    sh = kUnpckhqdq; break;
+      }
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, 16, false, 1, false, &sm)) {
+        return false;
+      }
+      EGet(b, 0);
+      EXmmLoad(b, reg);
+      ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+      EShuffleLanes(b, sh);
+      ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── pshufd (66) ─────────────────────────────────────────────────────────
+    case 0x170: {
+      if (!osz || rep) return false;  // only pshufd; lw/hw/pshufw stay behind
+      k = (int)x->op.uimm0;
+      for (i = 0; i < 4; ++i) {
+        int src = (k >> (i * 2)) & 3;
+        lanes[i * 4 + 0] = (u8)(src * 4 + 0);
+        lanes[i * 4 + 1] = (u8)(src * 4 + 1);
+        lanes[i * 4 + 2] = (u8)(src * 4 + 2);
+        lanes[i * 4 + 3] = (u8)(src * 4 + 3);
+      }
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, 16, false, 0, false, &sm)) {
+        return false;  // pshufd reads unaligned (GetModrmRegisterXmmPointerRead16)
+      }
+      EGet(b, 0);
+      ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+      ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+      EShuffleLanes(b, lanes);
+      ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── shift by imm8 (66 only; the target is the rm REGISTER) ──────────────
+    case 0x171: case 0x172: case 0x173: {
+      int sub = (int)ModrmReg(rde);
+      int cnt = (int)(x->op.uimm0 & 0xff);
+      int width = mop == 0x171 ? 16 : mop == 0x172 ? 32 : 64;
+      int arith = (sub == 4);
+      if (!osz || !IsModrmRegister(rde)) return false;
+      if (mop == 0x173 && (sub == 3 || sub == 7)) {  // psrldq / pslldq
+        int n = cnt > 16 ? 16 : cnt;
+        for (i = 0; i < 16; ++i) {
+          int s = sub == 7 ? i - n : i + n;  // pslldq shifts left by n BYTES
+          lanes[i] = (u8)(s >= 0 && s < 16 ? s : 16);  // lane 16 = a zero byte
+        }
+        EGet(b, 0);
+        EXmmLoad(b, rm);
+        ESimd(b, V_CONST);
+        for (i = 0; i < 16; ++i) bput(b, 0);
+        EShuffleLanes(b, lanes);
+        ESimdMem(b, V_STORE, OFF_XMM + (u32)rm * 16);
+        return true;
+      }
+      if (sub != 2 && sub != 4 && sub != 6) return false;
+      if (arith) {  // blink clamps the arithmetic count to width-1
+        if (cnt > width - 1) cnt = width - 1;
+        if (width == 64) return false;  // no i64x2.shr_s before relaxed-simd
+        vop = width == 16 ? V_I16_SHR_S : V_I32_SHR_S;
+      } else if (cnt >= width) {  // logical shift by >= width yields all zeroes
+        EGet(b, 0);
+        ESimd(b, V_CONST);
+        for (i = 0; i < 16; ++i) bput(b, 0);
+        ESimdMem(b, V_STORE, OFF_XMM + (u32)rm * 16);
+        return true;
+      } else if (sub == 2) {
+        vop = width == 16 ? V_I16_SHR_U : width == 32 ? V_I32_SHR_U
+                                                      : V_I64_SHR_U;
+      } else {
+        vop = width == 16 ? V_I16_SHL : width == 32 ? V_I32_SHL : V_I64_SHL;
+      }
+      EGet(b, 0);
+      EXmmLoad(b, rm);
+      EConstI(b, cnt);
+      ESimd(b, vop);
+      ESimdMem(b, V_STORE, OFF_XMM + (u32)rm * 16);
+      return true;
+    }
+
+    // ── pmovmskb (66 only; the rm operand is always a register) ─────────────
+    case 0x1d7: {
+      if (!osz || !IsModrmRegister(rde)) return false;
+      EXmmLoad(b, rm);
+      ESimd(b, V_I8_BITMASK);
+      bput(b, 0xad);  // i64.extend_i32_u (Put64 = full 64-bit register write)
+      ESet(b, LOC_GPR + reg);
+      RcMark(rc, reg);
+      RcDirty(rc, reg);
+      return true;
+    }
+
+    // ── float arithmetic (add/sub/mul/div; min/max/sqrt stay on the leaf) ───
+    case 0x158: case 0x159: case 0x15c: case 0x15e: {
+      int kind = mop == 0x158 ? 0 : mop == 0x159 ? 2 : mop == 0x15c ? 1 : 3;
+      static const u8 kS64[4] = {0xa0, 0xa1, 0xa2, 0xa3};  // f64 add sub mul div
+      static const u8 kS32[4] = {0x92, 0x93, 0x94, 0x95};  // f32 add sub mul div
+      static const u32 kV64[4] = {V_F64_ADD, V_F64_SUB, V_F64_MUL, V_F64_DIV};
+      static const u32 kV32[4] = {V_F32_ADD, V_F32_SUB, V_F32_MUL, V_F32_DIV};
+      int scalar = (rep == 2 || rep == 3);
+      int dbl = (rep == 2 || (!rep && osz));
+      int size = scalar ? (dbl ? 8 : 4) : 16;
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, size, false, 0, false, &sm)) {
+        return false;  // all four read the source unaligned
+      }
+      EGet(b, 0);
+      if (scalar) {
+        EXmmLd(b, dbl ? 0x2b : 0x2a, reg, 0);   // f64.load / f32.load
+        ESseSrc(b, &sm, rm, dbl ? 0x2b : 0x2a, 0, 0);
+        bput(b, dbl ? kS64[kind] : kS32[kind]);
+        EXmmSt(b, dbl ? 0x39 : 0x38, reg, 0);   // f64.store / f32.store
+      } else {
+        EXmmLoad(b, reg);
+        ESseSrc(b, &sm, rm, V_LOAD, 1, 0);
+        ESimd(b, dbl ? kV64[kind] : kV32[kind]);
+        ESimdMem(b, V_STORE, OFF_XMM + (u32)reg * 16);
+      }
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── ucomis/comis ────────────────────────────────────────────────────────
+    case 0x12e: case 0x12f: {
+      int isucomis = (mop == 0x12e);
+      int dbl = osz;
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, dbl ? 8 : 4, false, 0,
+                       !isucomis, &sm)) {
+        return false;
+      }
+      EXmmLd(b, dbl ? 0x29 : 0x35, reg, 0);  // i64.load / i64.load32_u
+      ESet(b, LT0);
+      ESseSrc(b, &sm, rm, dbl ? 0x29 : 0x35, 0, 0);
+      ESet(b, LT1);
+      EmitComisFlags(b, rc, dbl, isucomis);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── cvtsi2sd / cvtsi2ss ─────────────────────────────────────────────────
+    case 0x12a: {
+      int dbl = (rep == 2);
+      if (rep != 2 && rep != 3) return false;  // 0/1 are MMX packed converts
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, Rexw(rde) ? 8 : 4, false, 0,
+                       false, &sm)) {
+        return false;
+      }
+      EGet(b, 0);
+      if (sm.ismem) {
+        EGet(b, HP0);
+        // i64.load / i32.load: the leaf sign-extends the 32-bit form
+        bput(b, Rexw(rde) ? 0x29 : 0x28); bleb_u(b, 0); bleb_u(b, 0);
+      } else {
+        RcLoad(b, rc, rm);
+        EGet(b, LOC_GPR + rm);
+        if (!Rexw(rde)) bput(b, I64_WRAP);
+      }
+      if (dbl) {
+        bput(b, Rexw(rde) ? 0xb9 : 0xb7);  // f64.convert_i64_s / _i32_s
+        EXmmSt(b, 0x39, reg, 0);       // f64.store (upper half preserved)
+      } else {
+        bput(b, Rexw(rde) ? 0xb4 : 0xb2);  // f32.convert_i64_s / _i32_s
+        EXmmSt(b, 0x38, reg, 0);       // f32.store
+      }
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    // ── cvttsd2si / cvttss2si ───────────────────────────────────────────────
+    case 0x12c: {
+      int dbl = (rep == 2);
+      // blink's leaf is a plain C `(i64)double` cast, which is undefined (and
+      // engine-dependent) outside the i64 range. Inline only the in-range case
+      // and hand everything else - NaN included - to the handler.
+      static const u8 kMin64d[8] = {0, 0, 0, 0, 0, 0, 0xe0, 0xc3};  // -2^63
+      static const u8 kMax64d[8] = {0, 0, 0, 0, 0, 0, 0xe0, 0x43};  // +2^63
+      static const u8 kMin64f[4] = {0, 0, 0, 0xdf};                 // -2^63
+      static const u8 kMax64f[4] = {0, 0, 0, 0x5f};                 // +2^63
+      if (rep != 2 && rep != 3) return false;  // MMX forms
+      if (!SseMemBegin(m, b, rc, rde, x, pc_next, dbl ? 8 : 4, false, 0, true,
+                       &sm)) {
+        return false;
+      }
+      ESseSrc(b, &sm, rm, dbl ? 0x29 : 0x35, 0, 0);
+      ESet(b, LT0);
+      // if (!(x >= -2^63 && x < 2^63)) goto slow  (NaN fails both)
+      for (i = 0; i < 2; ++i) {
+        EGet(b, LT0);
+        if (!dbl) bput(b, I64_WRAP);
+        bput(b, dbl ? 0xbf : 0xbe);  // reinterpret
+        if (dbl) { bput(b, 0x44); bputs(b, i ? kMax64d : kMin64d, 8); }
+        else { bput(b, 0x43); bputs(b, i ? kMax64f : kMin64f, 4); }
+        bput(b, i ? (dbl ? 0x63 : 0x5d)   // f.lt  (x < 2^63)
+                  : (dbl ? 0x66 : 0x60)); // f.ge  (x >= -2^63)
+        bput(b, 0x45);                    // i32.eqz
+        bput(b, 0x0d); bleb_u(b, 0);      // br_if $slow
+      }
+      EGet(b, LT0);
+      if (!dbl) bput(b, I64_WRAP);
+      bput(b, dbl ? 0xbf : 0xbe);
+      bput(b, dbl ? 0xb0 : 0xae);  // i64.trunc_f64_s / i64.trunc_f32_s
+      if (!Rexw(rde)) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
+      ESet(b, LOC_GPR + reg);
+      RcMark(rc, reg);
+      RcDirty(rc, reg);
+      SseMemEnd(b, &sm, rc, rde, x, h, pc_next, oplen);
+      return true;
+    }
+
+    default:
+      return false;
+  }
+}
+
 // Decide if this insn is an inlinable register-direct 32/64-bit mov.
 static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
                       bool *imm, u64 *immv, int *log2) {
@@ -1857,6 +2580,9 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
   if (TryEmitMemWrite(m, bb, rc, h, rde, xedd, pc, oplen)) {
     return true;
   }
+  if (TryEmitSse(m, bb, rc, h, rde, xedd, pc, oplen)) {
+    return true;  // SSE/SSE2 as wasm SIMD (fast path leaves m->ip stale)
+  }
 #ifdef PKJIT_FBPROF
   { static int fbcnt[0x400], fbtot;
     fbcnt[Mopcode(rde) & 0x3ff]++;
@@ -2361,7 +3087,13 @@ static inline u32 HashLocal(u64 ip) {
 static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
                                     int first_compile) {
   int idx = pk_jit_install(s->bytes, (int)s->len, first_compile);
-  if (idx <= 0) return 0;
+  if (idx <= 0) {
+    // The engine rejected the module (bad emission, or no SIMD support). Park
+    // the entry: without this every later lookup of this ip recompiles the
+    // module from scratch, which is far slower than just interpreting.
+    atomic_store_explicit(&s->state, kEmitting, memory_order_release);
+    return 0;
+  }
   struct LocalHook *lh = &t_local[HashLocal(ip)];
   lh->idx = (u32)idx;
   lh->gen = gen;
