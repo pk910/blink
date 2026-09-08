@@ -2206,8 +2206,8 @@ static void EmitCmov(struct Buf *b, struct Rc *rc, int cc, int log2, int dr,
 // main decoders don't cover at any width (group3 test/not/neg, group5 inc/dec
 // - the dispatch table entry is Op0ff, never OpIncEvqp directly - setcc,
 // movzx/movsx). Emits nothing when returning false -> handler fallback.
-static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
-                   u64 uimm0) {
+static bool EmitBW(struct Machine *m, struct Buf *b, struct Rc *rc,
+                   nexgen32e_f h, u64 rde, u64 uimm0, u64 pc) {
   if (Lock(rde)) return false;
   int lg = RegLog2(rde);
   int dr = 0, dsh = 0, sr = 0, ssh = 0, t = 0;  // defined (init invariant)
@@ -2236,6 +2236,25 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
       dr = rgr; dsh = rgs; sr = rmr; ssh = rms;
     } else {
       dr = rmr; dsh = rms; sr = rgr; ssh = rgs;
+    }
+    // add/or/and/sub/xor/cmp/test on LOW sub-registers go through the same
+    // inline flag math the 32/64-bit forms use, instead of a call_indirect into
+    // blink's kAlu leaf. EmitAluInline is already width-generic and already
+    // serves `cmp/test al,imm` through AluDecode, so this only needs both
+    // operands to sit at bit 0. It matters because a byte compare is the inner
+    // loop of every string routine: strlen was paying an indirect call per byte.
+    // adc/sbb (t 2/3) read CF and inc/dec/neg have their own AF/CF rules, so
+    // they stay on the leaf, as do the high-byte forms (ah/ch/dh/bh live at
+    // bits 8..15, which the inline path's width mask would read as garbage).
+    if (t != 2 && t != 3 && !dsh && (imm || !ssh)) {
+      int need = GetNeededFlags(m, (i64)pc, CF | ZF | SF | OF | AF | PF);
+      EmitAluInline(b, rc, t, lg, dr, sr, imm, uimm0, false, false, need);
+      if (wb) {  // EmitAluInline leaves the width-masked result in LT2
+        EGet(b, LT2);
+        ESet(b, LT3);
+        EWriteSub(b, rc, dr, dsh, lg);
+      }
+      return true;
     }
     EmitAluSub(b, rc, t, lg, dr, dsh, sr, ssh, imm, uimm0, wb);
     return true;
@@ -2325,7 +2344,10 @@ static bool EmitBW(struct Buf *b, struct Rc *rc, nexgen32e_f h, u64 rde,
     if (sub == 2) EmitNotSub(b, rc, lg, dr, dsh);
     else if (sub == 3)
       EmitAluSub(b, rc, ALU_NEG, lg, dr, dsh, 0, 0, true, 0, true);
-    else  // 0/1: test rm, imm - flags only
+    else if (!dsh)  // 0/1: test rm, imm - flags only, inline (see above)
+      EmitAluInline(b, rc, ALU_AND, lg, dr, 0, true, uimm0, false, false,
+                    GetNeededFlags(m, (i64)pc, CF | ZF | SF | OF | AF | PF));
+    else
       EmitAluSub(b, rc, ALU_AND, lg, dr, dsh, 0, 0, true, uimm0, false);
     return true;
   }
@@ -2672,7 +2694,7 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
              GetNeededFlags(m, pc, CF | OF));
     return true;
   }
-  if (EmitBW(bb, rc, h, rde, xedd->op.uimm0)) {
+  if (EmitBW(m, bb, rc, h, rde, xedd->op.uimm0, pc)) {
     // 8/16-bit reg ALU/mov, movzx/movsx, setcc, group3 test/not/neg,
     // group5 inc/dec (any width)
     return true;
