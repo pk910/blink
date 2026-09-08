@@ -294,6 +294,9 @@ TryAgain:
   }
   m->tlb[tlbkey].page = page;
   m->tlb[tlbkey].entry = entry;
+  // pk910: the only TLB fill site in the tree; the only invalidation site is
+  // ResetTlb's memset, which zeroes this along with entry. See MachineTlb.
+  m->tlb[tlbkey].host = (entry & PAGE_HOST) ? FindHostPage(entry) : 0;
   return entry;
 MapError:
   m->segvcode = SEGV_MAPERR_LINUX;

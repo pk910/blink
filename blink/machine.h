@@ -337,9 +337,23 @@ struct JitPath {
   struct JitBlock *jb;
 };
 
+// pk910: `host` is QEMU's addend. It is FindHostPage(entry), cached so the wasm
+// JIT's inlined fast path does not have to chase g_hostpages.p and then p[idx]
+// on every guest access - two DEPENDENT loads from linear memory that the
+// entry already determines. Soundness is free: g_hostpages slots are append
+// only (TrackHostPage writes p[n++] and nothing ever rewrites a slot), so
+// FindHostPage(entry) is a pure, permanently stable function of entry, and
+// wherever the cached entry is valid the cached pointer is too. Null for the
+// non-PAGE_HOST (s->real / metal) case, which the JIT fast path rejects anyway.
+//
+// Padded to a hard 32 bytes on every host pointer width so the JIT can index
+// the array with a shift by 5 and so one 64-byte cache line always holds two
+// whole entries instead of an entry straddling a line boundary.
 struct MachineTlb {
   i64 page;
   u64 entry;
+  u8 *host;
+  u8 pad_[32 - 16 - sizeof(void *)];
 };
 
 // pk910: softmmu TLB size. Direct-mapped, indexed (addr >> 12) & (N-1), so a

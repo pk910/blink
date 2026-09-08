@@ -274,6 +274,86 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I32_ADD 0x6a
 #define I32_GTU 0x4b
 
+// ── profiling counters (PKJIT_MEMPROF builds only) ──────────────────────────
+// The emitted wasm bumps u64s that live in blink's own linear memory, so the
+// address is a link-time constant the emitter can bake in and no call is
+// needed. Ratios only: the bumps themselves cost time, so never read a
+// benchmark's ms from a MEMPROF build. Dumped from WasmJitLookup, which the
+// dispatch loop calls once per region entry.
+#ifdef PKJIT_MEMPROF
+#define MP_RD_TOTAL 0
+#define MP_RD_PGH   1  // same-page cache hit
+#define MP_RD_TLB   2  // cache miss, TLB hit
+#define MP_RD_SLOW  3  // handler fallback (any reason)
+#define MP_RD_INVAL 4  // ... because m->invalidated was set
+#define MP_RD_CROSS 5  // ... because the access crosses a page boundary
+#define MP_RD_UNAL  6  // (not slow) access not naturally aligned
+#define MP_WR_TOTAL 8
+#define MP_WR_PGH   9
+#define MP_WR_TLB   10
+#define MP_WR_SLOW  11
+#define MP_WR_INVAL 12
+#define MP_WR_CROSS 13
+#define MP_WR_UNAL  14
+u64 g_memprof[16];
+u64 g_aluprof[64];   // indexed by the compacted GetNeededFlags mask
+u64 g_alutot;
+u64 g_fbdyn[1024];   // dynamic handler-fallback count by Mopcode
+u64 g_fbtot;
+static u64 g_lk_hit, g_lk_miss;  // WasmJitLookup: ran JIT code / had to interpret
+static bool g_prof_write;  // arm of the access being emitted, so EmitMemEnd's
+                           // $slow bump lands in the same bin as EmitMemBegin's
+static void EProfBump(struct Buf *b, u64 *p) {
+  EConstI(b, (i32)(uintptr_t)p);
+  EConstI(b, (i32)(uintptr_t)p);
+  bput(b, 0x29); bleb_u(b, 3); bleb_u(b, 0);  // i64.load
+  EConst(b, 1); EBin(b, I64_ADD);
+  bput(b, 0x37); bleb_u(b, 3); bleb_u(b, 0);  // i64.store
+}
+#define PROF(b, i) EProfBump(b, &g_memprof[(i) + (g_prof_write ? 8 : 0)])
+void WasmJitProfDump(void) {
+  int i;
+  u64 rt = g_memprof[MP_RD_TOTAL], wt = g_memprof[MP_WR_TOTAL];
+  fprintf(stderr,
+          "MEMPROF rd=%llu pgh=%llu tlb=%llu slow=%llu(inval=%llu cross=%llu) "
+          "unal=%llu wr=%llu pgh=%llu tlb=%llu slow=%llu(inval=%llu cross=%llu) "
+          "unal=%llu\n",
+          (unsigned long long)rt, (unsigned long long)g_memprof[MP_RD_PGH],
+          (unsigned long long)g_memprof[MP_RD_TLB],
+          (unsigned long long)g_memprof[MP_RD_SLOW],
+          (unsigned long long)g_memprof[MP_RD_INVAL],
+          (unsigned long long)g_memprof[MP_RD_CROSS],
+          (unsigned long long)g_memprof[MP_RD_UNAL], (unsigned long long)wt,
+          (unsigned long long)g_memprof[MP_WR_PGH],
+          (unsigned long long)g_memprof[MP_WR_TLB],
+          (unsigned long long)g_memprof[MP_WR_SLOW],
+          (unsigned long long)g_memprof[MP_WR_INVAL],
+          (unsigned long long)g_memprof[MP_WR_CROSS],
+          (unsigned long long)g_memprof[MP_WR_UNAL]);
+  fprintf(stderr, "ALUPROF total=%llu:", (unsigned long long)g_alutot);
+  for (i = 0; i < 64; ++i) {
+    if (g_aluprof[i]) {
+      fprintf(stderr, " %d%s%s%s%s%s%s=%llu", i, (i & 1) ? "C" : "",
+              (i & 2) ? "Z" : "", (i & 4) ? "S" : "", (i & 8) ? "O" : "",
+              (i & 16) ? "A" : "", (i & 32) ? "P" : "",
+              (unsigned long long)g_aluprof[i]);
+    }
+  }
+  fprintf(stderr, "\n");
+  fprintf(stderr, "FBDYN total=%llu lk_hit=%llu lk_miss=%llu:",
+          (unsigned long long)g_fbtot, (unsigned long long)g_lk_hit,
+          (unsigned long long)g_lk_miss);
+  for (i = 0; i < 1024; ++i) {
+    if (g_fbdyn[i] > g_fbtot / 200) {
+      fprintf(stderr, " %03x=%llu", i, (unsigned long long)g_fbdyn[i]);
+    }
+  }
+  fprintf(stderr, "\n");
+}
+#else
+#define PROF(b, i) ((void)0)
+#endif
+
 // ── register cache ──────────────────────────────────────────────────────────
 struct Rc {
   u8 loaded[16];
@@ -652,6 +732,13 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
                           int src, bool imm, u64 immv, bool wb, bool keepcf,
                           int needed) {
   static const i64 kWMask[4] = {0xff, 0xffff, 0xffffffffLL, -1};
+#ifdef PKJIT_MEMPROF
+  { int k = ((needed & CF) ? 1 : 0) | ((needed & ZF) ? 2 : 0) |
+            ((needed & SF) ? 4 : 0) | ((needed & OF) ? 8 : 0) |
+            ((needed & AF) ? 16 : 0) | ((needed & PF) ? 32 : 0);
+    EProfBump(b, &g_alutot);
+    EProfBump(b, &g_aluprof[k]); }
+#endif
   bool w32 = (log2 != 3);  // any narrow width: operands masked (flag math generic)
   i64 mask = kWMask[log2 & 3];
   int signsh = (8 << (log2 & 3)) - 1;
@@ -956,20 +1043,47 @@ static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
 //     write-validated page is read-valid by construction, so the write path
 //     fills both.
 static void EmitMemBegin(struct Buf *b, int size, bool write) {
+#ifdef PKJIT_MEMPROF
+  g_prof_write = write;
+#endif
   bput(b, 0x02); bput(b, 0x40);   // block $done
   bput(b, 0x02); bput(b, 0x40);   // block $slow
+  PROF(b, MP_RD_TOTAL);
   // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
   EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_INVAL);  // i32.load8_u
+#ifdef PKJIT_MEMPROF
+  bput(b, 0x04); bput(b, 0x40);   // if
+  PROF(b, MP_RD_INVAL);
+  bput(b, 0x0c); bleb_u(b, 1);    // br $slow (one deeper inside the if)
+  bput(b, 0x0b);                  // end
+#else
   bput(b, 0x0d); bleb_u(b, 0);    // br_if $slow
+#endif
   // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those).
   // Hoisted above the cache test: it is needed on both arms.
   EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
   if (size > 1) {
     bput(b, 0x22); bleb_u(b, HP1);  // local.tee
-    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
+    EConstI(b, 4096 - size); bput(b, I32_GTU);
+#ifdef PKJIT_MEMPROF
+    bput(b, 0x04); bput(b, 0x40);
+    PROF(b, MP_RD_CROSS);
+    bput(b, 0x0c); bleb_u(b, 1);
+    bput(b, 0x0b);
+#else
+    bput(b, 0x0d); bleb_u(b, 0);
+#endif
   } else {
     ESet(b, HP1);
   }
+#ifdef PKJIT_MEMPROF
+  if (size > 1) {  // how much would a TinyEMU-style aligned-only tag cost us?
+    EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, size - 1); bput(b, I32_AND);
+    bput(b, 0x04); bput(b, 0x40);
+    PROF(b, MP_RD_UNAL);
+    bput(b, 0x0b);
+  }
+#endif
   // LT2 = addr & -4096 ; take the cached host page if it is the same page
   EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
   bput(b, 0x22); bleb_u(b, LT2);  // local.tee
@@ -979,16 +1093,17 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
     EGet(b, PGV); EConst(b, -4096); EBin(b, I64_AND); bput(b, I64_EQ);
   }
   bput(b, 0x04); bput(b, 0x40);   // if (cache hit)
+  PROF(b, MP_RD_PGH);
   EGet(b, PGH); EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
   bput(b, 0x05);                  // else: the full softmmu probe
   // HP0 = m + ((addr>>12) & (TLB_ENTRIES-1))*sizeof(MachineTlb)
   // (tlb slot; OFF_TLB applied at each load). Same index FindPageTableEntry
   // computes, so a JIT hit and an interpreter hit are the same entry.
-  _Static_assert(sizeof(struct MachineTlb) == 16, "tlb slot shift is 4");
+  _Static_assert(sizeof(struct MachineTlb) == 32, "tlb slot shift is 5");
   _Static_assert((TLB_ENTRIES & (TLB_ENTRIES - 1)) == 0, "tlb size pow2");
   EGet(b, LT2); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
   EConstI(b, TLB_ENTRIES - 1); bput(b, I32_AND);
-  EConstI(b, 4); bput(b, I32_SHL);
+  EConstI(b, 5); bput(b, I32_SHL);
   EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
   // tlb.page != (addr & -4096) -> slow  (br 1: we are one `if` deeper here)
   EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
@@ -1010,13 +1125,11 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
     EConst(b, (i64)want);
   }
   bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
-  // ch = g_hostpages.p[(entry & PAGE_TA) >> 12] (host base of the page)
-  EConstI(b, (i32)(uintptr_t)&g_hostpages.p);
-  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p
-  EGet(b, LT2); EConst(b, (i64)PAGE_TA); EBin(b, I64_AND);
-  EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
-  EConstI(b, 2); bput(b, I32_SHL); bput(b, I32_ADD);
-  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p[idx] (page base)
+  // ch = tlb.host, the addend FindPageTableEntry cached when it filled this
+  // entry. Was `g_hostpages.p` then `p[(entry & PAGE_TA) >> 12]`: two dependent
+  // loads and 13 ops on the arm that takes 79% of reads and 95% of writes.
+  _Static_assert(offsetof(struct MachineTlb, host) == 16, "tlb host at +16");
+  EGet(b, HP0); bput(b, 0x28); bleb_u(b, 2); bleb_u(b, OFF_TLB + 16);
   bput(b, 0x22); bleb_u(b, PGH);               // local.tee PGH
   EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
   // arm the cache LAST, so nothing above can leave it armed after a br $slow
@@ -1024,6 +1137,7 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
   EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
   if (write) { EConst(b, 1); EBin(b, I64_OR); }  // mark it write-validated
   ESet(b, PGV);
+  PROF(b, MP_RD_TLB);
   bput(b, 0x0b);                  // end if
 }
 
@@ -1044,6 +1158,7 @@ static void EmitMemEnd(struct Buf *b, const struct Rc *pre, const struct Rc *rc,
   int r;
   bput(b, 0x0c); bleb_u(b, 1);    // fast path done: br $done
   bput(b, 0x0b);                  // end $slow
+  PROF(b, MP_RD_SLOW);
   for (r = 0; r < 16; ++r) {      // spill pre-instruction dirty regs
     if (!pre->dirty[r]) continue;
     EGet(b, 0); EGet(b, LOC_GPR + r); EStore(b, OFF_WEG + (u32)r * 8);
@@ -1090,6 +1205,18 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   } else if (h == OpMovGvqpEvqp && lg == 1) {  // mov r16, [mem] (keeps upper)
     kind = 4; dst = (int)RexrReg(rde); mergesh = 0;
     mergemask = ~(i64)0xffff; size = 2; loadop = 0x33;
+  } else if (h == OpAlui && (int)ModrmReg(rde) == ALU_CMP && lg < 2 &&
+             !Lock(rde)) {
+    // cmp byte/word [mem], imm (opcode 0x80, and 0x81/0x83 under 66:). Narrow
+    // widths are safe HERE and only here because cmp writes no register, so the
+    // "8/16-bit writeback would clobber the upper bits" bail below does not
+    // apply, and EmitAluInline's width-masked formulas already cover log2 0/1
+    // (the register-direct byte ALU has used them since the 8/16-bit flags
+    // work). This one form is 95% of the `str` benchmark's runtime: gcc's
+    // strlen idiom is `cmpb $0,(%rdx)` and MEMPROF counted 50.0M of the
+    // benchmark's 52.5M handler fallbacks on it, and 23.1M of busybox's 61.9M.
+    kind = 3; t = ALU_CMP;
+    size = 1 << lg; loadop = lg == 0 ? 0x31 : 0x33;  // i64.load8_u / load16_u
   } else if (lg != 2 && lg != 3) {
     return false;  // remaining 16-bit-dst forms keep upper bits: fallback
   } else if (h == OpMovGvqpEvqp) {       // mov reg, [mem]
@@ -2871,6 +2998,10 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
       fprintf(stderr, "\n");
     } }
 #endif
+#ifdef PKJIT_MEMPROF
+  EProfBump(bb, &g_fbtot);
+  EProfBump(bb, &g_fbdyn[Mopcode(rde) & 0x3ff]);
+#endif
   RcSpill(bb, rc);                    // handler reads regs from memory
   EGet(bb, 0); EConst(bb, (i64)pc); EStore(bb, OFF_IP);  // m->ip = pc
   // m->oplen = this insn's length, so RestoreIp (m->ip -= m->oplen) rewinds
@@ -3506,6 +3637,23 @@ static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
   lh->virt = ip;
   return (nexgen32e_f)(uintptr_t)idx;
 }
+
+#ifdef PKJIT_MEMPROF
+// The dispatch loop runs JIT code while this returns non-null and interprets
+// exactly one instruction when it returns null, so lk_miss IS the interpreted
+// instruction count and lk_hit the region-entry count.
+nexgen32e_f WasmJitLookupInner(struct Machine *, u64);
+nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
+  static u32 c;
+  nexgen32e_f f;
+  if (c == 0) atexit(WasmJitProfDump);
+  if (++c % 200 == 0) WasmJitProfDump();
+  f = WasmJitLookupInner(m, ip);
+  if (f) ++g_lk_hit; else ++g_lk_miss;
+  return f;
+}
+#define WasmJitLookup WasmJitLookupInner
+#endif
 
 nexgen32e_f WasmJitLookup(struct Machine *m, u64 ip) {
   if (!t_local) {
