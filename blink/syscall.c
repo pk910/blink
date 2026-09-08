@@ -220,6 +220,10 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
 extern int js_uname(char *buf);                  // pk910: six NUL-terminated 65-byte fields from the kernel's identity
 extern int js_klogctl(int type, char *buf, int len);  // pk910: syslog(2) over the kernel's ring buffer
+extern int js_socketpair(int family, int type, int protocol, int *fds);  // pk910: the kernel's, see SysSocketpair
+extern int js_epoll_create(int flags);                                   // pk910: epoll(7) in the kernel
+extern int js_epoll_ctl(int epfd, int op, int fd, unsigned events, unsigned lo, unsigned hi);
+extern int js_epoll_wait(int epfd, void *out, int maxevents, int timeout);
 extern int js_getxid(int which);                 // pk910: 0 uid 1 euid 2 gid 3 egid, from the kernel's credentials
 extern int js_getgroups(int size, int *out);   // pk910: the kernel's supplementary groups (size 0 = count)
 extern int js_setgroups(int size, const int *in);
@@ -814,7 +818,13 @@ static void *OnSpawnFork(void *arg) {
 
 // fork(): COW-clone the address space in place, spawn the child on its own
 // pthread, hand the parent the child's pid. Real fork semantics, zero copy.
-static int PkForkThread(struct Machine *m) {
+// `child_sp` is clone()'s stack argument, and it matters for a CLONE_VM child.
+// musl's __clone pushes the child function's argument onto THAT stack and the
+// child, once the syscall returns 0, pops it and calls the function - so a
+// child that resumes on the parent's rsp pops whatever the parent had. That is
+// posix_spawn, which is how Wine starts wineserver: the child crashed reading
+// its args struct through a garbage pointer.
+static int PkForkThread(struct Machine *m, u64 child_sp) {
   int pid, err;
   pthread_t thread;
   pthread_attr_t attr;
@@ -846,6 +856,7 @@ static int PkForkThread(struct Machine *m) {
   m2->flags = m->flags;
   m2->mxcsr = m->mxcsr;
   Write64(m2->ax, 0);           // the child returns 0 from fork
+  if (child_sp) Write64(m2->sp, child_sp);  // CLONE_VM: the child's own stack
   m2->spawn_sigmask = oldss;
   if ((pid = js_forkchild()) < 0) {
     FreeMachine(m2);            // frees the child System too (last machine)
@@ -886,7 +897,7 @@ static int SysVfork(struct Machine *m) {
   // safe when multiple processes vfork concurrently in one shared runtime (they
   // race in ForkRestoreParent -> double free). A vfork child only exec/_exits,
   // so a private COW copy is indistinguishable to correct programs.
-  return PkForkThread(m);
+  return PkForkThread(m, 0);
 #elif defined(PK_FORK)
   struct ForkFrame *f;
   struct System *child;
@@ -926,7 +937,7 @@ static int SysVfork(struct Machine *m) {
 // worker; the parent gets the pid and goes on. Real fork semantics.
 static int SysFork(struct Machine *m) {
 #ifdef __EMSCRIPTEN__
-  return PkForkThread(m);
+  return PkForkThread(m, 0);
 #else
   return Fork(m, 0, 0, 0);
 #endif
@@ -1046,7 +1057,9 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
   // clone(); they get the same copy-on-write fork as SysFork/SysVfork. The
   // ForkFrame path below used to catch the CLONE_VFORK ones and then exec'd
   // the child as a separate kernel process, losing argv[0] on the way.
-  if (IsForkOrVfork(flags)) return PkForkThread(m);
+  // only a CLONE_VM child gets a stack of its own; a plain fork keeps the
+  // parent's, which is what its copy of the address space has at that address
+  if (IsForkOrVfork(flags)) return PkForkThread(m, (flags & CLONE_VM_LINUX) ? stack : 0);
 #endif
   if (IsForkOrVfork(flags)) {
 #if defined(PK_FORK)
@@ -2040,7 +2053,17 @@ static int SysSocketpair(struct Machine *m, i32 family, i32 type, i32 protocol,
   if (!IsValidMemory(m, pipefds_addr, sizeof(fds_linux), PROT_WRITE)) return -1;
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
   if (flags) LOCK(&m->system->exec_lock);
-  if ((rc = VfsSocketpair(family, type, protocol, fds)) != -1) {
+#ifdef __EMSCRIPTEN__
+  // pk910: emscripten's own libc answers socketpair() with ENOSYS without ever
+  // calling an import, so the js-library entry for it is never referenced and
+  // dead-strips - the kernel has had socketpair since the net stack landed, it
+  // was just unreachable. wineserver's sock_init() is the first thing that
+  // needs it, and refuses to start without it.
+  rc = js_socketpair(family, type, protocol, fds);
+#else
+  rc = VfsSocketpair(family, type, protocol, fds);
+#endif
+  if (rc != -1) {
     if (fds[0] >= lim || fds[1] >= lim) {
       VfsClose(fds[0]);
       VfsClose(fds[1]);
@@ -6394,6 +6417,80 @@ static int SysEpollWait(struct Machine *m, i32 epfd, i64 eventsaddr,
 
 #endif /* HAVE_EPOLL_PWAIT1 */
 
+#ifdef __EMSCRIPTEN__
+// pk910: epoll(7). blink's own implementation (HAVE_EPOLL_PWAIT1 above) calls
+// the host's epoll, and wasm has none, so these were simply missing: wineserver
+// builds its main loop on epoll and cannot start without it. The interest list
+// lives in the kernel, where Linux keeps it, and readiness comes from the same
+// poll path every other wait uses.
+static i32 SysEpollCreate1Js(struct Machine *m, i32 flags) {
+  int rc = js_epoll_create(flags);
+  if (rc < 0) return enosys();
+  return rc;
+}
+
+static i32 SysEpollCreateJs(struct Machine *m, i32 size) {
+  return SysEpollCreate1Js(m, 0);
+}
+
+static i32 SysEpollCtlJs(struct Machine *m, i32 epfd, i32 op, i32 fd,
+                         i64 eventaddr) {
+  u32 events = 0;
+  u32 lo = 0, hi = 0;
+  const struct epoll_event_linux *gepe;
+  if (eventaddr) {
+    if (!(gepe = (const struct epoll_event_linux *)SchlepR(m, eventaddr,
+                                                          sizeof(*gepe)))) {
+      return -1;
+    }
+    events = Read32(gepe->events);
+    lo = Read32(gepe->data);
+    hi = Read32(gepe->data + 4);
+  }
+  if (js_epoll_ctl(epfd, op, fd, events, lo, hi) < 0) return -1;
+  return 0;
+}
+
+// epoll_pwait: the mask is swapped in for the wait and put back after, the way
+// SysPpoll does it, so a signal blocked outside the wait can still wake it.
+static int SysEpollPwaitJs(struct Machine *m, i32 epfd, i64 eventsaddr,
+                           i32 maxevents, i32 timeout, i64 sigmaskaddr,
+                           u64 sigsetsize);
+
+static int SysEpollWaitJs(struct Machine *m, i32 epfd, i64 eventsaddr,
+                          i32 maxevents, i32 timeout) {
+  return SysEpollPwaitJs(m, epfd, eventsaddr, maxevents, timeout, 0, 8);
+}
+
+static int SysEpollPwaitJs(struct Machine *m, i32 epfd, i64 eventsaddr,
+                           i32 maxevents, i32 timeout, i64 sigmaskaddr,
+                           u64 sigsetsize) {
+  int rc;
+  size_t size;
+  u64 oldmask = 0;
+  bool pushed = false;
+  const struct sigset_linux *sm;
+  struct epoll_event_linux *gepe;
+  if (maxevents <= 0) return einval();
+  if (sigmaskaddr) {
+    if (sigsetsize != 8) return einval();
+    if (!(sm = (const struct sigset_linux *)SchlepR(m, sigmaskaddr, sizeof(*sm)))) return -1;
+    oldmask = m->sigmask;
+    m->sigmask = Read64(sm->sigmask);
+    pushed = true;
+  }
+  size = (size_t)maxevents * sizeof(*gepe);
+  if (!(gepe = (struct epoll_event_linux *)malloc(size))) return enomem();
+  rc = js_epoll_wait(epfd, gepe, maxevents, timeout);
+  if (rc > 0 && CopyToUserWrite(m, eventsaddr, gepe, (size_t)rc * sizeof(*gepe)) == -1) {
+    rc = -1;
+  }
+  free(gepe);
+  if (pushed) m->sigmask = oldmask;
+  return rc;
+}
+#endif
+
 void OpSyscall(P) {
   size_t mark;
   u64 ax, di, si, dx, r0, r8, r9;
@@ -6517,6 +6614,11 @@ void OpSyscall(P) {
     SYSCALL(2, 0x06D, "setpgid", SysSetpgid, STRACE_2);
 #ifdef __EMSCRIPTEN__
     SYSCALL(3, 0x067, "syslog", SysSyslog, STRACE_3);  // pk910: the kernel's ring buffer
+    SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreateJs, STRACE_1);
+    SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1Js, STRACE_1);
+    SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtlJs, STRACE_4);
+    SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWaitJs, STRACE_4);
+    SYSCALL(6, 0x119, "epoll_pwait", SysEpollPwaitJs, STRACE_6);
 #endif
     SYSCALL(0, 0x066, "getuid", SysGetuid, STRACE_GETUID);
     SYSCALL(0, 0x068, "getgid", SysGetgid, STRACE_GETGID);

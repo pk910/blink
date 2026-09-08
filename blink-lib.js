@@ -855,8 +855,56 @@ addToLibrary({
       // blink stamps its own "E<time>:file:line:tid " prefix; dmesg already
       // carries the time and the unit, so drop it and keep the message
       var m = PKSYS.cstr(ptr).replace(/\n+$/, '').replace(/^[EI][0-9T:.-]+:[^\s:]+:\d+:\d+ /, '');
-      ksys('klog', [m.slice(0, 500)]);
+      ksys('klog', [m.slice(0, 4000)]);
     } catch (e) { /* nothing better to do */ }
+  },
+
+  // epoll(7): blink's own epoll goes to the host's, and wasm has none. The
+  // interest list lives in the kernel like Linux keeps it; wineserver's main
+  // loop is epoll and will not start without it.
+  js_epoll_create__deps: ['$PKSYS'],
+  js_epoll_create__proxy: 'none',
+  js_epoll_create: function (flags) {
+    try { return ksys('epoll_create', [flags | 0]); } catch (e) { PKSYS.klog(e); return -1; }
+  },
+  js_epoll_ctl__deps: ['$PKSYS'],
+  js_epoll_ctl__proxy: 'none',
+  js_epoll_ctl: function (epfd, op, fd, events, lo, hi) {
+    try { ksys('epoll_ctl', [epfd | 0, op | 0, fd | 0, events >>> 0, lo >>> 0, hi >>> 0]); return 0; }
+    catch (e) { PKSYS.klog(e); return -1; }
+  },
+  // writes struct epoll_event_linux[] (packed: u32 events, u64 data) and
+  // returns how many it filled
+  js_epoll_wait__deps: ['$PKSYS'],
+  js_epoll_wait__proxy: 'none',
+  js_epoll_wait: function (epfd, out, maxevents, timeout) {
+    try {
+      var r = ksys('epoll_wait', [epfd | 0, maxevents | 0, timeout | 0]);
+      for (var i = 0; i < r.length; i++) {
+        var p = out + i * 12;
+        HEAPU32[p >> 2] = r[i].events >>> 0;
+        HEAPU32[(p + 4) >> 2] = r[i].lo >>> 0;
+        HEAPU32[(p + 8) >> 2] = r[i].hi >>> 0;
+      }
+      return r.length;
+    } catch (e) { PKSYS.klog(e); return -1; }
+  },
+
+  // socketpair(2): blink calls this directly, because emscripten's libc answers
+  // the syscall itself with ENOSYS and never imports __syscall_socketpair
+  js_socketpair__deps: ['$PKSYS'],
+  js_socketpair__proxy: 'none',
+  js_socketpair: function (family, type, protocol, fds) {
+    try {
+      var r = ksys('socketpair', [family, type]);
+      HEAP32[fds >> 2] = r[0];
+      HEAP32[(fds + 4) >> 2] = r[1];
+      return 0;
+    } catch (e) {
+      // blink's callers test for -1, not for a negative errno
+      try { ksys('klog', ['socketpair failed: ' + (e && e.message ? e.message : e)]); } catch (x) {}
+      return -1;
+    }
   },
 
   // syslog(2): the ring buffer is the kernel's, and so is the clearing. Types
