@@ -154,8 +154,8 @@ addToLibrary({
       HEAPU32[buf >> 2] = st.dev >>> 0; // dev
       HEAPU32[(buf + 4) >> 2] = mode;
       HEAPU32[(buf + 8) >> 2] = st.nlink >>> 0; // nlink
-      HEAPU32[(buf + 12) >> 2] = 0; // uid (numeric ids land with the uid/gid inversion)
-      HEAPU32[(buf + 16) >> 2] = 0; // gid
+      HEAPU32[(buf + 12) >> 2] = st.uid >>> 0; // uid
+      HEAPU32[(buf + 16) >> 2] = st.gid >>> 0; // gid
       HEAPU32[(buf + 20) >> 2] = 0; // rdev
       HEAP64[(buf + 24) >> 3] = BigInt(size); // size
       HEAP32[(buf + 32) >> 2] = 4096; // blksize
