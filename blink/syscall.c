@@ -222,7 +222,13 @@ extern int js_getxid(int which);                 // pk910: 0 uid 1 euid 2 gid 3 
 extern int js_getgroups(int size, int *out);   // pk910: the kernel's supplementary groups (size 0 = count)
 extern int js_setgroups(int size, const int *in);
 extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the kernel replaces this process's image (deprecated)
-extern int js_exec_resolve(const char *prog, char *buf, int buflen);  // execve: kernel resolves+bookkeeps, returns the real path for in-place exec
+// execve: the kernel resolves the image through its binfmt and does the
+// bookkeeping. Returns the count of argv strings packed into buf (image path
+// first, NUL-separated) for an in-place load, PK_EXEC_HANDOFF when the kernel
+// took the process over, or -errno.
+#define PK_EXEC_HANDOFF (-1000)
+#define PK_EXEC_BUF 16384
+extern int js_exec_resolve(const char *prog, char **argv, char **envp, char *buf, int buflen);
 extern void js_procexit(int code);  // exit_group: notify the kernel, then this pthread ends (worker reclaimed)
 extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
 static int PkBridge(int r) {
@@ -4018,14 +4024,37 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
     // the guest's own argv/envp; the channel and pid stay, so the new image's
     // syscalls keep routing to the same process. Only amd64 ELF is emulatable in
     // place (scripts/JS programs return ENOEXEC). Returns only on failure.
-    char resolved[1024];
-    int rc = js_exec_resolve(prog, resolved, sizeof(resolved));
-    if (rc < 0) {
-      errno = -rc;
+    char *packed, **nargv, *p;
+    int i, n;
+    if (!(packed = (char *)AddToFreeList(m, malloc(PK_EXEC_BUF)))) return -1;
+    n = js_exec_resolve(prog, argv, envp, packed, PK_EXEC_BUF);
+    if (n == PK_EXEC_HANDOFF) {
+      // The kernel replaced this process's image with one it runs itself (a JS
+      // program). This pthread ends the way exit_group does, minus the exit
+      // notification: the pid lives on in the kernel's worker.
+      ClearChildTid(m);
+      KillOtherThreads(m->system);
+#ifdef HAVE_JIT
+      DisableJit(&m->system->jit);
+#endif
+      FreeMachine(m);
+      pthread_exit(0);
+    }
+    if (n < 0) {
+      errno = -n;
       return -1;
     }
+    if (!(nargv = (char **)AddToFreeList(m, malloc((n + 1) * sizeof(char *))))) return -1;
+    p = packed;
+    prog = p;  // the final image: a script's interpreter chain is already collapsed
+    p += strlen(p) + 1;
+    for (i = 0; i < n; ++i) {
+      nargv[i] = p;
+      p += strlen(p) + 1;
+    }
+    nargv[n] = 0;
     LOCK(&m->system->exec_lock);
-    ExecveBlink(m, resolved, argv, envp);  // never returns on success
+    ExecveBlink(m, prog, nargv, envp);  // never returns on success
     UNLOCK(&m->system->exec_lock);
     errno = ENOEXEC;  // ExecveBlink returned: not an emulatable image
     return -1;
