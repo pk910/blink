@@ -21,6 +21,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/heap.h>
+#endif
+
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/bitscan.h"
@@ -874,6 +878,17 @@ static int DetermineHostProtection(int prot) {
 
 i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
                    i64 offset, bool shared, bool fixedmap) {
+#ifdef __EMSCRIPTEN__
+  // pk910: Linux's overcommit heuristic, in the only form we can honour. Guest
+  // pages are backed out of the wasm heap, so a mapping larger than the heap
+  // could ever grow to can never be backed - handing it out means the guest
+  // dies of SIGSEGV the moment its allocator writes a header into it. Refusing
+  // here is what turns that into malloc() returning NULL, which is a thing the
+  // guest can act on. (Linux with overcommit_memory=0 refuses the same way.)
+  if (size > 0 && (u64)size > emscripten_get_heap_max() - emscripten_get_heap_size()) {
+    return enomem();
+  }
+#endif
   u8 *mi;
   int demand;
   int method;
