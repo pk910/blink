@@ -105,6 +105,10 @@ static char *GetTimestamp(void) {
   return s;
 }
 
+#ifdef __EMSCRIPTEN__
+extern void js_klog(const char *);  // pk910: the kernel's ring buffer
+#endif
+
 static void OpenLog(void) {
   int fd;
   if (!g_log.path) return;
@@ -145,9 +149,17 @@ static void Log(const char *file, int line, const char *fmt, va_list va,
   if (g_log.fd != -1) {
     WriteError(g_log.fd, b, n);
   }
+#ifdef __EMSCRIPTEN__
+  // pk910: fd 2 is the GUEST's stderr, and a diagnostic from the emulator is
+  // not the guest's output - a segfault used to spray a page-table dump over
+  // whatever the user was reading. It goes to the kernel's ring buffer instead,
+  // which is where dmesg(1) shows it, the same as a real kernel's oops.
+  js_klog(b);
+#else
   if (FLAG_alsologtostderr || (!FLAG_nologstderr && level <= g_log.level)) {
     WriteError(2, b, n);
   }
+#endif
   errno = err;
 }
 

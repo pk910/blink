@@ -100,7 +100,15 @@ static void *PortableMmap(void *addr,     //
 
 static int GetBitsInAddressSpace(void) {
 #ifdef __EMSCRIPTEN__
-  return 32;
+  // pk910: 47, the width of an x86-64 user address, not the host's pointer
+  // width. wasm32 has no linear mapping (CanHaveLinearMemory() is false), so a
+  // guest address is an index into blink's page table and never a host pointer;
+  // nothing here has to fit in 32 bits. Capping it at 32 squeezed the whole
+  // layout - image, heap, mmap window and stack - into 2 GB, so ScaleAddress
+  // moved the automap window down next to the break and a mapping of any size
+  // landed on top of the heap. A guest that then grew its heap wrote to memory
+  // it did not own: printf() after a 2.25 GB malloc took SIGSEGV.
+  return 47;
 #else
   int i;
   void *ptr;

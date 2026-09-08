@@ -219,6 +219,7 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 // the host errno.
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
 extern int js_uname(char *buf);                  // pk910: six NUL-terminated 65-byte fields from the kernel's identity
+extern int js_klogctl(int type, char *buf, int len);  // pk910: syslog(2) over the kernel's ring buffer
 extern int js_getxid(int which);                 // pk910: 0 uid 1 euid 2 gid 3 egid, from the kernel's credentials
 extern int js_getgroups(int size, int *out);   // pk910: the kernel's supplementary groups (size 0 = count)
 extern int js_setgroups(int size, const int *in);
@@ -1907,6 +1908,27 @@ static void FixupSock(int fd, int flags) {
 #ifndef BLINK_UNAME_V
 #define BLINK_UNAME_V "BLINK_UNAME_V_UNKNOWN"
 #warning "-DBLINK_UNAME_V=... should be passed to blink/syscall.c"
+#endif
+
+#ifdef __EMSCRIPTEN__
+// pk910: syslog(2). The ring buffer belongs to the kernel, which is where every
+// message in it came from, so dmesg reads it through the same channel as
+// everything else. Without this the guest gets ENOSYS and dmesg says
+// "klogctl: Function not implemented" on a box that logs plenty.
+static int SysSyslog(struct Machine *m, int type, i64 bufaddr, int len) {
+  int rc;
+  char *buf;
+  if (len < 0) return einval();
+  if (type == 2 || type == 3 || type == 4) {
+    if (!len) return 0;
+    if (!(buf = (char *)malloc(len))) return enomem();
+    rc = js_klogctl(type, buf, len);
+    if (rc > 0) rc = CopyToUserWrite(m, bufaddr, buf, rc) == -1 ? -1 : rc;
+    free(buf);
+    return rc;
+  }
+  return js_klogctl(type, 0, 0);
+}
 #endif
 
 static int SysUname(struct Machine *m, i64 utsaddr) {
@@ -6460,6 +6482,9 @@ void OpSyscall(P) {
     SYSCALL(2, 0x089, "statfs", SysStatfs, STRACE_2);
     SYSCALL(2, 0x08A, "fstatfs", SysFstatfs, STRACE_2);
     SYSCALL(2, 0x06D, "setpgid", SysSetpgid, STRACE_2);
+#ifdef __EMSCRIPTEN__
+    SYSCALL(3, 0x067, "syslog", SysSyslog, STRACE_3);  // pk910: the kernel's ring buffer
+#endif
     SYSCALL(0, 0x066, "getuid", SysGetuid, STRACE_GETUID);
     SYSCALL(0, 0x068, "getgid", SysGetgid, STRACE_GETGID);
     SYSCALL(1, 0x069, "setuid", SysSetuid, STRACE_SETUID);
