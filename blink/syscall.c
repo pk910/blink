@@ -1031,6 +1031,13 @@ static bool IsForkOrVfork(u64 flags) {
 
 static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
+#ifdef __EMSCRIPTEN__
+  // pk910: glibc's fork(), vfork() and posix_spawn() all arrive here as
+  // clone(); they get the same copy-on-write fork as SysFork/SysVfork. The
+  // ForkFrame path below used to catch the CLONE_VFORK ones and then exec'd
+  // the child as a separate kernel process, losing argv[0] on the way.
+  if (IsForkOrVfork(flags)) return PkForkThread(m);
+#endif
   if (IsForkOrVfork(flags)) {
 #if defined(PK_FORK)
     // route clone()-based fork/vfork through the copy-on-write fork too
@@ -3632,6 +3639,21 @@ static int SysFchmod(struct Machine *m, i32 fd, u32 mode) {
 
 static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
   return VfsChmod(GetDirFildes(dirfd), LoadStr(m, path), mode, 0);
+}
+
+// fchmodat2(2): fchmodat with flags. glibc uses it for AT_SYMLINK_NOFOLLOW and,
+// without it, emulates through an O_PATH open that fails here, so chmod -R
+// reported ELOOP for every symlink. The mode bits of a symlink cannot be
+// changed on Linux: ENOTSUP, which coreutils knows to ignore.
+static int SysFchmodat2(struct Machine *m, i32 dirfd, i64 path, u32 mode, i32 flags) {
+  const char *p;
+  struct stat st;
+  if (!(p = LoadStr(m, path))) return -1;
+  if (flags & AT_SYMLINK_NOFOLLOW_LINUX) {
+    if (VfsStat(GetDirFildes(dirfd), p, &st, AT_SYMLINK_NOFOLLOW) == -1) return -1;
+    if (S_ISLNK(st.st_mode)) return enotsup();
+  }
+  return VfsChmod(GetDirFildes(dirfd), p, mode, 0);
 }
 
 static int SysFcntlLock(struct Machine *m, int systemfd, int cmd, i64 arg) {
@@ -6470,6 +6492,7 @@ void OpSyscall(P) {
     SYSCALL(3, 0x10A, "symlinkat", SysSymlinkat, STRACE_SYMLINKAT);
     SYSCALL(4, 0x10B, "readlinkat", SysReadlinkat, STRACE_READLINKAT);
     SYSCALL(3, 0x10C, "fchmodat", SysFchmodat, STRACE_FCHMODAT);
+    SYSCALL(4, 0x1C4, "fchmodat2", SysFchmodat2, STRACE_4);
 #ifndef DISABLE_SOCKETS
     SYSCALL(3, 0x029, "socket", SysSocket, STRACE_SOCKET);
     SYSCALL(3, 0x02A, "connect", SysConnect, STRACE_CONNECT);
