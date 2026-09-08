@@ -1103,6 +1103,117 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
   return true;
 }
 
+// ── stack ops (push/pop/leave/call/ret) ─────────────────────────────────────
+// blink's PushN/PopN mask the stack pointer per mode and pick the operand size
+// from kStackOsz[Osz][Mode], so only long mode without a 0x66 prefix is a plain
+// 64-bit rsp-relative access; everything else stays on the handler. metal is
+// excluded for the same reason as MemEaDecode (EmitMemBegin assumes Cpl 3 and
+// PAGE_U). A segment override is irrelevant here: PushN/PopN never add ss.base
+// in long mode.
+static bool StackInlinable(struct Machine *m, u64 rde) {
+  if (m->metal) return false;
+  if (Mode(rde) != XED_MODE_LONG) return false;
+  if (Osz(rde) || Lock(rde)) return false;
+  return true;
+}
+
+// i64.load / i64.store [HP0] with align 0, offset 0.
+static void ELoadHp(struct Buf *b) { bput(b, 0x29); bleb_u(b, 0); bleb_u(b, 0); }
+static void EStoreHp(struct Buf *b) { bput(b, 0x37); bleb_u(b, 0); bleb_u(b, 0); }
+
+// push: [rsp - 8] = val ; rsp -= 8. sreg >= 0 pushes that GPR, else the
+// constant val (push imm, and the return address of a direct call). The address
+// lands in LT3 and the Rc snapshot is taken BEFORE rsp is touched, so the $slow
+// fallback spills the true pre-instruction state and the handler redoes the
+// whole instruction. `push rsp` works because the store reads the local before
+// the rsp writeback, matching blink evaluating ReadStackWord before PushN.
+static void EmitPush(struct Buf *b, struct Rc *rc, int sreg, u64 val, u64 rde,
+                     i64 disp, u64 uimm0, u32 hidx, u64 pc_next, u32 oplen) {
+  struct Rc pre;
+  RcLoad(b, rc, 4);
+  if (sreg >= 0) RcLoad(b, rc, sreg);
+  EGet(b, LOC_GPR + 4); EConst(b, 8); EBin(b, I64_SUB); ESet(b, LT3);
+  pre = *rc;
+  EmitMemBegin(b, 8, true);
+  EGet(b, HP0);
+  if (sreg >= 0) EGet(b, LOC_GPR + sreg);
+  else EConst(b, (i64)val);
+  EStoreHp(b);
+  EGet(b, LT3); ESet(b, LOC_GPR + 4);
+  RcMark(rc, 4);
+  RcDirty(rc, 4);
+  EmitMemEnd(b, &pre, rc, rde, disp, uimm0, hidx, pc_next, oplen);
+}
+
+// pop-shaped: addr = GPR[areg] ; v = [addr] ; rsp = addr + 8 ; GPR[dreg] = v.
+// `pop r` is areg = rsp; `leave` is areg = rbp with dreg = rbp (blink does
+// sp = bp, then pops bp, which reads at the new sp). rsp is written FIRST so
+// `pop rsp` ends up with the loaded value, exactly like PopN + Put64.
+static void EmitPopTo(struct Buf *b, struct Rc *rc, int areg, int dreg, u64 rde,
+                      i64 disp, u64 uimm0, u32 hidx, u64 pc_next, u32 oplen) {
+  struct Rc pre;
+  RcLoad(b, rc, areg);
+  EGet(b, LOC_GPR + areg); ESet(b, LT3);
+  pre = *rc;
+  EmitMemBegin(b, 8, false);
+  EGet(b, HP0); ELoadHp(b); ESet(b, LT2);
+  EGet(b, LT3); EConst(b, 8); EBin(b, I64_ADD); ESet(b, LOC_GPR + 4);
+  RcMark(rc, 4);
+  RcDirty(rc, 4);
+  EGet(b, LT2); ESet(b, LOC_GPR + dreg);
+  RcMark(rc, dreg);
+  RcDirty(rc, dreg);
+  EmitMemEnd(b, &pre, rc, rde, disp, uimm0, hidx, pc_next, oplen);
+}
+
+// ret: m->ip = [rsp] ; rsp += 8. m->ip (not a local) is the landing spot on
+// BOTH paths - the $slow handler is OpRet, which does the same thing - so the
+// caller can read the return address back out of m->ip afterwards.
+static void EmitRet(struct Buf *b, struct Rc *rc, u64 rde, i64 disp, u64 uimm0,
+                    u32 hidx, u64 pc_next, u32 oplen) {
+  struct Rc pre;
+  RcLoad(b, rc, 4);
+  EGet(b, LOC_GPR + 4); ESet(b, LT3);
+  pre = *rc;
+  EmitMemBegin(b, 8, false);
+  EGet(b, 0);
+  EGet(b, HP0); ELoadHp(b);
+  EStore(b, OFF_IP);
+  EGet(b, LT3); EConst(b, 8); EBin(b, I64_ADD); ESet(b, LOC_GPR + 4);
+  RcMark(rc, 4);
+  RcDirty(rc, 4);
+  EmitMemEnd(b, &pre, rc, rde, disp, uimm0, hidx, pc_next, oplen);
+}
+
+// Try to inline push r / push imm / pop r / leave. Mopcode is exact (it carries
+// the 0x0F escape in bit 8), so no extern-symbol identification is needed.
+static bool TryEmitStack(struct Machine *m, struct Buf *b, struct Rc *rc,
+                         u64 rde, const struct XedDecodedInst *x, u32 hidx,
+                         u64 pc_next, u32 oplen) {
+  u32 op = (u32)Mopcode(rde);
+  if (op != 0x0C9 && (op & ~0xf) != 0x050 && op != 0x068 && op != 0x06A) {
+    return false;
+  }
+  if (!StackInlinable(m, rde)) return false;
+  if (op == 0x068 || op == 0x06A) {  // push imm (the handler pushes uimm0 raw)
+    EmitPush(b, rc, -1, x->op.uimm0, rde, x->op.disp, x->op.uimm0, hidx,
+             pc_next, oplen);
+    return true;
+  }
+  if (op == 0x0C9) {  // leave
+    EmitPopTo(b, rc, 5, 5, rde, x->op.disp, x->op.uimm0, hidx, pc_next, oplen);
+    return true;
+  }
+  if (op < 0x058) {  // 50+r push r
+    EmitPush(b, rc, (int)RexbSrm(rde), 0, rde, x->op.disp, x->op.uimm0, hidx,
+             pc_next, oplen);
+  } else {           // 58+r pop r
+    EmitPopTo(b, rc, 4, (int)RexbSrm(rde), rde, x->op.disp, x->op.uimm0, hidx,
+              pc_next, oplen);
+  }
+  return true;
+}
+
 // Decide if this insn is an inlinable register-direct 32/64-bit mov.
 static bool MovDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *src,
                       bool *imm, u64 *immv, int *log2) {
@@ -1851,6 +1962,9 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
             (int)RexbRm(rde), 0, true, 0, true);
     return true;
   }
+  if (TryEmitStack(m, bb, rc, rde, xedd, (u32)(uintptr_t)h, pc, oplen)) {
+    return true;  // push r / push imm / pop r / leave (long mode, osz 8)
+  }
   if (TryEmitMemRead(m, bb, rc, h, rde, xedd, pc, oplen)) {
     return true;  // fast path leaves m->ip stale ($slow sets it itself)
   }
@@ -1896,14 +2010,17 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
 // fallthrough therefore starts with all of `regs` marked dirty, so the first
 // handler spill writes them back; a block whose only predecessor is the
 // preceding block's fallthrough inherits that block's exact dirty set.
-#define PKJIT_RBLOCKS 24    // blocks per region
-#define PKJIT_RINSNS  384   // instructions per region
+#define PKJIT_RBLOCKS 48    // blocks per region (call following needs headroom)
+#define PKJIT_RINSNS  640   // instructions per region
 #define PKJIT_RBINSNS 128   // instructions per block
+#define PKJIT_RETSITES 12   // distinct in-region call-return sites tracked
 
 enum {
   kTermJcc,   // conditional direct branch: tgt = taken, fall = not taken
   kTermJmp,   // unconditional direct branch to tgt
   kTermFall,  // ran into another block's first instruction at tgt
+  kTermCall,  // direct call: inline push of `fall`, then jump to tgt
+  kTermRet,   // ret: inline pop into m->ip, then the return-site guard
   kTermExit,  // last insn is a handler-emitted branch/precious op (it sets ip)
   kTermStop,  // gave up here; leave with m->ip = tgt
 };
@@ -1911,13 +2028,14 @@ enum {
 struct RBlock {
   u64 start;
   u64 end;    // address after the last instruction this block EMITS
-  u64 tgt;    // jcc taken / jmp / fall / stop target address
-  u64 fall;   // jcc not-taken address
+  u64 tgt;    // jcc taken / jmp / fall / call target / stop target address
+  u64 fall;   // jcc not-taken / call return address
   int term;
   int cc;     // jcc condition code
   int s_tgt, s_fall;  // successor block indices, -1 = leaves the region
   int pos;    // layout position, -1 = unreachable/not emitted
   int preds;  // in-region predecessor edges
+  int isret;  // block start is a known call-return site (a ret may branch here)
 };
 
 static int RFind(const struct RBlock *bs, int n, u64 a) {
@@ -1931,8 +2049,14 @@ static int RFind(const struct RBlock *bs, int n, u64 a) {
 // Walk the CFG from `ip` over direct branches. Blocks are re-walked until the
 // leader set stops growing, which is what splits a block that a later-found
 // branch target lands inside of. Returns the block count (>= 1).
+// DIRECT CALLS are followed like an unconditional jump to the callee, with the
+// address after the call recorded as a return site and made a block leader. The
+// callee's blocks therefore join the region and its `ret` can branch straight
+// back inside the wasm function instead of round-tripping to the C dispatcher.
 static int RDiscover(struct Machine *m, u64 ip, struct RBlock *bs) {
-  int n = 1, pass, i, k;
+  int n = 1, pass, i, k, j;
+  u64 rets[PKJIT_RETSITES];
+  int nrets = 0;
   struct XedDecodedInst x;
   bs[0].start = ip;
   for (pass = 0; pass < 6; ++pass) {
@@ -1987,6 +2111,23 @@ static int RDiscover(struct Machine *m, u64 ip, struct RBlock *bs) {
           b->end = pc;   // ditto
           break;
         }
+        if (Mopcode(rde) == 0x0E8 && StackInlinable(m, rde)) {  // call rel32
+          b->term = kTermCall;
+          b->tgt = pcn + (u64)x.op.disp;
+          b->fall = pcn;          // return site: a leader, and a ret guard entry
+          b->end = pc;            // the call becomes an inline push + a jump
+          for (j = 0; j < nrets; ++j) {
+            if (rets[j] == pcn) break;
+          }
+          if (j == nrets && nrets < PKJIT_RETSITES) rets[nrets++] = pcn;
+          break;
+        }
+        if (Mopcode(rde) == 0x0C3 && StackInlinable(m, rde)) {  // ret
+          b->term = kTermRet;
+          b->tgt = pcn;
+          b->end = pc;            // becomes an inline pop + the return guard
+          break;
+        }
         if (ClassifyOp(rde) != kOpNormal) {  // call/ret/indirect/precious
           b->term = kTermExit;
           b->tgt = pcn;
@@ -1998,16 +2139,20 @@ static int RDiscover(struct Machine *m, u64 ip, struct RBlock *bs) {
       }
       if (k == PKJIT_RBINSNS) { b->term = kTermStop; b->tgt = pc; b->end = pc; }
       // register this block's in-region successors as leaders
-      if (b->term == kTermJcc || b->term == kTermJmp || b->term == kTermFall) {
+      if (b->term == kTermJcc || b->term == kTermJmp || b->term == kTermFall ||
+          b->term == kTermCall) {
         u64 t2[2];
-        int nt = 1, j;
+        int nt = 1, q;
         t2[0] = b->tgt;
-        if (b->term == kTermJcc) { t2[1] = b->fall; nt = 2; }
-        for (j = 0; j < nt; ++j) {
-          if (RFind(bs, n, t2[j]) >= 0) continue;
+        if (b->term == kTermJcc || b->term == kTermCall) {
+          t2[1] = b->fall;  // jcc not-taken, or the call's return site
+          nt = 2;
+        }
+        for (q = 0; q < nt; ++q) {
+          if (RFind(bs, n, t2[q]) >= 0) continue;
           if (n >= PKJIT_RBLOCKS) continue;
           memset(&bs[n], 0, sizeof(bs[n]));
-          bs[n].start = t2[j];
+          bs[n].start = t2[q];
           ++n;
           added = 1;
         }
@@ -2020,7 +2165,11 @@ static int RDiscover(struct Machine *m, u64 ip, struct RBlock *bs) {
     bs[i].preds = 0;
     bs[i].s_tgt = -1;
     bs[i].s_fall = -1;
-    if (bs[i].term == kTermJcc) {
+    bs[i].isret = 0;
+    for (k = 0; k < nrets; ++k) {
+      if (rets[k] == bs[i].start) bs[i].isret = 1;
+    }
+    if (bs[i].term == kTermJcc || bs[i].term == kTermCall) {
       bs[i].s_tgt = RFind(bs, n, bs[i].tgt);
       bs[i].s_fall = RFind(bs, n, bs[i].fall);
     } else if (bs[i].term == kTermJmp || bs[i].term == kTermFall) {
@@ -2039,6 +2188,9 @@ static void RLayout(struct RBlock *bs, int b, int *order, int *cnt) {
   if (bs[b].term == kTermJcc) {
     RLayout(bs, bs[b].s_fall, order, cnt);
     RLayout(bs, bs[b].s_tgt, order, cnt);
+  } else if (bs[b].term == kTermCall) {
+    RLayout(bs, bs[b].s_tgt, order, cnt);   // callee first: free fallthrough
+    RLayout(bs, bs[b].s_fall, order, cnt);  // then the return site
   } else if (bs[b].term == kTermJmp || bs[b].term == kTermFall) {
     RLayout(bs, bs[b].s_tgt, order, cnt);
   }
@@ -2144,9 +2296,11 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
       ol = Oplength(rde);
       if (!ol) return false;
       h = GetOp(Mopcode(rde));
-      if (!EmitOneInsn(m, b, rc, h, rde, &x, pc + ol, ol)) {
-        RegionSync(b, rc, regs);
-      }
+      // a handler invalidated the cache; DON'T reload the whole region set
+      // here - the invariant is only owed at block edges, and every terminator
+      // below does its own RegionSync. Reloading eagerly cost one load per
+      // hoisted register per handler call, which grew with the region.
+      (void)EmitOneInsn(m, b, rc, h, rde, &x, pc + ol, ol);
       pc += ol;
       if (b->ovf) return false;
     }
@@ -2173,6 +2327,57 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
         inherit = (bl->s_tgt >= 0 && bs[bl->s_tgt].pos == i + 1 &&
                    bs[bl->s_tgt].preds == 1);
         break;
+      case kTermCall: {
+        // a direct call is a push of a compile-time constant plus a jump to a
+        // compile-time constant: no handler, no dispatcher round trip.
+        u64 rde;
+        u32 ol;
+        if (GetInstruction(m, bl->end, &x)) return false;
+        rde = x.op.rde;
+        ol = Oplength(rde);
+        if (!ol) return false;
+        EmitPush(b, rc, -1, bl->fall, rde, x.op.disp, x.op.uimm0,
+                 (u32)(uintptr_t)GetOp(Mopcode(rde)), bl->fall, ol);
+        RegionSync(b, rc, regs);
+        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 0, usetbl);
+        inherit = (bl->s_tgt >= 0 && bs[bl->s_tgt].pos == i + 1 &&
+                   bs[bl->s_tgt].preds == 1);
+        break;
+      }
+      case kTermRet: {
+        // pop into m->ip, then match it against the region's known return
+        // sites; a hit re-enters that block through the loop dispatch, a miss
+        // (recursion below the region entry, or a caller outside it) leaves
+        // with m->ip already correct.
+        u64 rde;
+        u32 ol;
+        int k;
+        if (GetInstruction(m, bl->end, &x)) return false;
+        rde = x.op.rde;
+        ol = Oplength(rde);
+        if (!ol) return false;
+        EmitRet(b, rc, rde, x.op.disp, x.op.uimm0,
+                (u32)(uintptr_t)GetOp(Mopcode(rde)), bl->tgt, ol);
+        RegionSync(b, rc, regs);
+        EGet(b, 0); ELoad(b, OFF_IP); ESet(b, LT2);
+        for (k = 0; k < nl; ++k) {
+          if (!bs[order[k]].isret) continue;
+          EGet(b, LT2);
+          EConst(b, (i64)bs[order[k]].start);
+          bput(b, 0x51);                 // i64.eq
+          bput(b, 0x04); bput(b, 0x40);  // if (void)
+          if (k > i) {                   // forward: straight out of block $B_k
+            bput(b, 0x0c); bleb_u(b, (u64)(k - i));
+          } else {                       // backward: through the loop dispatch
+            EConstI(b, k); ESet(b, TG);
+            bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $L (extra depth 1)
+          }
+          bput(b, 0x0b);                 // end if
+        }
+        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        inherit = false;
+        break;
+      }
       case kTermExit:
         // the last instruction was a handler-emitted branch: it set m->ip
         RegionSync(b, rc, regs);
@@ -2201,7 +2406,7 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
 }
 
 static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
-                       u64 *lastpc) {
+                       u64 *firstpc, u64 *lastpc) {
   struct RBlock bs[PKJIT_RBLOCKS];
   int order[PKJIT_RBLOCKS];
   int n, nl = 0, i, usetbl = 0, hasback = 0;
@@ -2217,7 +2422,12 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
     struct RBlock *bl = &bs[order[i]];
     int s[2], k, ns = 0;
     if (bl->term == kTermJcc) { s[ns++] = bl->s_tgt; s[ns++] = bl->s_fall; }
-    else if (bl->term == kTermJmp || bl->term == kTermFall) s[ns++] = bl->s_tgt;
+    else if (bl->term == kTermJmp || bl->term == kTermFall ||
+             bl->term == kTermCall) s[ns++] = bl->s_tgt;
+    // a return site is entered by every ret guard in the region, i.e. from
+    // anywhere: it must start with the block-entry cache invariant (all regs
+    // dirty), so count the guard as an extra predecessor.
+    if (bl->isret) ++bl->preds;
     for (k = 0; k < ns; ++k) {
       if (s[k] < 0 || bs[s[k]].pos < 0) continue;
       ++bs[s[k]].preds;
@@ -2230,6 +2440,19 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
     if (bl->end > hi) hi = bl->end;
   }
   bs[0].preds++;  // the region entry is reached from outside
+  // A ret guard branching FORWARD to a return site is a plain `br` out of a
+  // nested block, so the usual layout (call, callee, return site) needs no
+  // dispatch at all. Only a BACKWARD guard edge - recursion, or a callee laid
+  // out after one of its return sites - has to go through the br_table.
+  for (i = 0; i < nl; ++i) {
+    int k;
+    if (bs[order[i]].term != kTermRet) continue;
+    for (k = 0; k <= i; ++k) {
+      if (!bs[order[k]].isret) continue;
+      usetbl = 1;
+      hasback = 1;
+    }
+  }
   // pass 1 discovers which GPRs the region actually keeps in locals
   memset(&probe, 0, sizeof(probe));
   pb = *bb;
@@ -2244,7 +2467,7 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
     return false;
   }
   *lastpc = hi;
-  (void)lo;
+  *firstpc = lo;  // call following can pull in code BELOW ip; SMC must see it
   return true;
 }
 
@@ -2258,6 +2481,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   t_wasloop = 0;
   struct XedDecodedInst xedd;
   u64 pc = ip;
+  u64 lopc = ip;   // lowest guest address the emission covers (region: min block)
   int count = 0;
   bool ip_dirty = false;   // true if m->ip != pc (an inline op advanced pc)
   bool terminated = false;
@@ -2277,10 +2501,11 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   // REGION: everything reachable from ip through direct branches, in ONE wasm
   // function. Subsumes the linear block below whenever it succeeds.
   {
-    u64 hi = ip;
+    u64 hi = ip, lo = ip;
     bb.n = 0;
-    if (EmitRegion(m, ip, &bb, &rc, &hi)) {
+    if (EmitRegion(m, ip, &bb, &rc, &lo, &hi)) {
       pc = hi;
+      lopc = lo;
       t_wasloop = 2;
       goto assemble;
     }
@@ -2337,7 +2562,7 @@ assemble:
   // register the guest code range so a later write to it invalidates blocks
   // (+3072 pads the self-loop path, where pc stays == ip; over-marking only
   // risks a spurious flush, never a stale block)
-  NoteCodePages(ip, (pc > ip ? pc : ip + 1) + 3072);
+  NoteCodePages(lopc, (pc > lopc ? pc : lopc + 1) + 3072);
   *out = mem;
   *outlen = mb.n;
   return true;
