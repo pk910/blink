@@ -117,7 +117,7 @@ addToLibrary({
         EAGAIN: 6, EINPROGRESS: 26, EALREADY: 7, ECONNREFUSED: 14, ECONNRESET: 15, ECONNABORTED: 13, EADDRINUSE: 3, EADDRNOTAVAIL: 4,
         ENOTSOCK: 57, EAFNOSUPPORT: 5, EPROTONOSUPPORT: 66, ESOCKTNOSUPPORT: 66, EOPNOTSUPP: 138, ENOTSUP: 58, EHOSTUNREACH: 23, ENETUNREACH: 40, ENETDOWN: 39,
         ETIMEDOUT: 73, EISCONN: 30, ENOTCONN: 53, EMSGSIZE: 35, ENOBUFS: 42, EDESTADDRREQ: 17, ENOPROTOOPT: 50, EINTR: 27, ENODEV: 43, ENXIO: 60,
-        ESRCH: 71, ELOOP: 32, ENOSYS: 52, ESHUTDOWN: 15, EFAULT: 21, EIO: 29,
+        ESRCH: 71, ELOOP: 32, E2BIG: 1, ENOSYS: 52, ESHUTDOWN: 15, EFAULT: 21, EIO: 29,
       };
       return map[name] || 29; // default EIO
     },
@@ -895,14 +895,36 @@ addToLibrary({
   // down. Writes the path into buf; returns 0 or -errno.
   js_exec_resolve__deps: ['$PKSYS'],
   js_exec_resolve__proxy: 'none',
-  js_exec_resolve: function (prog, buf, buflen) {
+  js_exec_resolve: function (prog, argv, envp, buf, buflen) {
+    // execve(2) through the kernel's binfmt. Returns the number of argv strings
+    // packed into buf (the image path first, all NUL-separated) for an in-place
+    // load of the final ELF; PK_EXEC_HANDOFF when the kernel took the process
+    // over (a JS image: this pthread must end without an exit notification);
+    // or -errno.
     try {
-      var resolved = ksys('execresolve', [PKSYS.cstr(prog)]);
-      var bytes = PKSYS.enc().encode(String(resolved));
-      if (bytes.length + 1 > buflen) return -36; // ENAMETOOLONG (WASI)
-      HEAPU8.set(bytes, buf);
-      HEAPU8[buf + bytes.length] = 0;
-      return 0;
+      var args = [];
+      var env = {};
+      var i;
+      var p;
+      for (i = 0; (p = HEAPU32[(argv >> 2) + i]); i++) args.push(UTF8ToString(p));
+      for (i = 0; (p = HEAPU32[(envp >> 2) + i]); i++) {
+        var kv = UTF8ToString(p);
+        var eq = kv.indexOf('=');
+        if (eq > 0) env[kv.slice(0, eq)] = kv.slice(eq + 1);
+      }
+      var r = ksys('execresolve', [PKSYS.cstr(prog), args, env]);
+      if (r && r.handoff) return -1000; // PK_EXEC_HANDOFF
+      var parts = [String(r.path)].concat(r.argv || []);
+      var pos = 0;
+      var enc = PKSYS.enc();
+      for (i = 0; i < parts.length; i++) {
+        var bytes = enc.encode(parts[i]);
+        if (pos + bytes.length + 1 > buflen) return PKSYS.errS(new Error('E2BIG: Argument list too long'));
+        HEAPU8.set(bytes, buf + pos);
+        pos += bytes.length;
+        HEAPU8[buf + pos++] = 0;
+      }
+      return parts.length - 1;
     } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
   js_vfork_exec__proxy: 'none',
