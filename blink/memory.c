@@ -294,6 +294,9 @@ TryAgain:
   }
   m->tlb[tlbkey].page = page;
   m->tlb[tlbkey].entry = entry;
+  // pk910: the only TLB fill site in the tree; the only invalidation site is
+  // ResetTlb's memset, which zeroes this along with entry. See MachineTlb.
+  m->tlb[tlbkey].host = (entry & PAGE_HOST) ? FindHostPage(entry) : 0;
   return entry;
 MapError:
   m->segvcode = SEGV_MAPERR_LINUX;
@@ -341,6 +344,15 @@ bool CowMaybeSplit(struct Machine *m, i64 virt) {
     StorePte(pslot, (newpage & (PAGE_TA | PAGE_HOST)) |
                         (entry & ~(PAGE_TA | PAGE_HOST | PAGE_COW)) | PAGE_RW);
     DecHostPageRef(entry);  // this system dropped the shared original
+    // pk910: the PTE now names a DIFFERENT host page, and every other thread of
+    // this system shares the page table but has its own m->tlb. a sibling that
+    // cached the old entry would keep reading the pre-split copy and never see
+    // our writes, so the whole system has to drop its tlbs, not just us. only
+    // this arm needs it: the sole-owner arm leaves the host page alone and only
+    // adds PAGE_RW, and a stale entry without PAGE_RW just misses on a write.
+    InvalidateSystem(m->system, true, false);
+    --g_cowpages;
+    return true;
   }
   --g_cowpages;
   atomic_store_explicit(&m->invalidated, true, memory_order_relaxed);
