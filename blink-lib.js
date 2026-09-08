@@ -918,7 +918,18 @@ addToLibrary({
   js_hello__deps: ['$PKSYS'],
   js_hello__proxy: 'none',
   js_hello: function (pid, kind) {
-    try { ksys('hello', [pid | 0, kind | 0]); return 0; } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+    try {
+      // A fork child is a new process and needs its own pending-signal word:
+      // sharing the founder's meant an alarm or a SIGCHLD raised for one
+      // process was read by every process in the heap group. This thread mints
+      // it and hands it over here, because a SharedArrayBuffer cannot come back
+      // through the synchronous channel. A thread of a process that already has
+      // one keeps reading that one (kind 1).
+      var sab = kind === 0 && typeof SharedArrayBuffer !== 'undefined' ? new SharedArrayBuffer(4) : null;
+      ksys('hello', [pid | 0, kind | 0, sab]);
+      if (sab && typeof globalThis.__pkSetSigSab === 'function') globalThis.__pkSetSigSab(sab);
+      return 0;
+    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
   // exit_group on a shared runtime: fire-and-forget the exit to the kernel (no
   // wait - this pthread is about to end and reclaim its pool worker). The kernel
