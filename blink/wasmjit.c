@@ -52,6 +52,7 @@ void OpMovEvqpGvqp(P);  // mov Ev,Gv (#1 hottest; reg-reg when mod==3)
 void OpMovGvqpEvqp(P);  // mov Gv,Ev
 void OpMovZvqpIvqp(P);  // mov Zv,imm
 void OpJcc(P);          // conditional jump (self-loop terminator detection)
+void OpJmp(P);          // direct unconditional jump (region CFG discovery)
 void OpLeaGvqpM(P);     // lea Gv,M (gcc emits it as arithmetic; no flags)
 void OpBsuwiImm(P);    // shift/rotate rm, imm (kBsu leaf)
 void OpBsuwiCl(P);     // shift/rotate rm, cl
@@ -230,6 +231,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define FL  24   // cached m->flags (i32)
 #define HP0 25   // i32 scratch: tlb slot / host pointer (memory fast path)
 #define HP1 26   // i32 scratch: offset within page
+#define TG  27   // i32: region block-dispatch target (br_table index)
 #define OFF_TLB   ((u32)offsetof(struct Machine, tlb))
 #define OFF_INVAL ((u32)offsetof(struct Machine, invalidated))
 
@@ -262,7 +264,21 @@ struct Rc {
   u8 dirty[16];
   u8 fl_loaded;  // m->flags cached in local FL
   u8 fl_dirty;
+  // pk910 region JIT: sticky masks over a whole emission (never cleared by
+  // RcInval). `touched` = every GPR the emitted code keeps in a local, so the
+  // region preamble knows what to hoist; `wrote` = every GPR it assigns, so the
+  // postamble only stores those back.
+  u16 touched;
+  u16 wrote;
 };
+static void RcMark(struct Rc *rc, int r) {
+  rc->loaded[r] = 1;
+  rc->touched |= (u16)(1u << r);
+}
+static void RcDirty(struct Rc *rc, int r) {
+  rc->dirty[r] = 1;
+  rc->wrote |= (u16)(1u << r);
+}
 static void FlagsEnsure(struct Buf *b, struct Rc *rc) {
   if (rc->fl_loaded) return;
   EGet(b, 0);
@@ -278,11 +294,12 @@ static void FlagsSpill(struct Buf *b, struct Rc *rc) {  // FL local -> m->flags
   rc->fl_dirty = 0;
 }
 static void RcLoad(struct Buf *b, struct Rc *rc, int r) {  // ensure GPR r in local
+  rc->touched |= (u16)(1u << r);
   if (rc->loaded[r]) return;
   EGet(b, 0);                        // m
   ELoad(b, OFF_WEG + (u32)r * 8);    // i64.load weg[r]
   ESet(b, LOC_GPR + r);
-  rc->loaded[r] = 1;
+  RcMark(rc, r);
 }
 static void RcSpill(struct Buf *b, struct Rc *rc) {  // dirty locals -> memory
   for (int r = 0; r < 16; ++r) {
@@ -379,8 +396,8 @@ static void EmitAlu(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
   bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 table0 -> i64
   if (wb) {
     ESet(b, LOC_GPR + dst);
-    rc->loaded[dst] = 1;
-    rc->dirty[dst] = 1;
+    RcMark(rc, dst);
+    RcDirty(rc, dst);
   } else {
     bput(b, 0x1a);  // drop (cmp/test: flags only)
   }
@@ -405,8 +422,8 @@ static void EmitBsu(struct Buf *b, struct Rc *rc, int op, int log2, int dst,
   bput(b, 0x41); bleb_s(b, (i64)(i32)fidx);   // i32.const kBsu fn idx
   bput(b, 0x11); bleb_u(b, 1); bput(b, 0x00);  // call_indirect t1 table0 -> i64
   ESet(b, LOC_GPR + dst);       // 32-bit leaf returns zero-extended, so full store ok
-  rc->loaded[dst] = 1;
-  rc->dirty[dst] = 1;
+  RcMark(rc, dst);
+  RcDirty(rc, dst);
   rc->fl_loaded = 0;            // kBsu wrote m->flags; FL cache stale
 }
 
@@ -450,8 +467,8 @@ static void EmitBsuInline(struct Buf *b, struct Rc *rc, int op, int log2,
   }
   if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }  // 32-bit zero-extend
   ESet(b, LOC_GPR + dst);
-  rc->loaded[dst] = 1;
-  rc->dirty[dst] = 1;
+  RcMark(rc, dst);
+  RcDirty(rc, dst);
 }
 
 // Decide if this insn is an inlinable register-direct 32/64-bit shift/rotate.
@@ -506,8 +523,8 @@ static void EmitImul(struct Buf *b, struct Rc *rc, int dst, int areg, int breg,
     EBin(b, I64_MUL);
     if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
     ESet(b, LOC_GPR + dst);
-    rc->loaded[dst] = 1;
-    rc->dirty[dst] = 1;
+    RcMark(rc, dst);
+    RcDirty(rc, dst);
     return;
   }
   RcLoad(b, rc, areg);
@@ -529,8 +546,8 @@ static void EmitImul(struct Buf *b, struct Rc *rc, int dst, int areg, int breg,
   EGet(b, LT2);
   if (w32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }
   ESet(b, LOC_GPR + dst);
-  rc->loaded[dst] = 1;
-  rc->dirty[dst] = 1;
+  RcMark(rc, dst);
+  RcDirty(rc, dst);
   // FL = (FL & ~(CF|OF)) | of * 0x801
   EGet(b, FL); EConstI(b, ~0x801); EBin(b, I32_AND);
   if (w32) {
@@ -702,8 +719,8 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   if (wb) {
     EGet(b, LT2);
     ESet(b, LOC_GPR + dst);
-    rc->loaded[dst] = 1;
-    rc->dirty[dst] = 1;
+    RcMark(rc, dst);
+    RcDirty(rc, dst);
   }
 }
 
@@ -718,8 +735,8 @@ static void EmitMov(struct Buf *b, struct Rc *rc, int dst, int src, bool imm,
     if (log2 == 2) { EConst(b, 0xffffffff); bput(b, 0x83); }  // i64.and (zero-ext)
   }
   ESet(b, LOC_GPR + dst);
-  rc->loaded[dst] = 1;
-  rc->dirty[dst] = 1;
+  RcMark(rc, dst);
+  RcDirty(rc, dst);
 }
 
 // dst = disp + base + (index << scale), address-arithmetic only (no flags,
@@ -739,8 +756,8 @@ static void EmitLea(struct Buf *b, struct Rc *rc, int dst, int base, int index,
   if (legacy) { EConst(b, (i64)0xffffffff); EBin(b, I64_AND); }  // 32-bit addr
   if (log2 == 2) { EConst(b, (i64)0xffffffff); EBin(b, I64_AND); }  // 32-bit dst ze
   ESet(b, LOC_GPR + dst);
-  rc->loaded[dst] = 1;
-  rc->dirty[dst] = 1;
+  RcMark(rc, dst);
+  RcDirty(rc, dst);
 }
 
 // Decide if this insn is an inlinable lea with a 32/64-bit dst and non-16-bit
@@ -981,8 +998,8 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
     if (mergesh) { EConst(b, mergesh); EBin(b, I64_SHL); }
     EBin(b, I64_OR);
     ESet(b, LOC_GPR + dst);
-    rc->loaded[dst] = 1;
-    rc->dirty[dst] = 1;
+    RcMark(rc, dst);
+    RcDirty(rc, dst);
     EmitMemEnd(b, &pre, rc, rde, x->op.disp, x->op.uimm0, (u32)(uintptr_t)h,
                pc_next, oplen);
     return true;
@@ -992,8 +1009,8 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   if (kind == 0) {
     if (sx32) { EConst(b, 0xffffffff); EBin(b, I64_AND); }  // 32-bit dst ze
     ESet(b, LOC_GPR + dst);
-    rc->loaded[dst] = 1;
-    rc->dirty[dst] = 1;
+    RcMark(rc, dst);
+    RcDirty(rc, dst);
   } else {
     ESet(b, LT3);                 // memory operand value (addr no longer needed)
     int need = GetNeededFlags(m, pc_next, CF | ZF | SF | OF | AF | PF);
@@ -1207,8 +1224,8 @@ static void EWriteSub(struct Buf *b, struct Rc *rc, int r, int sh, int log2) {
     EBin(b, I64_OR);
     ESet(b, LOC_GPR + r);
   }
-  rc->loaded[r] = 1;
-  rc->dirty[r] = 1;
+  RcMark(rc, r);
+  RcDirty(rc, r);
 }
 
 // dst.sub = kAlu[t][log2](m, dst.sub, y) with byte/word merge writeback.
@@ -1765,11 +1782,479 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   return true;
 }
 
+// ── one instruction ─────────────────────────────────────────────────────────
+// Emit one decoded instruction. Returns true when it came out as pure inline
+// wasm (m->ip left stale, register cache still valid), false when it went
+// through the real Op handler (m->ip + m->oplen stored, cache invalidated - the
+// caller must resync). Shared by the linear block path and the region compiler,
+// so both get the identical opcode coverage.
+static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
+                        nexgen32e_f h, u64 rde,
+                        const struct XedDecodedInst *xedd, u64 pc, u32 oplen) {
+  int t = 0, log2 = 0, dst = 0, src = 0;
+  bool imm = false, wb = false;
+  u64 immv = 0;
+  int lbase = 0, lindex = 0, lscale = 0; i64 ldispv = 0;
+  bool lhb = false, lhi = false, lrip = false, lleg = false;
+  int iareg = 0, ibreg = 0;
+  if (AluDecode(h, rde, xedd->op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
+                &wb)) {
+    // pc is already past this insn; skip flag emission if all flags are dead.
+    int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
+    if (t == 2 || t == 3) EmitAlu(bb, rc, t, log2, dst, src, imm, immv, wb);
+    else EmitAluInline(bb, rc, t, log2, dst, src, imm, immv, wb, false, need);
+    return true;
+  }
+  if (AluAxDecode(h, rde, xedd->op.uimm0, &t, &log2, &immv)) {
+    // cmp/test al/ax/eax/rax, imm: flags only, any width
+    int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
+    EmitAluInline(bb, rc, t, log2, 0, 0, true, immv, false, false, need);
+    return true;
+  }
+  if (MovDecode(h, rde, xedd->op.uimm0, &dst, &src, &imm, &immv, &log2)) {
+    EmitMov(bb, rc, dst, src, imm, immv, log2);
+    return true;
+  }
+  if (LeaDecode(h, rde, xedd->op.disp, &dst, &lbase, &lindex, &lscale, &ldispv,
+                &lhb, &lhi, &lrip, &lleg, &log2)) {
+    EmitLea(bb, rc, dst, lbase, lindex, lscale, ldispv, lhb, lhi, lrip, lleg,
+            log2, pc);  // pc already past this insn = rip base
+    return true;
+  }
+  if (BsuDecode(h, rde, xedd->op.uimm0, &t, &log2, &dst, &imm, &immv)) {
+    // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
+    if (!GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF) &&
+        t != 2 && t != 3 && (log2 == 3 || t >= 4)) {
+      EmitBsuInline(bb, rc, t, log2, dst, imm, immv);
+    } else {
+      EmitBsu(bb, rc, t, log2, dst, imm, immv);  // t = BSU_* op index
+    }
+    return true;
+  }
+  if (ImulDecode(h, rde, xedd->op.uimm0, &dst, &iareg, &ibreg, &imm, &immv,
+                 &log2)) {
+    // exact CF/OF emitted only if a downstream reader needs them
+    EmitImul(bb, rc, dst, iareg, ibreg, imm, immv, log2,
+             GetNeededFlags(m, pc, CF | OF));
+    return true;
+  }
+  if (EmitBW(bb, rc, h, rde, xedd->op.uimm0)) {
+    // 8/16-bit reg ALU/mov, movzx/movsx, setcc, group3 test/not/neg,
+    // group5 inc/dec (any width)
+    return true;
+  }
+  if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
+      (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
+    // inc/dec reg via blink's own kAlu[INC/DEC](x, 0) - exact flag semantics
+    // (AF=0, CF preserved) that a hand-inlined add/sub-1 would get subtly wrong.
+    EmitAlu(bb, rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
+            (int)RexbRm(rde), 0, true, 0, true);
+    return true;
+  }
+  if (TryEmitMemRead(m, bb, rc, h, rde, xedd, pc, oplen)) {
+    return true;  // fast path leaves m->ip stale ($slow sets it itself)
+  }
+  if (TryEmitMemWrite(m, bb, rc, h, rde, xedd, pc, oplen)) {
+    return true;
+  }
+#ifdef PKJIT_FBPROF
+  { static int fbcnt[0x400], fbtot;
+    fbcnt[Mopcode(rde) & 0x3ff]++;
+    if (++fbtot % 500 == 0) {
+      fprintf(stderr, "FBPROF total=%d:", fbtot);
+      for (int z = 0; z < 0x400; ++z)
+        if (fbcnt[z] > 4) fprintf(stderr, " %03x=%d", z, fbcnt[z]);
+      fprintf(stderr, "\n");
+    } }
+#endif
+  RcSpill(bb, rc);                    // handler reads regs from memory
+  EGet(bb, 0); EConst(bb, (i64)pc); EStore(bb, OFF_IP);  // m->ip = pc
+  // m->oplen = this insn's length, so RestoreIp (m->ip -= m->oplen) rewinds
+  // correctly if the handler faults (matches JitlessDispatch, machine.c:2105).
+  EGet(bb, 0); EConstI(bb, (i32)oplen);
+  bput(bb, 0x3a); bleb_u(bb, 0); bleb_u(bb, OFF_OPLEN);  // i32.store8
+  EmitHandler(bb, rde, xedd->op.disp, xedd->op.uimm0, (u32)(uintptr_t)h);
+  EmitCommitStash(bb);                // drain page-crossing store stash
+  RcInval(rc);                        // handler may have changed regs
+  return false;
+}
+
+// ── region compiler ─────────────────────────────────────────────────────────
+// One wasm function per REGION, not per basic block: discover every block
+// reachable from the entry through DIRECT branches (jcc rel, jmp rel) and emit
+// them all into a single function whose control flow never leaves wasm. Forward
+// edges are a `br` out of a nested block, backward edges a `br` to the enclosing
+// `loop` (with a br_table dispatch only when some loop has more than one entry).
+// The register cache is hoisted to the whole region, so a hot loop keeps its
+// guest registers in wasm locals across iterations even when the body contains
+// memory operands, byte ops or internal branches - none of which the older
+// self-loop path could handle.
+//
+// CACHE INVARIANT on every edge and at every block entry: each r in `regs` lives
+// in local LOC_GPR+r and the LOCAL is authoritative (linear memory may be
+// stale); m->flags likewise lives in FL. A block that is not entered purely by
+// fallthrough therefore starts with all of `regs` marked dirty, so the first
+// handler spill writes them back; a block whose only predecessor is the
+// preceding block's fallthrough inherits that block's exact dirty set.
+#define PKJIT_RBLOCKS 24    // blocks per region
+#define PKJIT_RINSNS  384   // instructions per region
+#define PKJIT_RBINSNS 128   // instructions per block
+
+enum {
+  kTermJcc,   // conditional direct branch: tgt = taken, fall = not taken
+  kTermJmp,   // unconditional direct branch to tgt
+  kTermFall,  // ran into another block's first instruction at tgt
+  kTermExit,  // last insn is a handler-emitted branch/precious op (it sets ip)
+  kTermStop,  // gave up here; leave with m->ip = tgt
+};
+
+struct RBlock {
+  u64 start;
+  u64 end;    // address after the last instruction this block EMITS
+  u64 tgt;    // jcc taken / jmp / fall / stop target address
+  u64 fall;   // jcc not-taken address
+  int term;
+  int cc;     // jcc condition code
+  int s_tgt, s_fall;  // successor block indices, -1 = leaves the region
+  int pos;    // layout position, -1 = unreachable/not emitted
+  int preds;  // in-region predecessor edges
+};
+
+static int RFind(const struct RBlock *bs, int n, u64 a) {
+  int i;
+  for (i = 0; i < n; ++i) {
+    if (bs[i].start == a) return i;
+  }
+  return -1;
+}
+
+// Walk the CFG from `ip` over direct branches. Blocks are re-walked until the
+// leader set stops growing, which is what splits a block that a later-found
+// branch target lands inside of. Returns the block count (>= 1).
+static int RDiscover(struct Machine *m, u64 ip, struct RBlock *bs) {
+  int n = 1, pass, i, k;
+  struct XedDecodedInst x;
+  bs[0].start = ip;
+  for (pass = 0; pass < 6; ++pass) {
+    int added = 0, total = 0;
+    for (i = 0; i < n; ++i) {
+      struct RBlock *b = &bs[i];
+      u64 pc = b->start;
+      b->term = kTermStop;
+      b->tgt = pc;
+      b->end = pc;
+      b->fall = pc;
+      b->cc = 0;
+      for (k = 0; k < PKJIT_RBINSNS; ++k) {
+        u64 rde, pcn;
+        u32 ol;
+        nexgen32e_f h;
+        if (k && RFind(bs, n, pc) >= 0) {  // ran into another leader
+          b->term = kTermFall;
+          b->tgt = pc;
+          b->end = pc;
+          break;
+        }
+        if (total >= PKJIT_RINSNS) {
+          b->term = kTermStop; b->tgt = pc; b->end = pc; break;
+        }
+        if (GetInstruction(m, pc, &x)) {
+          b->term = kTermStop; b->tgt = pc; b->end = pc; break;
+        }
+        rde = x.op.rde;
+        ol = Oplength(rde);
+        if (!ol) { b->term = kTermStop; b->tgt = pc; b->end = pc; break; }
+        h = GetOp(Mopcode(rde));
+        pcn = pc + ol;
+        if (h == OpJcc) {
+          int c = (int)(Opcode(rde) & 15);
+          if (c == 0xa || c == 0xb) {  // JP/JNP: lazy parity, handler + leave
+            b->term = kTermExit;
+            b->tgt = pcn;
+            b->end = pcn;
+            break;
+          }
+          b->term = kTermJcc;
+          b->cc = c;
+          b->tgt = pcn + (u64)x.op.disp;
+          b->fall = pcn;
+          b->end = pc;   // the jcc itself is replaced by wasm control flow
+          break;
+        }
+        if (h == OpJmp) {
+          b->term = kTermJmp;
+          b->tgt = pcn + (u64)x.op.disp;
+          b->end = pc;   // ditto
+          break;
+        }
+        if (ClassifyOp(rde) != kOpNormal) {  // call/ret/indirect/precious
+          b->term = kTermExit;
+          b->tgt = pcn;
+          b->end = pcn;  // the op is emitted through its handler; it sets m->ip
+          break;
+        }
+        ++total;
+        pc = pcn;
+      }
+      if (k == PKJIT_RBINSNS) { b->term = kTermStop; b->tgt = pc; b->end = pc; }
+      // register this block's in-region successors as leaders
+      if (b->term == kTermJcc || b->term == kTermJmp || b->term == kTermFall) {
+        u64 t2[2];
+        int nt = 1, j;
+        t2[0] = b->tgt;
+        if (b->term == kTermJcc) { t2[1] = b->fall; nt = 2; }
+        for (j = 0; j < nt; ++j) {
+          if (RFind(bs, n, t2[j]) >= 0) continue;
+          if (n >= PKJIT_RBLOCKS) continue;
+          memset(&bs[n], 0, sizeof(bs[n]));
+          bs[n].start = t2[j];
+          ++n;
+          added = 1;
+        }
+      }
+    }
+    if (!added) break;
+  }
+  for (i = 0; i < n; ++i) {
+    bs[i].pos = -1;
+    bs[i].preds = 0;
+    bs[i].s_tgt = -1;
+    bs[i].s_fall = -1;
+    if (bs[i].term == kTermJcc) {
+      bs[i].s_tgt = RFind(bs, n, bs[i].tgt);
+      bs[i].s_fall = RFind(bs, n, bs[i].fall);
+    } else if (bs[i].term == kTermJmp || bs[i].term == kTermFall) {
+      bs[i].s_tgt = RFind(bs, n, bs[i].tgt);
+    }
+  }
+  return n;
+}
+
+// Depth-first layout, fallthrough successor first, so the not-taken edge of a
+// jcc and the target of a jmp cost nothing.
+static void RLayout(struct RBlock *bs, int b, int *order, int *cnt) {
+  if (b < 0 || bs[b].pos >= 0) return;
+  bs[b].pos = *cnt;
+  order[(*cnt)++] = b;
+  if (bs[b].term == kTermJcc) {
+    RLayout(bs, bs[b].s_fall, order, cnt);
+    RLayout(bs, bs[b].s_tgt, order, cnt);
+  } else if (bs[b].term == kTermJmp || bs[b].term == kTermFall) {
+    RLayout(bs, bs[b].s_tgt, order, cnt);
+  }
+}
+
+// Restore the block-entry cache invariant (see above) without emitting code.
+static void RcEnterBlock(struct Rc *rc, u16 regs) {
+  int r;
+  for (r = 0; r < 16; ++r) {
+    rc->loaded[r] = (regs >> r) & 1;
+    rc->dirty[r] = (regs >> r) & 1;
+  }
+  rc->fl_loaded = 1;
+  rc->fl_dirty = 1;
+}
+
+// Re-establish the invariant after a handler call invalidated the cache.
+static void RegionSync(struct Buf *b, struct Rc *rc, u16 regs) {
+  int r;
+  for (r = 0; r < 16; ++r) {
+    if (regs & (1u << r)) RcLoad(b, rc, r);
+  }
+  FlagsEnsure(b, rc);
+}
+
+// Emit the control transfer from the block at layout position `i` to successor
+// `s` (block index, -1 = leaves the region at address `addr`). `extra` is the
+// extra wasm nesting depth at the emission point (1 inside an `if`).
+static void EmitGoto(struct Buf *b, struct RBlock *bs, int s, u64 addr, int i,
+                     int nl, int extra, int usetbl) {
+  int p = (s >= 0) ? bs[s].pos : -1;
+  if (p < 0) {  // leaves the region
+    EGet(b, 0); EConst(b, (i64)addr); EStore(b, OFF_IP);
+    bput(b, 0x0c); bleb_u(b, (u64)(nl - i + extra));      // br $EXIT
+    return;
+  }
+  if (p == i + 1 && !extra) return;                       // natural fallthrough
+  if (p > i) {                                            // forward: direct br
+    bput(b, 0x0c); bleb_u(b, (u64)(p - i - 1 + extra));   // br $B_p
+    return;
+  }
+  if (usetbl) {  // backward into a multi-entry loop: go through the dispatch
+    EGet(b, 0); EConst(b, (i64)bs[s].start); EStore(b, OFF_IP);
+    EConstI(b, p); ESet(b, TG);
+  }
+  bput(b, 0x0c); bleb_u(b, (u64)(nl - 1 - i + extra));    // br $L
+}
+
+// One emission pass over the laid-out region. `regs` is the set of GPRs hoisted
+// into locals for the whole region; pass 0 to run the discovery pass that
+// computes it (rc->touched), then re-run with the result.
+static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
+                           struct RBlock *bs, const int *order, int nl,
+                           u16 regs, int usetbl, int hasback, u64 ip) {
+  struct XedDecodedInst x;
+  int i, r;
+  bool inherit = false;
+  RcInval(rc);
+  // preamble: hoist the region's registers and flags into locals
+  for (r = 0; r < 16; ++r) {
+    if (regs & (1u << r)) RcLoad(b, rc, r);
+  }
+  FlagsEnsure(b, rc);
+  if (usetbl) { EConstI(b, 0); ESet(b, TG); }
+  bput(b, 0x02); bput(b, 0x40);   // block $EXIT
+  bput(b, 0x03); bput(b, 0x40);   // loop $L
+  if (hasback) {  // let signals through: leave when the machine wants attention
+    EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_ATT);  // i32.load8_u
+    bput(b, 0x04); bput(b, 0x40);                                 // if
+    if (!usetbl) { EGet(b, 0); EConst(b, (i64)ip); EStore(b, OFF_IP); }
+    bput(b, 0x0c); bleb_u(b, 2);                                  // br $EXIT
+    bput(b, 0x0b);                                                // end if
+  }
+  if (usetbl) {  // block $B{nl-1} .. block $B0 { br_table } end $B0
+    for (i = nl - 1; i >= 0; --i) { bput(b, 0x02); bput(b, 0x40); }
+    EGet(b, TG);
+    bput(b, 0x0e); bleb_u(b, (u64)nl);          // br_table, nl targets + default
+    for (i = 0; i < nl; ++i) bleb_u(b, (u64)i);
+    bleb_u(b, 0);                               // default -> block 0
+    bput(b, 0x0b);                              // end $B0
+  } else {
+    for (i = nl - 1; i >= 1; --i) { bput(b, 0x02); bput(b, 0x40); }
+  }
+  for (i = 0; i < nl; ++i) {
+    struct RBlock *bl = &bs[order[i]];
+    u64 pc = bl->start;
+    if (i) {
+      bput(b, 0x0b);  // end $B_i - control now joins here
+      if (!inherit) RcEnterBlock(rc, regs);
+    } else {
+      RcEnterBlock(rc, regs);
+      if (bl->preds <= 1) {  // no back edge: the preamble just loaded them
+        for (r = 0; r < 16; ++r) rc->dirty[r] = 0;
+        rc->fl_dirty = 0;
+      }
+    }
+    while (pc < bl->end) {
+      u64 rde;
+      u32 ol;
+      nexgen32e_f h;
+      if (GetInstruction(m, pc, &x)) return false;
+      rde = x.op.rde;
+      ol = Oplength(rde);
+      if (!ol) return false;
+      h = GetOp(Mopcode(rde));
+      if (!EmitOneInsn(m, b, rc, h, rde, &x, pc + ol, ol)) {
+        RegionSync(b, rc, regs);
+      }
+      pc += ol;
+      if (b->ovf) return false;
+    }
+    // terminator
+    switch (bl->term) {
+      case kTermJcc:
+        RegionSync(b, rc, regs);
+        EmitCond(b, bl->cc);
+        bput(b, 0x04); bput(b, 0x40);  // if (taken)
+        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 1, usetbl);
+        bput(b, 0x0b);                 // end if
+        EmitGoto(b, bs, bl->s_fall, bl->fall, i, nl, 0, usetbl);
+        if (bl->s_fall >= 0 && bs[bl->s_fall].pos == i + 1 &&
+            bs[bl->s_fall].preds == 1) {
+          inherit = true;
+        } else {
+          inherit = false;
+        }
+        break;
+      case kTermJmp:
+      case kTermFall:
+        RegionSync(b, rc, regs);
+        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 0, usetbl);
+        inherit = (bl->s_tgt >= 0 && bs[bl->s_tgt].pos == i + 1 &&
+                   bs[bl->s_tgt].preds == 1);
+        break;
+      case kTermExit:
+        // the last instruction was a handler-emitted branch: it set m->ip
+        RegionSync(b, rc, regs);
+        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        inherit = false;
+        break;
+      default:  // kTermStop
+        RegionSync(b, rc, regs);
+        EGet(b, 0); EConst(b, (i64)bl->tgt); EStore(b, OFF_IP);
+        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        inherit = false;
+        break;
+    }
+    if (b->ovf) return false;
+  }
+  bput(b, 0x0b);   // end $L
+  bput(b, 0x0b);   // end $EXIT
+  // postamble: every register the region assigned goes back to the Machine
+  for (r = 0; r < 16; ++r) {
+    if (!(rc->wrote & (1u << r))) continue;
+    EGet(b, 0); EGet(b, LOC_GPR + r); EStore(b, OFF_WEG + (u32)r * 8);
+  }
+  EGet(b, 0); EGet(b, FL);
+  bput(b, 0x36); bleb_u(b, 2); bleb_u(b, OFF_FLAGS);  // i32.store m->flags
+  return !b->ovf;
+}
+
+static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
+                       u64 *lastpc) {
+  struct RBlock bs[PKJIT_RBLOCKS];
+  int order[PKJIT_RBLOCKS];
+  int n, nl = 0, i, usetbl = 0, hasback = 0;
+  u64 lo = ip, hi = ip;
+  u16 regs;
+  struct Rc probe;
+  struct Buf pb;
+  n = RDiscover(m, ip, bs);
+  if (n < 1) return false;
+  RLayout(bs, 0, order, &nl);
+  if (nl < 1) return false;
+  for (i = 0; i < nl; ++i) {  // predecessor counts + loop shape
+    struct RBlock *bl = &bs[order[i]];
+    int s[2], k, ns = 0;
+    if (bl->term == kTermJcc) { s[ns++] = bl->s_tgt; s[ns++] = bl->s_fall; }
+    else if (bl->term == kTermJmp || bl->term == kTermFall) s[ns++] = bl->s_tgt;
+    for (k = 0; k < ns; ++k) {
+      if (s[k] < 0 || bs[s[k]].pos < 0) continue;
+      ++bs[s[k]].preds;
+      if (bs[s[k]].pos <= i) {
+        hasback = 1;
+        if (bs[s[k]].pos != 0) usetbl = 1;
+      }
+    }
+    if (bl->start < lo) lo = bl->start;
+    if (bl->end > hi) hi = bl->end;
+  }
+  bs[0].preds++;  // the region entry is reached from outside
+  // pass 1 discovers which GPRs the region actually keeps in locals
+  memset(&probe, 0, sizeof(probe));
+  pb = *bb;
+  if (!EmitRegionPass(m, &pb, &probe, bs, order, nl, 0, usetbl, hasback, ip)) {
+    return false;
+  }
+  regs = probe.touched;
+  bb->n = 0;
+  bb->ovf = 0;
+  memset(rc, 0, sizeof(*rc));
+  if (!EmitRegionPass(m, bb, rc, bs, order, nl, regs, usetbl, hasback, ip)) {
+    return false;
+  }
+  *lastpc = hi;
+  (void)lo;
+  return true;
+}
+
 static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) {
   if (!t_scratch && !(t_scratch = (u8 *)malloc(PKJIT_SCRATCH))) return false;
   struct Buf bb = {t_scratch, 0, PKJIT_SCRATCH, 0};
   struct Rc rc;
   RcInval(&rc);
+  rc.touched = 0;
+  rc.wrote = 0;
   t_wasloop = 0;
   struct XedDecodedInst xedd;
   u64 pc = ip;
@@ -1788,6 +2273,24 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
 #else
   (void)EmitSelfLoop;
 #endif
+#ifndef PKJIT_NO_REGION
+  // REGION: everything reachable from ip through direct branches, in ONE wasm
+  // function. Subsumes the linear block below whenever it succeeds.
+  {
+    u64 hi = ip;
+    bb.n = 0;
+    if (EmitRegion(m, ip, &bb, &rc, &hi)) {
+      pc = hi;
+      t_wasloop = 2;
+      goto assemble;
+    }
+    bb.n = 0;
+    bb.ovf = 0;
+    RcInval(&rc);
+    rc.touched = 0;
+    rc.wrote = 0;
+  }
+#endif
   for (; count < PKJIT_MAXINSN; ++count) {
     if (GetInstruction(m, pc, &xedd)) break;
     u64 rde = xedd.op.rde;
@@ -1795,83 +2298,9 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     if (!oplen) break;
     nexgen32e_f h = GetOp(Mopcode(rde));
     pc += oplen;
-    int t = 0, log2 = 0, dst = 0, src = 0;
-    bool imm = false, wb = false;
-    u64 immv = 0;
-    int lbase = 0, lindex = 0, lscale = 0; i64 ldispv = 0;
-    bool lhb = false, lhi = false, lrip = false, lleg = false;
-    int iareg = 0, ibreg = 0;
-    if (AluDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &src, &imm, &immv,
-                  &wb)) {
-      // pc is already past this insn; skip flag emission if all flags are dead.
-      int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
-      if (t == 2 || t == 3) EmitAlu(&bb, &rc, t, log2, dst, src, imm, immv, wb);
-      else EmitAluInline(&bb, &rc, t, log2, dst, src, imm, immv, wb, false, need);
+    if (EmitOneInsn(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
       ip_dirty = true;  // inline op: m->ip not updated
-    } else if (AluAxDecode(h, rde, xedd.op.uimm0, &t, &log2, &immv)) {
-      // cmp/test al/ax/eax/rax, imm: flags only, any width
-      int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
-      EmitAluInline(&bb, &rc, t, log2, 0, 0, true, immv, false, false, need);
-      ip_dirty = true;
-    } else if (MovDecode(h, rde, xedd.op.uimm0, &dst, &src, &imm, &immv,
-                         &log2)) {
-      EmitMov(&bb, &rc, dst, src, imm, immv, log2);
-      ip_dirty = true;
-    } else if (LeaDecode(h, rde, xedd.op.disp, &dst, &lbase, &lindex, &lscale,
-                         &ldispv, &lhb, &lhi, &lrip, &lleg, &log2)) {
-      EmitLea(&bb, &rc, dst, lbase, lindex, lscale, ldispv, lhb, lhi, lrip, lleg,
-              log2, pc);  // pc already advanced past this insn = rip base
-      ip_dirty = true;
-    } else if (BsuDecode(h, rde, xedd.op.uimm0, &t, &log2, &dst, &imm, &immv)) {
-      // flags dead + not rcl/rcr + not 32-bit rot -> pure wasm op, no call
-      if (!GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF) &&
-          t != 2 && t != 3 && (log2 == 3 || t >= 4)) {
-        EmitBsuInline(&bb, &rc, t, log2, dst, imm, immv);
-      } else {
-        EmitBsu(&bb, &rc, t, log2, dst, imm, immv);  // t = BSU_* op index
-      }
-      ip_dirty = true;
-    } else if (ImulDecode(h, rde, xedd.op.uimm0, &dst, &iareg, &ibreg, &imm,
-                          &immv, &log2)) {
-      // exact CF/OF emitted only if a downstream reader needs them
-      EmitImul(&bb, &rc, dst, iareg, ibreg, imm, immv, log2,
-               GetNeededFlags(m, pc, CF | OF));
-      ip_dirty = true;
-    } else if (EmitBW(&bb, &rc, h, rde, xedd.op.uimm0)) {
-      // 8/16-bit reg ALU/mov, movzx/movsx, setcc, group3 test/not/neg,
-      // group5 inc/dec (any width)
-      ip_dirty = true;
-    } else if ((h == OpIncEvqp || h == OpDecEvqp) && IsModrmRegister(rde) &&
-               (RegLog2(rde) == 2 || RegLog2(rde) == 3)) {
-      // inc/dec reg via blink's own kAlu[INC/DEC](x, 0) - exact flag semantics
-      // (AF=0, CF preserved) that a hand-inlined add/sub-1 would get subtly wrong.
-      EmitAlu(&bb, &rc, h == OpIncEvqp ? 10 : 11, (int)RegLog2(rde),
-              (int)RexbRm(rde), 0, true, 0, true);
-      ip_dirty = true;
-    } else if (TryEmitMemRead(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
-      ip_dirty = true;  // fast path leaves m->ip stale ($slow sets it itself)
-    } else if (TryEmitMemWrite(m, &bb, &rc, h, rde, &xedd, pc, oplen)) {
-      ip_dirty = true;
     } else {
-#ifdef PKJIT_FBPROF
-      { static int fbcnt[0x400], fbtot;
-        fbcnt[Mopcode(rde) & 0x3ff]++;
-        if (++fbtot % 500 == 0) {
-          fprintf(stderr, "FBPROF total=%d:", fbtot);
-          for (int z = 0; z < 0x400; ++z)
-            if (fbcnt[z] > 4) fprintf(stderr, " %03x=%d", z, fbcnt[z]);
-          fprintf(stderr, "\n");
-        } }
-#endif
-      RcSpill(&bb, &rc);                    // handler reads regs from memory
-      EGet(&bb, 0); EConst(&bb, (i64)pc); EStore(&bb, OFF_IP);  // m->ip = pc
-      // m->oplen = this insn's length, so RestoreIp (m->ip -= m->oplen) rewinds
-      // correctly if the handler faults (matches JitlessDispatch, machine.c:2105).
-      EGet(&bb, 0); EConstI(&bb, (i32)oplen);
-      bput(&bb, 0x3a); bleb_u(&bb, 0); bleb_u(&bb, OFF_OPLEN);  // i32.store8
-      EmitHandler(&bb, rde, xedd.op.disp, xedd.op.uimm0, (u32)(uintptr_t)h);
-      EmitCommitStash(&bb);                 // drain page-crossing store stash
-      RcInval(&rc);                         // handler may have changed regs
       ip_dirty = false;
       if (ClassifyOp(rde) != kOpNormal) {   // branch/precious ends the block
         terminated = true;
@@ -1889,7 +2318,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
 
 assemble:
   if (bb.ovf) return false;
-  u32 body_len = 5 + bb.n + 1;  // locals(02 14 7e 01 7f) + instrs + end
+  u32 body_len = 5 + bb.n + 1;  // locals(02 14 7e 04 7f) + instrs + end
   u32 content_len = 1 + leb_u_size(body_len) + body_len;
   u32 total = (u32)sizeof(kPrefix) + 1 + leb_u_size(content_len) + content_len;
   u8 *mem = (u8 *)malloc(total);
@@ -1901,7 +2330,7 @@ assemble:
   bleb_u(&mb, 1);         // 1 function body
   bleb_u(&mb, body_len);
   bput(&mb, 0x02); bput(&mb, 0x14); bput(&mb, 0x7e);  // 20 i64 (16 GPR + LT0..3)
-  bput(&mb, 0x03); bput(&mb, 0x7f);                   // 3 i32 (FL, HP0, HP1)
+  bput(&mb, 0x04); bput(&mb, 0x7f);                   // 4 i32 (FL, HP0, HP1, TG)
   bputs(&mb, bb.p, bb.n);
   bput(&mb, 0x0b);        // end
   if (mb.ovf) { free(mem); return false; }

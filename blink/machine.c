@@ -905,7 +905,7 @@ void Terminate(P, void uop(struct Machine *, u64)) {
   }
 }
 
-static void OpJmp(P) {
+void OpJmp(P) {  // pk910: extern for wasmjit region CFG discovery
   m->ip += disp;
   Terminate(A, FastJmp);
 }
