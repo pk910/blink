@@ -157,7 +157,13 @@ addToLibrary({
       HEAP64[(buf + 40) >> 3] = secs; HEAPU32[(buf + 48) >> 2] = 0; // atime
       HEAP64[(buf + 56) >> 3] = secs; HEAPU32[(buf + 64) >> 2] = 0; // mtime
       HEAP64[(buf + 72) >> 3] = secs; HEAPU32[(buf + 80) >> 2] = 0; // ctime
-      HEAP64[(buf + 88) >> 3] = 1n; // ino
+      // ino: glibc's ld.so keys "is this object already loaded?" on (dev, ino),
+      // so a constant inode makes every dlopen return the first loaded link map.
+      // Hash the path (FNV-1a) for a stable, distinct inode per file.
+      var q = (st && st.path) || '';
+      var hh = 2166136261 >>> 0;
+      for (var qi = 0; qi < q.length; qi++) { hh ^= q.charCodeAt(qi); hh = Math.imul(hh, 16777619) >>> 0; }
+      HEAP64[(buf + 88) >> 3] = BigInt(hh || 1); // ino
       return 0;
     },
     statfs: function (buf) {
@@ -585,7 +591,7 @@ addToLibrary({
   __syscall_getdents64: function (fd, dirp, count) { try { return PKSYS.getdents(fd, dirp, count); } catch (e) { return PKSYS.errS(e); } },
   __syscall_mkdirat__deps: ['$PKSYS'],
   __syscall_mkdirat__proxy: 'none',
-  __syscall_mkdirat: function (dirfd, path) { try { ksys('mkdir', [PKSYS.atPath(dirfd, path)]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_mkdirat: function (dirfd, path, mode) { try { ksys('mkdir', [PKSYS.atPath(dirfd, path), mode]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_unlinkat__deps: ['$PKSYS'],
   __syscall_unlinkat__proxy: 'none',
   __syscall_unlinkat: function (dirfd, path, flags) { try { ksys('unlink', [PKSYS.atPath(dirfd, path), (flags & 512) !== 0]); return 0; } catch (e) { return PKSYS.errS(e); } },
@@ -779,6 +785,34 @@ addToLibrary({
   js_fork_snapshot_done__proxy: 'none',
   js_fork_snapshot_done: function () { globalThis.__pkForkSnapshot = null; },
 
+  // ── shared-memory fork: the child is a pthread of this runtime ──
+  // js_forkchild asks the kernel to allocate the child pid and clone the fd
+  // table (no snapshot); js_hello binds this pthread's own kernel channel to a
+  // pid (kind 0 = fork child / new process, 1 = a thread of an existing pid).
+  js_forkchild__deps: ['$PKSYS'],
+  js_forkchild__proxy: 'none',
+  js_forkchild: function () {
+    try {
+      var pid = ksys('forkchild', []) | 0;
+      // track it on THIS (the parent) thread's bridge so wait4 reaps it via the
+      // kernel (SysWait4 -> js_vfork_wait -> vwait looks in vforkKids)
+      if (pid > 0 && typeof __pkx !== 'undefined' && __pkx.trackChild) __pkx.trackChild(pid);
+      return pid;
+    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+  },
+  js_hello__deps: ['$PKSYS'],
+  js_hello__proxy: 'none',
+  js_hello: function (pid, kind) {
+    try { ksys('hello', [pid | 0, kind | 0]); return 0; } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+  },
+  // exit_group on a shared runtime: fire-and-forget the exit to the kernel (no
+  // wait - this pthread is about to end and reclaim its pool worker). The kernel
+  // reaps the process and wakes the parent's wait().
+  js_procexit__proxy: 'none',
+  js_procexit: function (code) {
+    try { if (typeof globalThis.__pkProcExitAsync === 'function') globalThis.__pkProcExitAsync(code | 0); } catch (e) { /* torn down */ }
+  },
+
   // ── vfork / pipe bridge: process-level fork+exec, wired in x86-runtime.js ──
   js_kernel_pipe__proxy: 'none',
   js_kernel_pipe: function (out) {
@@ -800,6 +834,23 @@ addToLibrary({
     for (i = 0; ; i++) { var p = HEAPU32[(argv >> 2) + i]; if (!p) break; args.push(UTF8ToString(p)); }
     for (i = 0; ; i++) { var q = HEAPU32[(envp >> 2) + i]; if (!q) break; var kv = UTF8ToString(q); var eq = kv.indexOf('='); if (eq > 0) env[kv.slice(0, eq)] = kv.slice(eq + 1); }
     return __pkx.exec(UTF8ToString(prog), args, env);
+  },
+  // in-place exec: ask the kernel to resolve the binary path (busybox multicall,
+  // /proc/self/exe) and do bookkeeping (name/exePath/suid); it returns the real
+  // VFS path, which blink then loads in place on this pthread with the guest's
+  // own argv. No worker swap, so a fork child does not tear the shared runtime
+  // down. Writes the path into buf; returns 0 or -errno.
+  js_exec_resolve__deps: ['$PKSYS'],
+  js_exec_resolve__proxy: 'none',
+  js_exec_resolve: function (prog, buf, buflen) {
+    try {
+      var resolved = ksys('execresolve', [PKSYS.cstr(prog)]);
+      var bytes = PKSYS.enc().encode(String(resolved));
+      if (bytes.length + 1 > buflen) return -36; // ENAMETOOLONG (WASI)
+      HEAPU8.set(bytes, buf);
+      HEAPU8[buf + bytes.length] = 0;
+      return 0;
+    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
   js_vfork_exec__proxy: 'none',
   js_vfork_exec: function (prog, argv, envp, f0, f1, f2) {
