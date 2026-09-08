@@ -614,12 +614,24 @@ static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
 }
 
 // i64 binop per ALU op index (0 add,1 or,4 and,5 sub,6 xor,7 cmp=sub).
+// 2/3 (adc/sbb) are two-step and handled by kind 3/4 below, not by this table.
 static const u8 kBin[8] = {I64_ADD, I64_OR, 0, 0, I64_AND, I64_SUB, I64_XOR,
                            I64_SUB};
 
 // Inline ALU: z = x OP y in wasm (no call), exact blink flags into the cached
-// flags local FL. Used for add/or/and/sub/xor/cmp/test (not adc/sbb). LT0=x,
-// LT1=y, LT2=z; operands masked to width so the 32/64-bit paths share formulas.
+// flags local FL. Covers add/or/and/sub/xor/cmp/test AND adc/sbb. LT0=x,
+// LT1=y, LT2=z (LT3=t, the carry-in intermediate, adc/sbb only); operands are
+// masked to width so the 32/64-bit paths share formulas.
+//
+// adc/sbb read CF out of FL and compute in two steps, exactly like blink's own
+// Adc*/Sbb* leaves in alu.c:
+//   adc: t = x + cf ; z = t + y ; cf' = (t<x)|(z<y) ; af = (t&15)<(x&15) |
+//        (z&15)<(y&15) ; of = ((z^x)&(z^y))>>signsh  [same form as add]
+//   sbb: t = x - cf ; z = t - y ; cf' = (x<t)|(t<z) ; af = (x&15)<(t&15) |
+//        (t&15)<(z&15) ; of = ((z^x)&(x^y))>>signsh  [same form as sub]
+// ZF/SF/PF come from z as for every other op. Using LT3 as t is safe: the two
+// memory-operand callers park the loaded value in LT3, and it is copied into
+// LT0/LT1 before t is written, after which nothing reads it again.
 static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
                           int src, bool imm, u64 immv, bool wb, bool keepcf,
                           int needed) {
@@ -628,7 +640,12 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   i64 mask = kWMask[log2 & 3];
   int signsh = (8 << (log2 & 3)) - 1;
   if (log2 < 2) wb = false;  // 8/16-bit writeback would clobber upper reg bits
-  int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
+  // 0 log, 1 add, 2 sub, 3 adc, 4 sbb
+  int kind = (t == 1 || t == 4 || t == 6) ? 0
+             : (t == 0)                   ? 1
+             : (t == 2)                   ? 3
+             : (t == 3)                   ? 4
+                                          : 2;
   // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
   if (dst >= 0) {
     RcLoad(b, rc, dst);
@@ -650,10 +667,23 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
     if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   }
   ESet(b, LT1);
-  // z = (x OP y) & mask -> LT2
-  EGet(b, LT0);
-  EGet(b, LT1);
-  EBin(b, kBin[t]);
+  if (kind >= 3) {
+    // adc/sbb: t = (x -+ cf) & mask -> LT3 ; z = (t -+ y) & mask -> LT2
+    FlagsEnsure(b, rc);
+    EGet(b, LT0);
+    EGet(b, FL); EConstI(b, 1); EBin(b, I32_AND); bput(b, 0xad);  // extend_i32_u
+    EBin(b, kind == 3 ? I64_ADD : I64_SUB);
+    if (w32) { EConst(b, mask); EBin(b, I64_AND); }
+    ESet(b, LT3);
+    EGet(b, LT3);
+    EGet(b, LT1);
+    EBin(b, kind == 3 ? I64_ADD : I64_SUB);
+  } else {
+    // z = (x OP y) & mask -> LT2
+    EGet(b, LT0);
+    EGet(b, LT1);
+    EBin(b, kBin[t]);
+  }
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT2);
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
@@ -684,13 +714,24 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
       EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
     }
     if (kind != 0) {  // cf, of, af (logical leaves them cleared = 0)
-      if ((needed & CF) && !keepcf) {  // cf: add z<y ; sub x<z
-        if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
-        else { EGet(b, LT0); EGet(b, LT2); }
-        EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+      if ((needed & CF) && !keepcf) {  // cf<<0
+        if (kind == 1) {         // add: z<y
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_LTU);
+        } else if (kind == 2) {  // sub: x<z
+          EGet(b, LT0); EGet(b, LT2); EBin(b, I64_LTU);
+        } else if (kind == 3) {  // adc: (t<x) | (z<y)
+          EGet(b, LT3); EGet(b, LT0); EBin(b, I64_LTU);
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        } else {                 // sbb: (x<t) | (t<z)
+          EGet(b, LT0); EGet(b, LT3); EBin(b, I64_LTU);
+          EGet(b, LT3); EGet(b, LT2); EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        }
+        EBin(b, I32_OR);
       }
-      if (needed & OF) {  // of<<11
-        if (kind == 1) {  // ((z^x)&(z^y))
+      if (needed & OF) {  // of<<11 (adc shares add's form, sbb sub's)
+        if (kind == 1 || kind == 3) {  // ((z^x)&(z^y))
           EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
           EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
         } else {  // ((x^y)&(z^x))
@@ -701,12 +742,33 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
         EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
         EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
       }
-      if (needed & AF) {  // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
-        if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
-                         EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
-        else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
-               EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
-        EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
+      if (needed & AF) {  // af<<4
+        if (kind == 1) {         // add: (z&15)<(y&15)
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+        } else if (kind == 2) {  // sub: (x&15)<(z&15)
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+        } else if (kind == 3) {  // adc: (t&15)<(x&15) | (z&15)<(y&15)
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        } else {                 // sbb: (x&15)<(t&15) | (t&15)<(z&15)
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        }
+        EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
       }
     }
     if (needed & PF) {  // parity byte (z & 0xFF) << 24
@@ -1036,8 +1098,7 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
     ESet(b, LT3);                 // memory operand value (addr no longer needed)
     int need = GetNeededFlags(m, pc_next, CF | ZF | SF | OF | AF | PF);
     if (kind == 1) {
-      if (t == 2 || t == 3) EmitAlu(b, rc, t, lg, dst, -1, false, 0, wb);
-      else EmitAluInline(b, rc, t, lg, dst, -1, false, 0, wb, false, need);
+      EmitAluInline(b, rc, t, lg, dst, -1, false, 0, wb, false, need);
     } else if (kind == 2) {
       EmitAluInline(b, rc, t, lg, -1, ysrc, false, 0, false, false, need);
     } else {
@@ -1078,12 +1139,11 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
     kind = 0; ysrc = (int)RexrReg(rde);
   } else if (h == OpAluw) {              // ALU [mem], reg (RMW)
     t = (int)((Opcode(rde) & 070) >> 3);
-    if (t == 2 || t == 3) return false;  // adc/sbb need the kAlu leaf: later
     kind = 2; ysrc = (int)RexrReg(rde);
     loadop = lg == 2 ? 0x35 : 0x29;
   } else if (h == OpAlui) {              // ALU [mem], imm (RMW; cmp = read path)
     t = (int)ModrmReg(rde);
-    if (t == 2 || t == 3 || t == ALU_CMP) return false;
+    if (t == ALU_CMP) return false;  // cmp is the read path
     kind = 3;
     loadop = lg == 2 ? 0x35 : 0x29;
   } else {
@@ -1672,7 +1732,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
     int lb = 0, li = 0, lsc = 0; i64 ldv = 0;
     bool lhb = false, lhi = false, lrp = false, llg = false;
     if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      o->kind = (t == 2 || t == 3) ? kSlAluCall : kSlAluInline;  // adc/sbb call
+      o->kind = kSlAluInline;  // incl. adc/sbb (carry-in read from FL)
       o->t = t; o->lg = lg; o->d = d; o->s = s; o->im = im; o->w = w; o->iv = iv;
       o->need = GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF);
       regs |= 1u << d;
@@ -1824,8 +1884,7 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
                 &wb)) {
     // pc is already past this insn; skip flag emission if all flags are dead.
     int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
-    if (t == 2 || t == 3) EmitAlu(bb, rc, t, log2, dst, src, imm, immv, wb);
-    else EmitAluInline(bb, rc, t, log2, dst, src, imm, immv, wb, false, need);
+    EmitAluInline(bb, rc, t, log2, dst, src, imm, immv, wb, false, need);
     return true;
   }
   if (AluAxDecode(h, rde, xedd->op.uimm0, &t, &log2, &immv)) {
