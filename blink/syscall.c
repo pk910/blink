@@ -218,6 +218,7 @@ extern void js_sysinfo(unsigned *out);  // pk910: uptime s, loads x3 (SI_LOAD_SH
 // so these go to the kernel directly (blink-lib.js); a negative result is
 // the host errno.
 extern int js_setxid(int which, int a, int b, int c);  // 0 setuid 1 setgid 2 setreuid 3 setregid 4 setresuid 5 setresgid
+extern int js_uname(char *buf);                  // pk910: six NUL-terminated 65-byte fields from the kernel's identity
 extern int js_getxid(int which);                 // pk910: 0 uid 1 euid 2 gid 3 egid, from the kernel's credentials
 extern int js_getgroups(int size, int *out);   // pk910: the kernel's supplementary groups (size 0 = count)
 extern int js_setgroups(int size, const int *in);
@@ -1901,6 +1902,12 @@ static int SysUname(struct Machine *m, i64 utsaddr) {
   // glibc binaries won't run unless we report blink as a
   // modern linux kernel on top of genuine intel hardware
   struct utsname_linux uts;
+#ifdef __EMSCRIPTEN__
+  // pk910: the kernel owns the box's identity; uname(1) in the JS userland
+  // and uname(2) from a guest must not disagree
+  memset(&uts, 0, sizeof(uts));
+  if (js_uname((char *)&uts) == 0) return CopyToUserWrite(m, utsaddr, &uts, sizeof(uts));
+#endif
   union {
     char host[sizeof(uts.nodename)];
     char domain[sizeof(uts.domainname)];
