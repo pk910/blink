@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <locale.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,6 +135,10 @@ extern char **environ;
 static bool FLAG_nojit;
 static char g_pathbuf[PATH_MAX];
 
+#ifdef __EMSCRIPTEN__
+extern void js_procexit(int code);  // the kernel's process table, from blink-lib.js
+#endif
+
 static void OnSigSys(int sig) {
   // do nothing
 }
@@ -164,6 +169,16 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   }
   if ((syssig = XlatSignal(sig)) == -1) syssig = SIGKILL;
   FreeMachine(m);
+#ifdef __EMSCRIPTEN__
+  // Shared runtime: this guest is a pthread and its System is gone now. Tell
+  // the kernel it died of a signal (128+n, the status a shell reports) and end
+  // ONLY this pthread. Falling through would Abort(), which is runtime-global:
+  // one guest touching memory it cannot get would take its parent and every
+  // fork sibling in the heap group down with it. Same reasoning as
+  // SysExitGroup in syscall.c.
+  js_procexit(128 + syssig);
+  pthread_exit(0);
+#endif
 #ifdef HAVE_JIT
   ShutdownJit();
 #endif
