@@ -166,25 +166,31 @@ addToLibrary({
       HEAP64[(buf + 88) >> 3] = BigInt(st.ino >>> 0); // ino
       return 0;
     },
-    statfs: function (buf) {
+    statfs: function (path, buf) {
       // blink fills the HOST (wasm32 musl) struct statfs then copies to the guest:
       // unsigned long is 4 bytes, fsblkcnt_t/fsfilcnt_t are 8 bytes (8-aligned).
       //   f_type u32@0  f_bsize u32@4  f_blocks u64@8  f_bfree u64@16  f_bavail u64@24
       //   f_files u64@32  f_ffree u64@40  f_fsid@48  f_namelen u32@56  f_frsize u32@60
-      // The VFS is virtual, so report a plausible fixed-size fs so `df` shows real numbers.
-      HEAPU8.fill(0, buf, buf + 88);
-      var U32 = function (off, v) { HEAPU32[(buf + off) >> 2] = v >>> 0; };
-      var U64 = function (off, v) { HEAPU32[(buf + off) >> 2] = v >>> 0; HEAPU32[(buf + off + 4) >> 2] = 0; };
-      U32(0, 0x01021994);  // f_type = TMPFS_MAGIC
-      U32(4, 4096);        // f_bsize
-      U64(8, 262144);      // f_blocks = 1 GiB / 4096
-      U64(16, 236000);     // f_bfree
-      U64(24, 236000);     // f_bavail
-      U64(32, 262144);     // f_files
-      U64(40, 250000);     // f_ffree
-      U32(56, 255);        // f_namelen
-      U32(60, 4096);       // f_frsize
-      return 0;
+      // The numbers are the kernel's, the same ones the JS df prints.
+      try {
+        var st = ksys('statfs', [path]);
+        var MAGIC = { tmpfs: 0x01021994, overlay: 0x794c7630, proc: 0x9fa0, sysfs: 0x62656572, devtmpfs: 0x1cd1, rootfs: 0x858458f6, assetcache: 0x858458f6 };
+        var bs = 4096;
+        HEAPU8.fill(0, buf, buf + 88);
+        var U32 = function (off, v) { HEAPU32[(buf + off) >> 2] = v >>> 0; };
+        var U64 = function (off, v) { HEAPU32[(buf + off) >> 2] = v >>> 0; HEAPU32[(buf + off + 4) >> 2] = Math.floor(v / 4294967296) >>> 0; };
+        var freeInodes = 2147483647 - (st.files || 0);
+        U32(0, MAGIC[st.fstype] || 0x01021994);
+        U32(4, bs);
+        U64(8, Math.ceil((st.size || 0) / bs));
+        U64(16, Math.floor((st.avail || 0) / bs));
+        U64(24, Math.floor((st.avail || 0) / bs));
+        U64(32, (st.files || 0) + freeInodes);
+        U64(40, freeInodes);
+        U32(56, 255);
+        U32(60, bs);
+        return 0;
+      } catch (e) { return PKSYS.errS(e); }
     },
     statPath: function (path, buf, nofollow) {
       try { return PKSYS.writeStat(buf, ksys(nofollow ? 'lstat' : 'stat', [path])); } catch (e) { return PKSYS.errS(e); }
@@ -580,10 +586,10 @@ addToLibrary({
   __syscall_fstat64: function (fd, buf) { try { return PKSYS.writeStat(buf, ksys('fstat', [fd])); } catch (e) { return PKSYS.errS(e); } },
   __syscall_statfs64__deps: ['$PKSYS'],
   __syscall_statfs64__proxy: 'none',
-  __syscall_statfs64: function (_p, _sz, buf) { return PKSYS.statfs(buf); },
+  __syscall_statfs64: function (p, _sz, buf) { return PKSYS.statfs(PKSYS.cstr(p), buf); },
   __syscall_fstatfs64__deps: ['$PKSYS'],
   __syscall_fstatfs64__proxy: 'none',
-  __syscall_fstatfs64: function (_fd, _sz, buf) { return PKSYS.statfs(buf); },
+  __syscall_fstatfs64: function (fd, _sz, buf) { try { return PKSYS.statfs(ksys('fdpath', [fd]), buf); } catch (e) { return PKSYS.errS(e); } },
 
   // ── directories ──
   __syscall_getdents64__deps: ['$PKSYS'],
@@ -763,6 +769,21 @@ addToLibrary({
   // ── identity and sessions: the kernel's, reached from blink's syscall handlers ──
   // (emscripten's libc answers the setuid family with EPERM before any syscall
   // and stubs setsid/setpgid, so the host calls never reach a JS import)
+  js_uname__deps: ['$PKSYS'],
+  js_uname__proxy: 'none',
+  js_uname: function (buf) {
+    // struct utsname: six 65-byte fields, from the kernel's uname
+    try {
+      var u = ksys('uname', []);
+      var fields = [u.sysname, u.nodename, u.release, u.version, u.machine, u.domainname];
+      for (var i = 0; i < 6; i++) {
+        var b = PKSYS.enc().encode(String(fields[i] || '')).subarray(0, 64);
+        HEAPU8.fill(0, buf + i * 65, buf + i * 65 + 65);
+        HEAPU8.set(b, buf + i * 65);
+      }
+      return 0;
+    } catch (e) { return -1; }
+  },
   js_getxid__deps: ['$PKSYS'],
   js_getxid__proxy: 'none',
   js_getxid: function (which) {
