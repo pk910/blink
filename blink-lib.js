@@ -155,7 +155,7 @@ addToLibrary({
       HEAPU32[(buf + 8) >> 2] = st.nlink >>> 0; // nlink
       HEAPU32[(buf + 12) >> 2] = st.uid >>> 0; // uid
       HEAPU32[(buf + 16) >> 2] = st.gid >>> 0; // gid
-      HEAPU32[(buf + 20) >> 2] = 0; // rdev
+      HEAPU32[(buf + 20) >> 2] = (st.rdev || 0) >>> 0; // rdev: the device's own (major, minor)
       HEAP64[(buf + 24) >> 3] = BigInt(size); // size
       HEAP32[(buf + 32) >> 2] = 4096; // blksize
       HEAP32[(buf + 36) >> 2] = Math.ceil(size / 512); // blocks
