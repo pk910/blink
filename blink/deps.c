@@ -24,7 +24,7 @@ static bool IsJump(u64 rde) {
   int op = Mopcode(rde);
   return op == 0x0E9 ||  // jmp  Jvds
          op == 0x0EB ||  // jmp  Jbs
-         op == 0x0E8;    // call Jvds
+         op == 0x0E8;    // call Jvds (see GetFlagClobbers)
 }
 
 static bool IsConditionalJump(u64 rde) {
@@ -85,11 +85,23 @@ int GetFlagClobbers(u64 rde) {
       return 0;
     case 0xE8:   // call
     case 0xC3:   // ret
-      if (Rep(rde)) {
-        return 0;
-      } else {
-        return -1;
-      }
+      // pk910: upstream jart/blink PR #214. the abi treats flags as
+      // caller-saved but the instructions themselves preserve them, and real
+      // code branches on flags across a call to a flag-preserving asm helper
+      // (go's runtime.duffzero is the known case). claiming a clobber here let
+      // CrawlFlags stop early and report the flags dead, so the wasm jit's
+      // GetNeededFlags users elided computing them and the jcc read stale bits.
+      //
+      // upstream then gives up on both (they fall through to the ClassifyOp
+      // check, which is kOpBranching). we keep 0xE8 in IsJump instead, so a
+      // direct call is crawled INTO: the flags live at the call are the ones
+      // the callee reads before overwriting them, and most callees clobber
+      // everything in their first `sub $n,%rsp`. following the callee past its
+      // own ret would be wrong, but it cannot happen - the ret lands on the
+      // kOpBranching arm below and yields -1 (all flags live), which is the
+      // conservative answer. an indirect call still has no known target and
+      // stays a give-up via ClassifyOp.
+      return 0;
     case 0x105:  // syscall
       return -1;
     case 0x000:  // add byte
