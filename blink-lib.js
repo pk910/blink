@@ -142,28 +142,28 @@ addToLibrary({
       return base === '/' ? '/' + p : base + '/' + p;
     },
     writeStat: function (buf, st) {
-      var typeBits = st.type === 'dir' ? 0o40000 : st.type === 'char' ? 0o20000 : st.type === 'fifo' ? 0o10000 : st.type === 'link' ? 0o120000 : st.type === 'sock' ? 0o140000 : 0o100000;
+      // struct stat, x86-64 layout. Every field here comes from the kernel's
+      // stat reply; nothing is invented on this side any more (a constant
+      // st_ino used to break every dlopen, see the inode model in fs/api.ts).
+      var t = st.type;
+      var typeBits = t === 'dir' ? 0o40000 : t === 'char' ? 0o20000 : t === 'fifo' ? 0o10000 : (t === 'symlink' || t === 'link') ? 0o120000 : t === 'sock' ? 0o140000 : 0o100000;
       var mode = typeBits | (st.mode & 0o7777);
-      var secs = BigInt(Math.floor((st.mtime || 0) / 1000));
-      HEAPU32[buf >> 2] = 910; // dev
+      var ms = function (v) { return BigInt(Math.floor((v || 0) / 1000)); };
+      var ns = function (v) { return ((v || 0) % 1000) * 1000000; };
+      var size = st.size || 0;
+      HEAPU32[buf >> 2] = st.dev >>> 0; // dev
       HEAPU32[(buf + 4) >> 2] = mode;
-      HEAPU32[(buf + 8) >> 2] = 1; // nlink
-      HEAPU32[(buf + 12) >> 2] = 0; // uid (guest runs as root)
+      HEAPU32[(buf + 8) >> 2] = st.nlink >>> 0; // nlink
+      HEAPU32[(buf + 12) >> 2] = 0; // uid (numeric ids land with the uid/gid inversion)
       HEAPU32[(buf + 16) >> 2] = 0; // gid
       HEAPU32[(buf + 20) >> 2] = 0; // rdev
-      HEAP64[(buf + 24) >> 3] = BigInt(st.size); // size
+      HEAP64[(buf + 24) >> 3] = BigInt(size); // size
       HEAP32[(buf + 32) >> 2] = 4096; // blksize
-      HEAP32[(buf + 36) >> 2] = Math.ceil(st.size / 512); // blocks
-      HEAP64[(buf + 40) >> 3] = secs; HEAPU32[(buf + 48) >> 2] = 0; // atime
-      HEAP64[(buf + 56) >> 3] = secs; HEAPU32[(buf + 64) >> 2] = 0; // mtime
-      HEAP64[(buf + 72) >> 3] = secs; HEAPU32[(buf + 80) >> 2] = 0; // ctime
-      // ino: glibc's ld.so keys "is this object already loaded?" on (dev, ino),
-      // so a constant inode makes every dlopen return the first loaded link map.
-      // Hash the path (FNV-1a) for a stable, distinct inode per file.
-      var q = (st && st.path) || '';
-      var hh = 2166136261 >>> 0;
-      for (var qi = 0; qi < q.length; qi++) { hh ^= q.charCodeAt(qi); hh = Math.imul(hh, 16777619) >>> 0; }
-      HEAP64[(buf + 88) >> 3] = BigInt(hh || 1); // ino
+      HEAP32[(buf + 36) >> 2] = Math.ceil(size / 512); // blocks
+      HEAP64[(buf + 40) >> 3] = ms(st.atime); HEAPU32[(buf + 48) >> 2] = ns(st.atime); // atime
+      HEAP64[(buf + 56) >> 3] = ms(st.mtime); HEAPU32[(buf + 64) >> 2] = ns(st.mtime); // mtime
+      HEAP64[(buf + 72) >> 3] = ms(st.ctime); HEAPU32[(buf + 80) >> 2] = ns(st.ctime); // ctime
+      HEAP64[(buf + 88) >> 3] = BigInt(st.ino >>> 0); // ino
       return 0;
     },
     statfs: function (buf) {
@@ -249,8 +249,8 @@ addToLibrary({
         var nameBytes = PKSYS.enc().encode(e.name);
         var aligned = (19 + nameBytes.length + 1 + 7) & ~7;
         if (pos + aligned > count) break;
-        var type = e.type === 'dir' ? 4 : e.type === 'link' ? 10 : 8;
-        HEAP64[(dirp + pos) >> 3] = BigInt(entries.idx + 1); // d_ino
+        var type = e.type === 'dir' ? 4 : (e.type === 'symlink' || e.type === 'link') ? 10 : e.type === 'char' ? 2 : e.type === 'fifo' ? 1 : e.type === 'sock' ? 12 : 8;
+        HEAP64[(dirp + pos) >> 3] = BigInt(e.ino !== undefined ? e.ino >>> 0 : entries.idx + 1); // d_ino ('.'/'..' are synthetic)
         HEAP64[(dirp + pos + 8) >> 3] = BigInt(entries.idx + 1); // d_off
         HEAP16[(dirp + pos + 16) >> 1] = aligned; // d_reclen
         HEAPU8[dirp + pos + 18] = type; // d_type
@@ -634,7 +634,27 @@ addToLibrary({
   __syscall_linkat__proxy: 'none',
   __syscall_linkat: function () { return -1; }, // EPERM
   __syscall_utimensat__proxy: 'none',
-  __syscall_utimensat: function () { return 0; }, // accepted, not stored
+  __syscall_utimensat__deps: ['$PKSYS'],
+  __syscall_utimensat__proxy: 'none',
+  __syscall_utimensat: function (dirfd, path, times, flags) {
+    // utimensat(2): times is struct timespec[2] {atime, mtime} or NULL for
+    // "now"; tv_nsec UTIME_NOW / UTIME_OMIT are the special cases. A NULL path
+    // with a real dirfd is futimens() on the fd itself.
+    try {
+      var target = path ? PKSYS.atPath(dirfd, path) : ksys('fdpath', [dirfd]);
+      var UTIME_NOW = 0x3fffffff, UTIME_OMIT = 0x3ffffffe;
+      var pick = function (off) {
+        if (!times) return 'now';
+        var sec = Number(HEAP64[(times + off) >> 3]);
+        var nsec = HEAP32[(times + off + 8) >> 2];
+        if (nsec === UTIME_NOW) return 'now';
+        if (nsec === UTIME_OMIT) return null;
+        return sec * 1000 + Math.floor(nsec / 1e6);
+      };
+      ksys('utime', [target, pick(0), pick(16), (flags & 0x100) !== 0]); // AT_SYMLINK_NOFOLLOW
+      return 0;
+    } catch (e) { return PKSYS.errS(e); }
+  },
   __syscall_fchown32__proxy: 'none',
   __syscall_fchown32: function () { return 0; },
   __syscall_fchownat__proxy: 'none',
