@@ -3113,9 +3113,14 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
   struct dirent *ent;
   struct dirent_linux rec;
   if (size < sizeof(rec) - sizeof(rec.name)) return einval();
-  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
   if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
+  // pk910: what matters is that the fd IS a directory, not that it was opened
+  // with O_DIRECTORY - that flag only asks open() to fail on a non-directory,
+  // and Linux reads dirents from any directory fd. Requiring it made getdents
+  // fail with ENOTDIR for every program that opens a directory plainly: GNU
+  // tar passes O_RDONLY|O_NOFOLLOW and could not archive a directory at all.
+  if (!S_ISDIR(st.st_mode)) return enotdir();
   if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
     return -1;
   }
