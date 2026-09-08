@@ -42,6 +42,7 @@
 #include "blink/rde.h"
 
 extern int pk_jit_install(const void *bytes, int len, int first_compile);
+extern void pk_jit_release(int idx);  // give a table slot back to the free list
 
 // static in machine.c, un-static'd (pk910) so we can identify them by symbol
 // and avoid 2-byte-opcode collisions from a pure-opcode decode.
@@ -224,15 +225,26 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define OFF_OPLEN ((u32)offsetof(struct Machine, oplen))
 #define OFF_STASH ((u32)offsetof(struct Machine, stashaddr))
 #define OFF_ATT ((u32)offsetof(struct Machine, attention))
-// scratch locals (declared after the 16 GPR locals): i64 20..23, i32 24..26
+// scratch locals (declared after the 16 GPR locals): i64 20..24, i32 25..29
 #define LT0 20
 #define LT1 21
 #define LT2 22
 #define LT3 23
-#define FL  24   // cached m->flags (i32)
-#define HP0 25   // i32 scratch: tlb slot / host pointer (memory fast path)
-#define HP1 26   // i32 scratch: offset within page
-#define TG  27   // i32: region block-dispatch target (br_table index)
+// pk910: one-entry page cache per emitted function (see EmitMemBegin). PGV
+// holds the guest base of the page most recently resolved, PGH the host pointer
+// of that page's first byte. A page base is 4096-aligned, so bit 0 of PGV is
+// free and carries the permission the page was validated for: 0 = read only,
+// 1 = also write (PAGE_RW|PAGE_XD checked). A read therefore hits on
+// (PGV & -4096) == page and a write on PGV == (page | 1), which is why one pair
+// of locals serves both - and locals are not free, they cost every emitted
+// function. PG_EMPTY is a non-canonical address so it matches neither test.
+#define PGV 24   // i64
+#define FL  25   // cached m->flags (i32)
+#define HP0 26   // i32 scratch: tlb slot / host pointer (memory fast path)
+#define HP1 27   // i32 scratch: offset within page
+#define TG  28   // i32: region block-dispatch target (br_table index)
+#define PGH 29   // i32
+#define PG_EMPTY ((i64)1 << 59)
 #define IT  TG   // sse scratch: safe to alias TG, which every path writes before the
                  // br_table reads it (region entry and EmitGoto backward edges)
 #define OFF_TLB   ((u32)offsetof(struct Machine, tlb))
@@ -251,6 +263,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
 #define I64_NE  0x52
+#define I64_EQ  0x51
 #define I64_WRAP 0xa7
 #define I64_SHRS 0x87
 #define I64_NE  0x52
@@ -617,12 +630,24 @@ static bool ImulDecode(nexgen32e_f h, u64 rde, u64 uimm0, int *dst, int *areg,
 }
 
 // i64 binop per ALU op index (0 add,1 or,4 and,5 sub,6 xor,7 cmp=sub).
+// 2/3 (adc/sbb) are two-step and handled by kind 3/4 below, not by this table.
 static const u8 kBin[8] = {I64_ADD, I64_OR, 0, 0, I64_AND, I64_SUB, I64_XOR,
                            I64_SUB};
 
 // Inline ALU: z = x OP y in wasm (no call), exact blink flags into the cached
-// flags local FL. Used for add/or/and/sub/xor/cmp/test (not adc/sbb). LT0=x,
-// LT1=y, LT2=z; operands masked to width so the 32/64-bit paths share formulas.
+// flags local FL. Covers add/or/and/sub/xor/cmp/test AND adc/sbb. LT0=x,
+// LT1=y, LT2=z (LT3=t, the carry-in intermediate, adc/sbb only); operands are
+// masked to width so the 32/64-bit paths share formulas.
+//
+// adc/sbb read CF out of FL and compute in two steps, exactly like blink's own
+// Adc*/Sbb* leaves in alu.c:
+//   adc: t = x + cf ; z = t + y ; cf' = (t<x)|(z<y) ; af = (t&15)<(x&15) |
+//        (z&15)<(y&15) ; of = ((z^x)&(z^y))>>signsh  [same form as add]
+//   sbb: t = x - cf ; z = t - y ; cf' = (x<t)|(t<z) ; af = (x&15)<(t&15) |
+//        (t&15)<(z&15) ; of = ((z^x)&(x^y))>>signsh  [same form as sub]
+// ZF/SF/PF come from z as for every other op. Using LT3 as t is safe: the two
+// memory-operand callers park the loaded value in LT3, and it is copied into
+// LT0/LT1 before t is written, after which nothing reads it again.
 static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst,
                           int src, bool imm, u64 immv, bool wb, bool keepcf,
                           int needed) {
@@ -631,7 +656,12 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
   i64 mask = kWMask[log2 & 3];
   int signsh = (8 << (log2 & 3)) - 1;
   if (log2 < 2) wb = false;  // 8/16-bit writeback would clobber upper reg bits
-  int kind = (t == 1 || t == 4 || t == 6) ? 0 : (t == 0 ? 1 : 2);  // 0 log,1 add,2 sub
+  // 0 log, 1 add, 2 sub, 3 adc, 4 sbb
+  int kind = (t == 1 || t == 4 || t == 6) ? 0
+             : (t == 0)                   ? 1
+             : (t == 2)                   ? 3
+             : (t == 3)                   ? 4
+                                          : 2;
   // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
   if (dst >= 0) {
     RcLoad(b, rc, dst);
@@ -653,10 +683,23 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
     if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   }
   ESet(b, LT1);
-  // z = (x OP y) & mask -> LT2
-  EGet(b, LT0);
-  EGet(b, LT1);
-  EBin(b, kBin[t]);
+  if (kind >= 3) {
+    // adc/sbb: t = (x -+ cf) & mask -> LT3 ; z = (t -+ y) & mask -> LT2
+    FlagsEnsure(b, rc);
+    EGet(b, LT0);
+    EGet(b, FL); EConstI(b, 1); EBin(b, I32_AND); bput(b, 0xad);  // extend_i32_u
+    EBin(b, kind == 3 ? I64_ADD : I64_SUB);
+    if (w32) { EConst(b, mask); EBin(b, I64_AND); }
+    ESet(b, LT3);
+    EGet(b, LT3);
+    EGet(b, LT1);
+    EBin(b, kind == 3 ? I64_ADD : I64_SUB);
+  } else {
+    // z = (x OP y) & mask -> LT2
+    EGet(b, LT0);
+    EGet(b, LT1);
+    EBin(b, kBin[t]);
+  }
   if (w32) { EConst(b, mask); EBin(b, I64_AND); }
   ESet(b, LT2);
   // flags: FL = (FL & keep) | cf | zf<<6 | sf<<7 | of<<11 | af<<4 | (z&0xFF)<<24
@@ -687,13 +730,24 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
       EConstI(b, 7); EBin(b, I32_SHL); EBin(b, I32_OR);
     }
     if (kind != 0) {  // cf, of, af (logical leaves them cleared = 0)
-      if ((needed & CF) && !keepcf) {  // cf: add z<y ; sub x<z
-        if (kind == 1) { EGet(b, LT2); EGet(b, LT1); }
-        else { EGet(b, LT0); EGet(b, LT2); }
-        EBin(b, I64_LTU); EBin(b, I32_OR);  // cf<<0
+      if ((needed & CF) && !keepcf) {  // cf<<0
+        if (kind == 1) {         // add: z<y
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_LTU);
+        } else if (kind == 2) {  // sub: x<z
+          EGet(b, LT0); EGet(b, LT2); EBin(b, I64_LTU);
+        } else if (kind == 3) {  // adc: (t<x) | (z<y)
+          EGet(b, LT3); EGet(b, LT0); EBin(b, I64_LTU);
+          EGet(b, LT2); EGet(b, LT1); EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        } else {                 // sbb: (x<t) | (t<z)
+          EGet(b, LT0); EGet(b, LT3); EBin(b, I64_LTU);
+          EGet(b, LT3); EGet(b, LT2); EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        }
+        EBin(b, I32_OR);
       }
-      if (needed & OF) {  // of<<11
-        if (kind == 1) {  // ((z^x)&(z^y))
+      if (needed & OF) {  // of<<11 (adc shares add's form, sbb sub's)
+        if (kind == 1 || kind == 3) {  // ((z^x)&(z^y))
           EGet(b, LT2); EGet(b, LT0); EBin(b, I64_XOR);
           EGet(b, LT2); EGet(b, LT1); EBin(b, I64_XOR);
         } else {  // ((x^y)&(z^x))
@@ -704,12 +758,33 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
         EConst(b, 1); EBin(b, I64_AND); EBin(b, I64_WRAP);
         EConstI(b, 11); EBin(b, I32_SHL); EBin(b, I32_OR);
       }
-      if (needed & AF) {  // af<<4: add (z&15)<(y&15) ; sub (x&15)<(z&15)
-        if (kind == 1) { EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
-                         EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND); }
-        else { EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
-               EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND); }
-        EBin(b, I64_LTU); EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
+      if (needed & AF) {  // af<<4
+        if (kind == 1) {         // add: (z&15)<(y&15)
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+        } else if (kind == 2) {  // sub: (x&15)<(z&15)
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+        } else if (kind == 3) {  // adc: (t&15)<(x&15) | (z&15)<(y&15)
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT1); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        } else {                 // sbb: (x&15)<(t&15) | (t&15)<(z&15)
+          EGet(b, LT0); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EGet(b, LT3); EConst(b, 15); EBin(b, I64_AND);
+          EGet(b, LT2); EConst(b, 15); EBin(b, I64_AND);
+          EBin(b, I64_LTU);
+          EBin(b, I32_OR);
+        }
+        EConstI(b, 4); EBin(b, I32_SHL); EBin(b, I32_OR);
       }
     }
     if (needed & PF) {  // parity byte (z & 0xFF) << 24
@@ -803,15 +878,21 @@ static bool LeaDecode(nexgen32e_f h, u64 rde, i64 disp, int *dst, int *base,
 // RW lookup path enqueues SMC invalidation - phase 2, not inlined yet.)
 
 // Decode a MEMORY rm operand's effective address parts. Only the flat common
-// case is inlined: long mode, 64-bit addressing, no segment override, no LOCK,
-// userland (!metal: ds/ss/es bases are 0, no ROM aliasing, Cpl always 3).
+// case is inlined: long mode, 64-bit addressing, no LOCK, userland (!metal:
+// ds/ss/es bases are 0, no ROM aliasing, Cpl always 3).
+//
+// A segment override IS covered: blink's AddSegment ignores the ds/ss base it
+// computed and returns `ea + m->seg[Sego(rde)-1].base` whenever Sego is set, so
+// *sego (0 = none, else the 1-based seg[] index) makes EmitEaAddr add that base
+// with one extra i64 load. musl puts TLS and the stack canary behind fs:, so
+// this is in the prologue/epilogue of nearly every -fstack-protector function.
 static bool MemEaDecode(struct Machine *m, u64 rde, int *base, int *index,
                         int *scale, bool *hasBase, bool *hasIndex,
-                        bool *riprel) {
+                        bool *riprel, int *sego) {
   if (IsModrmRegister(rde) || Lock(rde)) return false;
   if (m->metal) return false;
   if (Mode(rde) != XED_MODE_LONG || Eamode(rde) != XED_MODE_LONG) return false;
-  if (Sego(rde)) return false;  // fs/gs override -> handler
+  *sego = (int)Sego(rde);
   *base = *index = *scale = 0;
   *hasBase = *hasIndex = *riprel = false;
   if (!SibExists(rde)) {
@@ -828,10 +909,11 @@ static bool MemEaDecode(struct Machine *m, u64 rde, int *base, int *index,
   return true;
 }
 
-// LT3 = disp + base + (index << scale) [+ pc_next when rip-relative].
+// LT3 = disp + base + (index << scale) [+ pc_next when rip-relative]
+//       [+ m->seg[sego-1].base when a segment override is present].
 static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
                        int scale, i64 dispv, bool hasBase, bool hasIndex,
-                       bool riprel, u64 pc_next) {
+                       bool riprel, u64 pc_next, int sego) {
   EConst(b, dispv + (riprel ? (i64)pc_next : 0));
   if (hasBase) { RcLoad(b, rc, base); EGet(b, LOC_GPR + base); EBin(b, I64_ADD); }
   if (hasIndex) {
@@ -840,30 +922,78 @@ static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
     if (scale) { EConst(b, (i64)scale); EBin(b, I64_SHL); }
     EBin(b, I64_ADD);
   }
+  if (sego) {  // fs:/gs: (and the legacy overrides, whose base is 0 here)
+    EGet(b, 0);
+    ELoad(b, (u32)(offsetof(struct Machine, seg) +
+                   (size_t)(sego - 1) * sizeof(struct DescriptorCache) +
+                   offsetof(struct DescriptorCache, base)));
+    EBin(b, I64_ADD);
+  }
   ESet(b, LT3);
 }
 
 // LT3 holds the guest addr. Opens block $done { block $slow { ... and emits the
-// TLB-hit checks; on the fast path HP0 = host pointer for [addr, addr+size).
-// Any check failing branches to $slow (the handler fallback in EmitMemEnd).
-// write=true additionally requires PAGE_RW (a fresh-TLB RW entry can't be COW:
-// CowMaybeSplit needs RW clear, so skipping CowSplitRange is equivalent) AND
-// PAGE_XD set (a write to an executable page is the SMC-enqueue case in
-// LookupAddress2 - keep that on the handler).
+// address-resolution checks; on the fast path HP0 = host pointer for
+// [addr, addr+size). Any check failing branches to $slow (the handler fallback
+// in EmitMemEnd). write=true additionally requires PAGE_RW (a fresh-TLB RW
+// entry can't be COW: CowMaybeSplit needs RW clear, so skipping CowSplitRange
+// is equivalent) AND PAGE_XD set (a write to an executable page is the
+// SMC-enqueue case in LookupAddress2 - keep that on the handler).
+//
+// pk910 page cache: even a TLB hit costs the slot arithmetic, the page compare,
+// the entry load and then TWO DEPENDENT loads (g_hostpages.p, then p[idx]) - a
+// pointer chase on every guest access, which dominates byte-at-a-time loops.
+// So the emitted function remembers the last page it resolved in locals and a
+// repeat access to it is `page == PGxV ? PGxH + off`. Soundness:
+//   * PGxV starts at PG_EMPTY and is reset to it after EVERY handler call
+//     (a handler can mmap, munmap, fault a page in, COW-split or reset the
+//     TLB), so the cache is always FRESHER than m->tlb, which is only revalidated
+//     on a miss;
+//   * m->invalidated is still checked per access, exactly as the TLB path does,
+//     so another thread's InvalidateSystem is honoured;
+//   * read and write get SEPARATE caches, because the write fast path needs
+//     PAGE_RW|PAGE_XD that a read-validated page was never checked for. A
+//     write-validated page is read-valid by construction, so the write path
+//     fills both.
 static void EmitMemBegin(struct Buf *b, int size, bool write) {
   bput(b, 0x02); bput(b, 0x40);   // block $done
   bput(b, 0x02); bput(b, 0x40);   // block $slow
   // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
   EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_INVAL);  // i32.load8_u
   bput(b, 0x0d); bleb_u(b, 0);    // br_if $slow
-  // HP0 = m + ((addr>>12) & 31)*16   (tlb slot; OFF_TLB applied at each load)
-  EGet(b, LT3); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
-  EConstI(b, 31); bput(b, I32_AND); EConstI(b, 4); bput(b, I32_SHL);
-  EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
-  // tlb.page != (addr & -4096) -> slow
-  EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
+  // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those).
+  // Hoisted above the cache test: it is needed on both arms.
+  EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
+  if (size > 1) {
+    bput(b, 0x22); bleb_u(b, HP1);  // local.tee
+    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
+  } else {
+    ESet(b, HP1);
+  }
+  // LT2 = addr & -4096 ; take the cached host page if it is the same page
   EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
-  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
+  bput(b, 0x22); bleb_u(b, LT2);  // local.tee
+  if (write) {  // exact match: only a write-validated page carries bit 0
+    EConst(b, 1); EBin(b, I64_OR); EGet(b, PGV); bput(b, I64_EQ);
+  } else {      // either permission serves a read
+    EGet(b, PGV); EConst(b, -4096); EBin(b, I64_AND); bput(b, I64_EQ);
+  }
+  bput(b, 0x04); bput(b, 0x40);   // if (cache hit)
+  EGet(b, PGH); EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
+  bput(b, 0x05);                  // else: the full softmmu probe
+  // HP0 = m + ((addr>>12) & (TLB_ENTRIES-1))*sizeof(MachineTlb)
+  // (tlb slot; OFF_TLB applied at each load). Same index FindPageTableEntry
+  // computes, so a JIT hit and an interpreter hit are the same entry.
+  _Static_assert(sizeof(struct MachineTlb) == 16, "tlb slot shift is 4");
+  _Static_assert((TLB_ENTRIES & (TLB_ENTRIES - 1)) == 0, "tlb size pow2");
+  EGet(b, LT2); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
+  EConstI(b, TLB_ENTRIES - 1); bput(b, I32_AND);
+  EConstI(b, 4); bput(b, I32_SHL);
+  EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
+  // tlb.page != (addr & -4096) -> slow  (br 1: we are one `if` deeper here)
+  EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
+  EGet(b, LT2);
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
   // entry -> LT2; need PAGE_V|PAGE_U|PAGE_HOST with PAGE_RSRV clear
   // (read perms = LookupAddress2(mask=need=PAGE_U) at Cpl 3; RSRV can't be in
   // the TLB, checked anyway; !HOST would mean s->real, not inlined)
@@ -879,23 +1009,29 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
     EConst(b, (i64)mask); EBin(b, I64_AND);
     EConst(b, (i64)want);
   }
-  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
-  // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those)
-  EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
-  if (size > 1) {
-    bput(b, 0x22); bleb_u(b, HP1);  // local.tee
-    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
-  } else {
-    ESet(b, HP1);
-  }
-  // HP0 = g_hostpages.p[(entry & PAGE_TA) >> 12] + HP1
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
+  // ch = g_hostpages.p[(entry & PAGE_TA) >> 12] (host base of the page)
   EConstI(b, (i32)(uintptr_t)&g_hostpages.p);
   bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p
   EGet(b, LT2); EConst(b, (i64)PAGE_TA); EBin(b, I64_AND);
   EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
   EConstI(b, 2); bput(b, I32_SHL); bput(b, I32_ADD);
   bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p[idx] (page base)
+  bput(b, 0x22); bleb_u(b, PGH);               // local.tee PGH
   EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
+  // arm the cache LAST, so nothing above can leave it armed after a br $slow
+  // (LT2 holds the entry by now, so the page base is recomputed)
+  EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
+  if (write) { EConst(b, 1); EBin(b, I64_OR); }  // mark it write-validated
+  ESet(b, PGV);
+  bput(b, 0x0b);                  // end if
+}
+
+// Empty the page cache. Must run at function entry (wasm zero-inits locals and
+// 0 is a legal page base) and after every handler call_indirect, which may have
+// changed the mapping under us.
+static void EmitPgInval(struct Buf *b) {
+  EConst(b, PG_EMPTY); ESet(b, PGV);
 }
 
 // Close the fast path and emit the $slow fallback: spill the PRE-instruction
@@ -921,6 +1057,7 @@ static void EmitMemEnd(struct Buf *b, const struct Rc *pre, const struct Rc *rc,
   bput(b, 0x3a); bleb_u(b, 0); bleb_u(b, OFF_OPLEN);    // i32.store8
   EmitHandler(b, rde, disp, uimm0, hidx);
   EmitCommitStash(b);
+  EmitPgInval(b);                 // the handler may have remapped anything
   for (r = 0; r < 16; ++r) {      // resync locals the fast path left valid
     if (!rc->loaded[r]) continue;
     EGet(b, 0); ELoad(b, OFF_WEG + (u32)r * 8); ESet(b, LOC_GPR + r);
@@ -986,10 +1123,12 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   } else {
     return false;
   }
-  int base, index, scale;
+  int base, index, scale, sego;
   bool hb, hi, rip;
-  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
-  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip, &sego)) {
+    return false;
+  }
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next, sego);
   if (kind == 4) RcLoad(b, rc, dst);  // merge needs the old dst value
   struct Rc pre = *rc;            // the $slow fallback spills THIS state
   EmitMemBegin(b, size, false);
@@ -1018,8 +1157,7 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
     ESet(b, LT3);                 // memory operand value (addr no longer needed)
     int need = GetNeededFlags(m, pc_next, CF | ZF | SF | OF | AF | PF);
     if (kind == 1) {
-      if (t == 2 || t == 3) EmitAlu(b, rc, t, lg, dst, -1, false, 0, wb);
-      else EmitAluInline(b, rc, t, lg, dst, -1, false, 0, wb, false, need);
+      EmitAluInline(b, rc, t, lg, dst, -1, false, 0, wb, false, need);
     } else if (kind == 2) {
       EmitAluInline(b, rc, t, lg, -1, ysrc, false, 0, false, false, need);
     } else {
@@ -1060,21 +1198,22 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
     kind = 0; ysrc = (int)RexrReg(rde);
   } else if (h == OpAluw) {              // ALU [mem], reg (RMW)
     t = (int)((Opcode(rde) & 070) >> 3);
-    if (t == 2 || t == 3) return false;  // adc/sbb need the kAlu leaf: later
     kind = 2; ysrc = (int)RexrReg(rde);
     loadop = lg == 2 ? 0x35 : 0x29;
   } else if (h == OpAlui) {              // ALU [mem], imm (RMW; cmp = read path)
     t = (int)ModrmReg(rde);
-    if (t == 2 || t == 3 || t == ALU_CMP) return false;
+    if (t == ALU_CMP) return false;  // cmp is the read path
     kind = 3;
     loadop = lg == 2 ? 0x35 : 0x29;
   } else {
     return false;
   }
-  int base, index, scale;
+  int base, index, scale, sego;
   bool hb, hi, rip;
-  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
-  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip, &sego)) {
+    return false;
+  }
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next, sego);
   if (kind == 0 || kind == 2) RcLoad(b, rc, ysrc);  // reg operand
   struct Rc pre = *rc;
   EmitMemBegin(b, size, true);
@@ -1236,6 +1375,7 @@ static bool SseMemBegin(struct Machine *m, struct Buf *b, struct Rc *rc,
                         struct SseMem *sm) {
   int base, index, scale;
   bool hb, hi, rip;
+  int sego = 0;
   sm->ismem = !IsModrmRegister(rde);
   sm->open = false;
   if (!sm->ismem) {
@@ -1247,8 +1387,10 @@ static bool SseMemBegin(struct Machine *m, struct Buf *b, struct Rc *rc,
     }
     return true;
   }
-  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
-  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip, &sego)) {
+    return false;  // fs:/gs: now inline too, so SSE memory forms get them free
+  }
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next, sego);
   sm->pre = *rc;
   EmitMemBegin(b, size, write);
   sm->open = true;
@@ -2505,7 +2647,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
     int lb = 0, li = 0, lsc = 0; i64 ldv = 0;
     bool lhb = false, lhi = false, lrp = false, llg = false;
     if (AluDecode(h, rde, x.op.uimm0, &t, &lg, &d, &s, &im, &iv, &w)) {
-      o->kind = (t == 2 || t == 3) ? kSlAluCall : kSlAluInline;  // adc/sbb call
+      o->kind = kSlAluInline;  // incl. adc/sbb (carry-in read from FL)
       o->t = t; o->lg = lg; o->d = d; o->s = s; o->im = im; o->w = w; o->iv = iv;
       o->need = GetNeededFlags(m, (i64)pcn, CF | ZF | SF | OF | AF | PF);
       regs |= 1u << d;
@@ -2565,6 +2707,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
   FlagsEnsure(bb, rc);
+  EmitPgInval(bb);
   bput(bb, 0x02); bput(bb, 0x40);  // block $B
   bput(bb, 0x03); bput(bb, 0x40);  // loop $L
   // attention check at loop top: if (m->attention) { m->ip = ip; exit }
@@ -2657,8 +2800,7 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
                 &wb)) {
     // pc is already past this insn; skip flag emission if all flags are dead.
     int need = GetNeededFlags(m, pc, CF | ZF | SF | OF | AF | PF);
-    if (t == 2 || t == 3) EmitAlu(bb, rc, t, log2, dst, src, imm, immv, wb);
-    else EmitAluInline(bb, rc, t, log2, dst, src, imm, immv, wb, false, need);
+    EmitAluInline(bb, rc, t, log2, dst, src, imm, immv, wb, false, need);
     return true;
   }
   if (AluAxDecode(h, rde, xedd->op.uimm0, &t, &log2, &immv)) {
@@ -2737,6 +2879,7 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
   bput(bb, 0x3a); bleb_u(bb, 0); bleb_u(bb, OFF_OPLEN);  // i32.store8
   EmitHandler(bb, rde, xedd->op.disp, xedd->op.uimm0, (u32)(uintptr_t)h);
   EmitCommitStash(bb);                // drain page-crossing store stash
+  EmitPgInval(bb);                    // handler may have remapped memory
   RcInval(rc);                        // handler may have changed regs
   return false;
 }
@@ -3002,6 +3145,7 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
     if (regs & (1u << r)) RcLoad(b, rc, r);
   }
   FlagsEnsure(b, rc);
+  EmitPgInval(b);
   if (usetbl) { EConstI(b, 0); ESet(b, TG); }
   bput(b, 0x02); bput(b, 0x40);   // block $EXIT
   bput(b, 0x03); bput(b, 0x40);   // loop $L
@@ -3268,6 +3412,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     rc.wrote = 0;
   }
 #endif
+  EmitPgInval(&bb);
   for (; count < PKJIT_MAXINSN; ++count) {
     if (GetInstruction(m, pc, &xedd)) break;
     u64 rde = xedd.op.rde;
@@ -3306,8 +3451,10 @@ assemble:
   bleb_u(&mb, content_len);
   bleb_u(&mb, 1);         // 1 function body
   bleb_u(&mb, body_len);
-  bput(&mb, 0x02); bput(&mb, 0x14); bput(&mb, 0x7e);  // 20 i64 (16 GPR + LT0..3)
-  bput(&mb, 0x04); bput(&mb, 0x7f);                   // 4 i32 (FL, HP0, HP1, TG)
+  bput(&mb, 0x02); bput(&mb, 0x15); bput(&mb, 0x7e);  // 21 i64 (16 GPR, LT0..3,
+                                                     //         PGV)
+  bput(&mb, 0x05); bput(&mb, 0x7f);                   // 5 i32 (FL, HP0, HP1,
+                                                     //        TG, PGH)
   bputs(&mb, bb.p, bb.n);
   bput(&mb, 0x0b);        // end
   if (mb.ovf) { free(mem); return false; }
@@ -3337,6 +3484,15 @@ static inline u32 HashLocal(u64 ip) {
 
 static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
                                     int first_compile) {
+  struct LocalHook *lh = &t_local[HashLocal(ip)];
+  // We only get here on a miss, a hash collision or a stale generation, so any
+  // idx already in this slot is about to lose its last reference: hand the
+  // table slot back first, so the install below reuses it instead of growing.
+  if (lh->idx) {
+    pk_jit_release((int)lh->idx);
+    lh->idx = 0;
+    lh->virt = 0;
+  }
   int idx = pk_jit_install(s->bytes, (int)s->len, first_compile);
   if (idx <= 0) {
     // The engine rejected the module (bad emission, or no SIMD support). Park
@@ -3345,7 +3501,6 @@ static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
     atomic_store_explicit(&s->state, kEmitting, memory_order_release);
     return 0;
   }
-  struct LocalHook *lh = &t_local[HashLocal(ip)];
   lh->idx = (u32)idx;
   lh->gen = gen;
   lh->virt = ip;

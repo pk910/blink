@@ -62,9 +62,20 @@ addToLibrary({
     try {
       // the block imports the shared memory (reads/writes the Machine struct) and
       // the shared function table (call_indirect to blink's static Op handlers).
-      var mod = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
+      // pk910: the compiled WebAssembly.Module is cached by (bytes pointer, len).
+      // blink never frees emitted bytes, so the pointer is a stable unique key
+      // per compiled block, and a block that gets evicted from the per-thread
+      // hash and later wanted again is re-INSTANTIATED, not re-COMPILED.
+      var key = ptr + ':' + len;
+      var mods = (globalThis.__pkJitMods || (globalThis.__pkJitMods = {}));
+      var mod = mods[key];
+      if (!mod) mod = mods[key] = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
       var inst = new WebAssembly.Instance(mod, { env: { mem: wasmMemory, tbl: wasmTable } });
-      var idx = wasmTable.grow(1); // returns the previous length = the new slot
+      // pk910: take a reclaimed slot before growing. Without this the table grew
+      // by one on every install and nothing ever came back, so a long-running
+      // guest with many hot entry points grew it without bound.
+      var free = (globalThis.__pkJitFree || (globalThis.__pkJitFree = []));
+      var idx = free.length ? free.pop() : wasmTable.grow(1); // grow returns the old length = the new slot
       wasmTable.set(idx, inst.exports.b);
       if (typeof ksys === 'function') {
         // firstCompile: the one thread that emitted this block's shared bytes.
@@ -75,12 +86,28 @@ addToLibrary({
           if (sl || fc === 1 || fc === 25 || fc % 250 === 0) { try { ksys('klog', ['wasmjit: emitted ' + (sl ? 'SELF-LOOP' : 'block') + ' #' + fc]); } catch (x) {} }
         }
         var n = (globalThis.__pkJitN = (globalThis.__pkJitN || 0) + 1);
-        if (n === 1 || n % 500 === 0) { try { ksys('klog', ['wasmjit: instantiated ' + n + ' (this thread)']); } catch (x) {} }
+        if (n === 1 || n % 500 === 0) { try { ksys('klog', ['wasmjit: instantiated ' + n + ' (this thread, table=' + wasmTable.length + ' free=' + free.length + ')']); } catch (x) {} }
       }
       return idx;
     } catch (e) {
       try { ksys('klog', ['wasmjit install failed: ' + (e && (e.stack || e.message) ? String(e.stack || e.message).slice(0, 200) : e)]); } catch (x) {}
       return 0;
+    }
+  },
+
+  // pk910: blink evicted the only reference to this table slot (a per-thread
+  // hash collision or a stale-generation block), so the slot goes on the free
+  // list for the next install. Safe even if that function is on the stack right
+  // now: call_indirect resolved the entry at call time and the Instance stays
+  // alive through the frame that is running it. The list is per worker, like the
+  // table itself - emscripten gives each pthread its own.
+  pk_jit_release__proxy: 'none',
+  pk_jit_release: function (idx) {
+    if (idx > 0) {
+      try {
+        wasmTable.set(idx, null);
+        (globalThis.__pkJitFree || (globalThis.__pkJitFree = [])).push(idx);
+      } catch (e) {}
     }
   },
 
