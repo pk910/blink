@@ -287,12 +287,14 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define MP_RD_SLOW  3  // handler fallback (any reason)
 #define MP_RD_INVAL 4  // ... because m->invalidated was set
 #define MP_RD_CROSS 5  // ... because the access crosses a page boundary
+#define MP_RD_UNAL  6  // (not slow) access not naturally aligned
 #define MP_WR_TOTAL 8
 #define MP_WR_PGH   9
 #define MP_WR_TLB   10
 #define MP_WR_SLOW  11
 #define MP_WR_INVAL 12
 #define MP_WR_CROSS 13
+#define MP_WR_UNAL  14
 u64 g_memprof[16];
 u64 g_aluprof[64];   // indexed by the compacted GetNeededFlags mask
 u64 g_alutot;
@@ -314,17 +316,20 @@ void WasmJitProfDump(void) {
   u64 rt = g_memprof[MP_RD_TOTAL], wt = g_memprof[MP_WR_TOTAL];
   fprintf(stderr,
           "MEMPROF rd=%llu pgh=%llu tlb=%llu slow=%llu(inval=%llu cross=%llu) "
-          "wr=%llu pgh=%llu tlb=%llu slow=%llu(inval=%llu cross=%llu)\n",
+          "unal=%llu wr=%llu pgh=%llu tlb=%llu slow=%llu(inval=%llu cross=%llu) "
+          "unal=%llu\n",
           (unsigned long long)rt, (unsigned long long)g_memprof[MP_RD_PGH],
           (unsigned long long)g_memprof[MP_RD_TLB],
           (unsigned long long)g_memprof[MP_RD_SLOW],
           (unsigned long long)g_memprof[MP_RD_INVAL],
-          (unsigned long long)g_memprof[MP_RD_CROSS], (unsigned long long)wt,
+          (unsigned long long)g_memprof[MP_RD_CROSS],
+          (unsigned long long)g_memprof[MP_RD_UNAL], (unsigned long long)wt,
           (unsigned long long)g_memprof[MP_WR_PGH],
           (unsigned long long)g_memprof[MP_WR_TLB],
           (unsigned long long)g_memprof[MP_WR_SLOW],
           (unsigned long long)g_memprof[MP_WR_INVAL],
-          (unsigned long long)g_memprof[MP_WR_CROSS]);
+          (unsigned long long)g_memprof[MP_WR_CROSS],
+          (unsigned long long)g_memprof[MP_WR_UNAL]);
   fprintf(stderr, "ALUPROF total=%llu:", (unsigned long long)g_alutot);
   for (i = 0; i < 64; ++i) {
     if (g_aluprof[i]) {
@@ -1071,6 +1076,14 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
   } else {
     ESet(b, HP1);
   }
+#ifdef PKJIT_MEMPROF
+  if (size > 1) {  // how much would a TinyEMU-style aligned-only tag cost us?
+    EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, size - 1); bput(b, I32_AND);
+    bput(b, 0x04); bput(b, 0x40);
+    PROF(b, MP_RD_UNAL);
+    bput(b, 0x0b);
+  }
+#endif
   // LT2 = addr & -4096 ; take the cached host page if it is the same page
   EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
   bput(b, 0x22); bleb_u(b, LT2);  // local.tee
@@ -1086,11 +1099,11 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
   // HP0 = m + ((addr>>12) & (TLB_ENTRIES-1))*sizeof(MachineTlb)
   // (tlb slot; OFF_TLB applied at each load). Same index FindPageTableEntry
   // computes, so a JIT hit and an interpreter hit are the same entry.
-  _Static_assert(sizeof(struct MachineTlb) == 16, "tlb slot shift is 4");
+  _Static_assert(sizeof(struct MachineTlb) == 32, "tlb slot shift is 5");
   _Static_assert((TLB_ENTRIES & (TLB_ENTRIES - 1)) == 0, "tlb size pow2");
   EGet(b, LT2); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
   EConstI(b, TLB_ENTRIES - 1); bput(b, I32_AND);
-  EConstI(b, 4); bput(b, I32_SHL);
+  EConstI(b, 5); bput(b, I32_SHL);
   EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
   // tlb.page != (addr & -4096) -> slow  (br 1: we are one `if` deeper here)
   EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
@@ -1112,13 +1125,11 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
     EConst(b, (i64)want);
   }
   bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
-  // ch = g_hostpages.p[(entry & PAGE_TA) >> 12] (host base of the page)
-  EConstI(b, (i32)(uintptr_t)&g_hostpages.p);
-  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p
-  EGet(b, LT2); EConst(b, (i64)PAGE_TA); EBin(b, I64_AND);
-  EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
-  EConstI(b, 2); bput(b, I32_SHL); bput(b, I32_ADD);
-  bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p[idx] (page base)
+  // ch = tlb.host, the addend FindPageTableEntry cached when it filled this
+  // entry. Was `g_hostpages.p` then `p[(entry & PAGE_TA) >> 12]`: two dependent
+  // loads and 13 ops on the arm that takes 79% of reads and 95% of writes.
+  _Static_assert(offsetof(struct MachineTlb, host) == 16, "tlb host at +16");
+  EGet(b, HP0); bput(b, 0x28); bleb_u(b, 2); bleb_u(b, OFF_TLB + 16);
   bput(b, 0x22); bleb_u(b, PGH);               // local.tee PGH
   EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
   // arm the cache LAST, so nothing above can leave it armed after a br $slow
