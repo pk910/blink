@@ -66,10 +66,21 @@ addToLibrary({
       // blink never frees emitted bytes, so the pointer is a stable unique key
       // per compiled block, and a block that gets evicted from the per-thread
       // hash and later wanted again is re-INSTANTIATED, not re-COMPILED.
+      // BOUNDED, deliberately: a WebAssembly.Module costs ~12 KB of RSS and a
+      // strong reference pins it forever, and exceeding V8's committed code space
+      // is FatalProcessOutOfMemory - the tab dies, and it is not catchable. So the
+      // cache is an LRU over the hot working set; a miss just recompiles, which is
+      // what happened before the cache existed.
       var key = ptr + ':' + len;
-      var mods = (globalThis.__pkJitMods || (globalThis.__pkJitMods = {}));
-      var mod = mods[key];
-      if (!mod) mod = mods[key] = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
+      var mods = (globalThis.__pkJitMods || (globalThis.__pkJitMods = new Map()));
+      var mod = mods.get(key);
+      if (mod) {
+        mods.delete(key);   // re-insert to move it to the young end
+      } else {
+        mod = new WebAssembly.Module(HEAPU8.slice(ptr, ptr + len));
+      }
+      mods.set(key, mod);
+      while (mods.size > 512) mods.delete(mods.keys().next().value);
       var inst = new WebAssembly.Instance(mod, { env: { mem: wasmMemory, tbl: wasmTable } });
       // pk910: take a reclaimed slot before growing. Without this the table grew
       // by one on every install and nothing ever came back, so a long-running
@@ -127,6 +138,7 @@ addToLibrary({
       if (!PKSYS._sabU8[i]) PKSYS._sabU8[i] = new Uint8Array(globalThis.__pkFileSabs[i]);
       return PKSYS._sabU8[i];
     },
+    umaskVal: 18, // 0o022
     rawActive: false,
     termios: {
       c_iflag: 0o25156 & 0xffff, c_oflag: 5, c_cflag: 191, c_lflag: 35387,
@@ -544,12 +556,9 @@ addToLibrary({
   // ── files ──
   __syscall_openat__deps: ['$PKSYS'],
   __syscall_openat__proxy: 'none',
-  __syscall_openat: function (dirfd, path, flags, varargs) {
+  __syscall_openat: function (dirfd, path, flags) {
     try {
-      // O_CREAT (64) puts the mode in the varargs slot; without it there is
-      // nothing to read and the kernel picks the default
-      var mode = (flags & 64) && varargs ? HEAP32[varargs >> 2] : undefined;
-      var r = ksys('openat', [PKSYS.atPath(dirfd, path), flags >>> 0, mode]);
+      var r = ksys('openat', [PKSYS.atPath(dirfd, path), flags >>> 0]);
       if (r !== null && typeof r === 'object') {
         // shared-SAB read-only file: cache the SAB view so reads stay local
         if (r.sab >= 0) PKSYS.cache[r.fd] = { u8: PKSYS.sabU8(r.sab), pos: 0, len: r.len };
@@ -680,13 +689,10 @@ addToLibrary({
   __syscall_fchmod: function (fd, mode) { try { ksys('chmod', [ksys('fdpath', [fd]), mode & 0o7777]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_fchmodat2__deps: ['$PKSYS'],
   __syscall_fchmodat2__proxy: 'none',
-  __syscall_fchmodat2: function (dirfd, path, mode, flags) { try { ksys('chmod', [PKSYS.atPath(dirfd, path), mode & 0o7777]); return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_fchmodat2: function (dirfd, path, mode) { try { ksys('chmod', [PKSYS.atPath(dirfd, path), mode & 0o7777]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_faccessat__deps: ['$PKSYS'],
   __syscall_faccessat__proxy: 'none',
-  __syscall_faccessat: function (dirfd, path, amode, flags) {
-    // R_OK/W_OK/X_OK against the real uid, AT_SYMLINK_NOFOLLOW (0x100) honoured
-    try { ksys('access', [PKSYS.atPath(dirfd, path), amode | 0, (flags & 0x100) !== 0]); return 0; } catch (e) { return PKSYS.errS(e); }
-  },
+  __syscall_faccessat: function (dirfd, path) { try { ksys('stat', [PKSYS.atPath(dirfd, path)]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_readlinkat__deps: ['$PKSYS'],
   __syscall_readlinkat__proxy: 'none',
   __syscall_readlinkat: function (dirfd, path, buf, bufsize) {
@@ -697,7 +703,7 @@ addToLibrary({
   __syscall_symlinkat__proxy: 'none',
   __syscall_symlinkat: function (target, dirfd, linkpath) { try { ksys('symlink', [PKSYS.cstr(target), PKSYS.atPath(dirfd, linkpath)]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_linkat__proxy: 'none',
-  __syscall_linkat: function (olddirfd, oldpath, newdirfd, newpath, flags) { return -1; }, // EPERM: no hard links
+  __syscall_linkat: function () { return -1; }, // EPERM
   __syscall_utimensat__proxy: 'none',
   __syscall_utimensat__deps: ['$PKSYS'],
   __syscall_utimensat__proxy: 'none',
@@ -728,8 +734,7 @@ addToLibrary({
   __syscall_fchownat: function (dirfd, path, uid, gid, flags) { try { ksys('chown', [PKSYS.atPath(dirfd, path), uid | 0, gid | 0, (flags & 0x100) !== 0]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_umask__deps: ['$PKSYS'],
   __syscall_umask__proxy: 'none',
-  // the mask belongs to the process, and the kernel is what creates the files
-  __syscall_umask: function (m) { try { return ksys('umask', [m & 0o777]); } catch (e) { return PKSYS.errS(e); } },
+  __syscall_umask: function (m) { var prev = PKSYS.umaskVal; PKSYS.umaskVal = m & 0o777; return prev; },
 
   // ── fds / ids / pipes ──
   __syscall_dup__deps: ['$PKSYS'],
@@ -760,7 +765,7 @@ addToLibrary({
   __syscall_getegid32: function () { try { return ksys('getids', []).egid | 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_pipe2__deps: ['$PKSYS'],
   __syscall_pipe2__proxy: 'none',
-  __syscall_pipe2: function (fdptr, flags) { try { var fds = ksys('pipe', [flags | 0]); HEAP32[fdptr >> 2] = fds[0]; HEAP32[(fdptr + 4) >> 2] = fds[1]; return 0; } catch (e) { return PKSYS.errS(e); } },
+  __syscall_pipe2: function (fdptr) { try { var fds = ksys('pipe', []); HEAP32[fdptr >> 2] = fds[0]; HEAP32[(fdptr + 4) >> 2] = fds[1]; return 0; } catch (e) { return PKSYS.errS(e); } },
 
   // ── ioctl: termios + winsize (ENOTTY on non-tty so isatty is honest) ──
   __syscall_ioctl__deps: ['$PKSYS'],
@@ -945,18 +950,7 @@ addToLibrary({
   js_hello__deps: ['$PKSYS'],
   js_hello__proxy: 'none',
   js_hello: function (pid, kind) {
-    try {
-      // A fork child is a new process and needs its own pending-signal word:
-      // sharing the founder's meant an alarm or a SIGCHLD raised for one
-      // process was read by every process in the heap group. This thread mints
-      // it and hands it over here, because a SharedArrayBuffer cannot come back
-      // through the synchronous channel. A thread of a process that already has
-      // one keeps reading that one (kind 1).
-      var sab = kind === 0 && typeof SharedArrayBuffer !== 'undefined' ? new SharedArrayBuffer(4) : null;
-      ksys('hello', [pid | 0, kind | 0, sab]);
-      if (sab && typeof globalThis.__pkSetSigSab === 'function') globalThis.__pkSetSigSab(sab);
-      return 0;
-    } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
+    try { ksys('hello', [pid | 0, kind | 0]); return 0; } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
   // exit_group on a shared runtime: fire-and-forget the exit to the kernel (no
   // wait - this pthread is about to end and reclaim its pool worker). The kernel
@@ -1093,18 +1087,14 @@ addToLibrary({
       return 0;
     } catch (e) { return PKSYS.errS(e); }
   },
-  // emscripten's socket syscalls keep the old socketcall arity: six slots
-  // whatever the call uses. The unused tail has to be declared, or the
-  // pointer-signature pass (which runs once the heap can pass 2 GB) rejects
-  // the function for being shorter than its signature.
   __syscall_bind__deps: ['$PKSYS'],
   __syscall_bind__proxy: 'none',
-  __syscall_bind: function (fd, addr, len, _d, _e, _f) {
+  __syscall_bind: function (fd, addr, len) {
     try { ksys('bind', [fd, PKSYS.readSockaddr(addr, len)]); return 0; } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_connect__deps: ['$PKSYS'],
   __syscall_connect__proxy: 'none',
-  __syscall_connect: function (fd, addr, len, _d, _e, _f) {
+  __syscall_connect: function (fd, addr, len) {
     try { ksys('connect', [fd, PKSYS.readSockaddr(addr, len)]); return 0; } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_listen__deps: ['$PKSYS'],
@@ -1114,7 +1104,7 @@ addToLibrary({
   },
   __syscall_accept4__deps: ['$PKSYS'],
   __syscall_accept4__proxy: 'none',
-  __syscall_accept4: function (fd, addr, addrlen, flags, _e, _f) {
+  __syscall_accept4: function (fd, addr, addrlen, flags) {
     try {
       var r = ksys('accept', [fd, { nonblock: (flags & 2048) !== 0 }]);
       if (addr && addrlen) PKSYS.writeSockaddr(addr, addrlen, r.peer);
@@ -1123,12 +1113,12 @@ addToLibrary({
   },
   __syscall_getsockname__deps: ['$PKSYS'],
   __syscall_getsockname__proxy: 'none',
-  __syscall_getsockname: function (fd, addr, addrlen, _d, _e, _f) {
+  __syscall_getsockname: function (fd, addr, addrlen) {
     try { PKSYS.writeSockaddr(addr, addrlen, ksys('getsockname', [fd])); return 0; } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_getpeername__deps: ['$PKSYS'],
   __syscall_getpeername__proxy: 'none',
-  __syscall_getpeername: function (fd, addr, addrlen, _d, _e, _f) {
+  __syscall_getpeername: function (fd, addr, addrlen) {
     try { PKSYS.writeSockaddr(addr, addrlen, ksys('getpeername', [fd])); return 0; } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_shutdown__deps: ['$PKSYS'],
@@ -1157,7 +1147,7 @@ addToLibrary({
   },
   __syscall_sendmsg__deps: ['$PKSYS'],
   __syscall_sendmsg__proxy: 'none',
-  __syscall_sendmsg: function (fd, msg, flags, _d, _e, _f) {
+  __syscall_sendmsg: function (fd, msg, flags) {
     try {
       var name = HEAPU32[msg >> 2];
       var namelen = HEAPU32[(msg + 4) >> 2];
@@ -1168,7 +1158,7 @@ addToLibrary({
   },
   __syscall_recvmsg__deps: ['$PKSYS'],
   __syscall_recvmsg__proxy: 'none',
-  __syscall_recvmsg: function (fd, msg, flags, _d, _e, _f) {
+  __syscall_recvmsg: function (fd, msg, flags) {
     try {
       var name = HEAPU32[msg >> 2];
       var iov = HEAPU32[(msg + 8) >> 2];
@@ -1185,7 +1175,7 @@ addToLibrary({
   },
   __syscall_getsockopt__deps: ['$PKSYS'],
   __syscall_getsockopt__proxy: 'none',
-  __syscall_getsockopt: function (fd, level, optname, optval, optlen, _f) {
+  __syscall_getsockopt: function (fd, level, optname, optval, optlen) {
     try {
       var v = ksys('getsockopt', [fd, level, optname]);
       PKSYS.writeOptVal(v, optval, optlen);
@@ -1194,7 +1184,7 @@ addToLibrary({
   },
   __syscall_setsockopt__deps: ['$PKSYS'],
   __syscall_setsockopt__proxy: 'none',
-  __syscall_setsockopt: function (fd, level, optname, optval, optlen, _f) {
+  __syscall_setsockopt: function (fd, level, optname, optval, optlen) {
     try {
       ksys('setsockopt', [fd, level, optname, PKSYS.readOptVal(level, optname, optval, optlen)]);
       return 0;
