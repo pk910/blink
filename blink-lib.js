@@ -500,6 +500,14 @@ addToLibrary({
       if (wantRaw !== PKSYS.rawActive) {
         try { ksys('ioctl', [0, 'raw', wantRaw]); PKSYS.rawActive = wantRaw; } catch (e) { if (e && e.__exit) throw e; }
       }
+      // OPOST|ONLCR: the tty adds the carriage return to a bare \n. Curses
+      // programs read termios back and emit bare newlines when it is on, so
+      // the tty has to mean it. Sent on every TCSETS and never cached: the
+      // raw ioctl above clears ONLCR as a side effect, so a cached "no change"
+      // would leave the tty with the opposite of what termios just asked for
+      // (which is exactly how less ended up stair-stepping).
+      var wantOnlcr = (data.c_oflag & 1) !== 0 && (data.c_oflag & 4) !== 0;
+      try { ksys('ioctl', [0, 'onlcr', wantOnlcr]); } catch (e) { if (e && e.__exit) throw e; }
       return 0;
     },
     winsize: function () {
