@@ -867,9 +867,14 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
   // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
   EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_INVAL);  // i32.load8_u
   bput(b, 0x0d); bleb_u(b, 0);    // br_if $slow
-  // HP0 = m + ((addr>>12) & 31)*16   (tlb slot; OFF_TLB applied at each load)
+  // HP0 = m + ((addr>>12) & (TLB_ENTRIES-1))*sizeof(MachineTlb)
+  // (tlb slot; OFF_TLB applied at each load). Same index FindPageTableEntry
+  // computes, so a JIT hit and an interpreter hit are the same entry.
+  _Static_assert(sizeof(struct MachineTlb) == 16, "tlb slot shift is 4");
+  _Static_assert((TLB_ENTRIES & (TLB_ENTRIES - 1)) == 0, "tlb size pow2");
   EGet(b, LT3); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
-  EConstI(b, 31); bput(b, I32_AND); EConstI(b, 4); bput(b, I32_SHL);
+  EConstI(b, TLB_ENTRIES - 1); bput(b, I32_AND);
+  EConstI(b, 4); bput(b, I32_SHL);
   EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
   // tlb.page != (addr & -4096) -> slow
   EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);

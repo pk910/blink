@@ -342,6 +342,14 @@ struct MachineTlb {
   u64 entry;
 };
 
+// pk910: softmmu TLB size. Direct-mapped, indexed (addr >> 12) & (N-1), so a
+// working set that sweeps more than N pages misses every time and pays a
+// four-level radix walk. 32 was tiny; 1024 covers 4 MiB of stride-walked guest
+// pages for 16 KiB per guest thread. Must be a power of two, and the mask is
+// ALSO baked into the wasm JIT's inlined fast path (EmitMemBegin) - keep the
+// two in sync through this macro.
+#define TLB_ENTRIES 1024
+
 struct Machine {               //
   u64 ip;                      // instruction pointer
   u8 oplen;                    // length of operation
@@ -443,7 +451,7 @@ struct Machine {               //
   bool boop;                             //
   i8 trapno;                             //
   i8 segvcode;                           //
-  struct MachineTlb tlb[32];             //
+  struct MachineTlb tlb[TLB_ENTRIES];    //
   sigjmp_buf onhalt;                     //
   struct sigaltstack_linux sigaltstack;  //
   i64 robust_list;                       //
