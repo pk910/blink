@@ -113,6 +113,7 @@ static _Thread_local struct LocalHook *t_local;
 static _Thread_local u8 *t_scratch;
 static _Thread_local int t_wasloop;  // diag: last emit was a self-loop
 static int g_pkjit_ready;
+static u32 g_rdemote;  // regions whose loops would not stackify (diag)
 static _Atomic(u32) g_emits;
 // Bumped whenever the guest writes an executable page (SMC); stale-gen blocks are
 // never executed and get re-emitted. Called from smc.c AddPageToSmcQueue.
@@ -2216,27 +2217,170 @@ static void RegionSync(struct Buf *b, struct Rc *rc, u16 regs) {
   FlagsEnsure(b, rc);
 }
 
+// ── wasm scope placement ────────────────────────────────────────────────────
+// A region's control flow needs one wasm scope per branch target:
+//   loop $Lh   spans layout positions [h, e], opened before CODE_h and closed
+//              after CODE_e; a BACKWARD edge into h is `br $Lh`. Its start is
+//              fixed at the header, its end can be extended later.
+//   block $Bq  spans [s, q-1], opened before CODE_s and closed just before
+//              CODE_q; a FORWARD edge to q is `br $Bq`. Its end is fixed at the
+//              target, its start can be extended earlier.
+// Scopes must nest, so an improper overlap is repaired by growing whichever one
+// is allowed to grow (this is LLVM's CFGStackify, cut down to what we need). An
+// overlap neither rule can fix means a forward branch into the middle of a loop,
+// which a reducible CFG cannot produce; we give the whole region up instead.
+//
+// The previous shape - one `loop` around everything plus a br_table keyed on a
+// dispatch local - made every backward edge whose target was not laid out first
+// pay a br_table, a dispatch-local store and an m->ip store PER ITERATION. That
+// is what following calls into a region exposed: a hot loop ends up buried at
+// some interior position of a 48-block region, and its inner loop was paying
+// dispatch on every trip.
+#define PKJIT_RSCOPES 160
+
+struct RScope {
+  int kind;    // 0 block (forward target), 1 loop (backward target)
+  int key;     // layout position of the target block
+  int s, e;    // inclusive layout span
+  int opened;
+};
+
+struct RStack {
+  int idx[PKJIT_RSCOPES + 1];  // scope indices, outermost first; [0] = -1 = $EXIT
+  int n;
+};
+
+// Layout positions this block can branch to, and whether the edge actually
+// emits a branch (a fallthrough to the next position emits nothing).
+static int RSuccs(struct RBlock *bs, const int *order, int nl, int i, int *out,
+                  int *needbr) {
+  struct RBlock *bl = &bs[order[i]];
+  int n = 0, k;
+  switch (bl->term) {
+    case kTermJcc:
+      if (bl->s_tgt >= 0 && bs[bl->s_tgt].pos >= 0) {
+        out[n] = bs[bl->s_tgt].pos;
+        needbr[n++] = 1;  // the taken edge sits inside an `if`, always a branch
+      }
+      if (bl->s_fall >= 0 && bs[bl->s_fall].pos >= 0) {
+        out[n] = bs[bl->s_fall].pos;
+        needbr[n] = bs[bl->s_fall].pos != i + 1;
+        ++n;
+      }
+      break;
+    case kTermJmp:
+    case kTermFall:
+    case kTermCall:
+      if (bl->s_tgt >= 0 && bs[bl->s_tgt].pos >= 0) {
+        out[n] = bs[bl->s_tgt].pos;
+        needbr[n] = bs[bl->s_tgt].pos != i + 1;
+        ++n;
+      }
+      break;
+    case kTermRet:
+      // the guard only tests return sites laid out AFTER this ret, so every
+      // guard edge is a forward `br`. A backward guard edge would be a fake
+      // loop scope - a return site is not a loop header - and forward branches
+      // from before it into its span are common, which is precisely the shape
+      // that cannot be stackified. The natural layout (call, callee, return
+      // site) puts the common case forward anyway; a backward one just leaves
+      // the region, which is what it did before calls were followed at all.
+      for (k = i + 1; k < nl; ++k) {
+        if (!bs[order[k]].isret) continue;
+        out[n] = k;
+        needbr[n++] = 1;
+      }
+      break;
+    default:
+      break;
+  }
+  return n;
+}
+
+static bool RScopes(struct RBlock *bs, const int *order, int nl,
+                    struct RScope *sc, int *nsc) {
+  int succ[PKJIT_RBLOCKS + 2], needbr[PKJIT_RBLOCKS + 2];
+  int i, k, j, n = 0, ns, pass;
+  for (i = 0; i < nl; ++i) {
+    ns = RSuccs(bs, order, nl, i, succ, needbr);
+    for (k = 0; k < ns; ++k) {
+      int q = succ[k], kind, found = -1;
+      if (!needbr[k]) continue;
+      kind = (q <= i) ? 1 : 0;
+      for (j = 0; j < n; ++j) {
+        if (sc[j].kind == kind && sc[j].key == q) { found = j; break; }
+      }
+      if (found < 0) {
+        if (n >= PKJIT_RSCOPES) return false;
+        found = n++;
+        sc[found].kind = kind;
+        sc[found].key = q;
+        sc[found].s = kind ? q : i;
+        sc[found].e = kind ? i : q - 1;
+      }
+      if (kind) {
+        if (i > sc[found].e) sc[found].e = i;
+      } else if (i < sc[found].s) {
+        sc[found].s = i;
+      }
+    }
+  }
+  for (pass = 0;; ++pass) {  // grow scopes until they nest
+    int changed = 0;
+    if (pass == 32) return false;
+    for (i = 0; i < n; ++i) {
+      for (k = 0; k < n; ++k) {
+        if (i == k) continue;
+        if (!(sc[i].s < sc[k].s && sc[k].s <= sc[i].e && sc[i].e < sc[k].e)) {
+          continue;
+        }
+        if (sc[i].kind == 1) {
+          sc[i].e = sc[k].e;  // a loop may end later
+        } else if (sc[k].kind == 0) {
+          sc[k].s = sc[i].s;  // a block may start earlier
+        } else {
+          return false;  // block outside, loop inside: not stackifiable
+        }
+        changed = 1;
+      }
+    }
+    if (!changed) break;
+  }
+  *nsc = n;
+  return true;
+}
+
+// br depth of an open scope, counted from the innermost. -1 = not open, which
+// means scope placement and emission disagree and the region must be dropped.
+static int SDepth(const struct RScope *sc, const struct RStack *st, int kind,
+                  int key) {
+  int k;
+  for (k = st->n - 1; k >= 1; --k) {
+    if (sc[st->idx[k]].kind == kind && sc[st->idx[k]].key == key) {
+      return st->n - 1 - k;
+    }
+  }
+  return -1;
+}
+
 // Emit the control transfer from the block at layout position `i` to successor
 // `s` (block index, -1 = leaves the region at address `addr`). `extra` is the
 // extra wasm nesting depth at the emission point (1 inside an `if`).
-static void EmitGoto(struct Buf *b, struct RBlock *bs, int s, u64 addr, int i,
-                     int nl, int extra, int usetbl) {
+static bool EmitGoto(struct Buf *b, struct RBlock *bs, const struct RScope *sc,
+                     const struct RStack *st, int s, u64 addr, int i,
+                     int extra) {
   int p = (s >= 0) ? bs[s].pos : -1;
+  int d;
   if (p < 0) {  // leaves the region
     EGet(b, 0); EConst(b, (i64)addr); EStore(b, OFF_IP);
-    bput(b, 0x0c); bleb_u(b, (u64)(nl - i + extra));      // br $EXIT
-    return;
+    bput(b, 0x0c); bleb_u(b, (u64)(st->n - 1 + extra));   // br $EXIT
+    return true;
   }
-  if (p == i + 1 && !extra) return;                       // natural fallthrough
-  if (p > i) {                                            // forward: direct br
-    bput(b, 0x0c); bleb_u(b, (u64)(p - i - 1 + extra));   // br $B_p
-    return;
-  }
-  if (usetbl) {  // backward into a multi-entry loop: go through the dispatch
-    EGet(b, 0); EConst(b, (i64)bs[s].start); EStore(b, OFF_IP);
-    EConstI(b, p); ESet(b, TG);
-  }
-  bput(b, 0x0c); bleb_u(b, (u64)(nl - 1 - i + extra));    // br $L
+  if (p == i + 1 && !extra) return true;                  // natural fallthrough
+  d = SDepth(sc, st, p <= i ? 1 : 0, p);
+  if (d < 0) return false;
+  bput(b, 0x0c); bleb_u(b, (u64)(d + extra));
+  return true;
 }
 
 // One emission pass over the laid-out region. `regs` is the set of GPRs hoisted
@@ -2244,43 +2388,51 @@ static void EmitGoto(struct Buf *b, struct RBlock *bs, int s, u64 addr, int i,
 // computes it (rc->touched), then re-run with the result.
 static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
                            struct RBlock *bs, const int *order, int nl,
-                           u16 regs, int usetbl, int hasback, u64 ip) {
+                           u16 regs, struct RScope *sc, int nsc) {
   struct XedDecodedInst x;
-  int i, r;
+  struct RStack st;
+  int i, k, r;
   bool inherit = false;
   RcInval(rc);
+  for (k = 0; k < nsc; ++k) sc[k].opened = 0;
   // preamble: hoist the region's registers and flags into locals
   for (r = 0; r < 16; ++r) {
     if (regs & (1u << r)) RcLoad(b, rc, r);
   }
   FlagsEnsure(b, rc);
-  if (usetbl) { EConstI(b, 0); ESet(b, TG); }
   bput(b, 0x02); bput(b, 0x40);   // block $EXIT
-  bput(b, 0x03); bput(b, 0x40);   // loop $L
-  if (hasback) {  // let signals through: leave when the machine wants attention
-    EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_ATT);  // i32.load8_u
-    bput(b, 0x04); bput(b, 0x40);                                 // if
-    if (!usetbl) { EGet(b, 0); EConst(b, (i64)ip); EStore(b, OFF_IP); }
-    bput(b, 0x0c); bleb_u(b, 2);                                  // br $EXIT
-    bput(b, 0x0b);                                                // end if
-  }
-  if (usetbl) {  // block $B{nl-1} .. block $B0 { br_table } end $B0
-    for (i = nl - 1; i >= 0; --i) { bput(b, 0x02); bput(b, 0x40); }
-    EGet(b, TG);
-    bput(b, 0x0e); bleb_u(b, (u64)nl);          // br_table, nl targets + default
-    for (i = 0; i < nl; ++i) bleb_u(b, (u64)i);
-    bleb_u(b, 0);                               // default -> block 0
-    bput(b, 0x0b);                              // end $B0
-  } else {
-    for (i = nl - 1; i >= 1; --i) { bput(b, 0x02); bput(b, 0x40); }
-  }
+  st.n = 0;
+  st.idx[st.n++] = -1;            // $EXIT is stack[0]
   for (i = 0; i < nl; ++i) {
     struct RBlock *bl = &bs[order[i]];
     u64 pc = bl->start;
-    if (i) {
-      bput(b, 0x0b);  // end $B_i - control now joins here
-      if (!inherit) RcEnterBlock(rc, regs);
-    } else {
+    for (;;) {  // open the scopes that start here, outermost (widest) first
+      int best = -1;
+      for (k = 0; k < nsc; ++k) {
+        if (sc[k].s != i || sc[k].opened) continue;
+        if (best < 0 || sc[k].e > sc[best].e ||
+            (sc[k].e == sc[best].e && sc[k].kind > sc[best].kind)) {
+          best = k;
+        }
+      }
+      if (best < 0) break;
+      sc[best].opened = 1;
+      bput(b, sc[best].kind ? 0x03 : 0x02); bput(b, 0x40);  // loop / block
+      st.idx[st.n++] = best;
+      if (sc[best].kind) {
+        // let signals through: a loop that never leaves wasm would otherwise
+        // make a spinning guest uninterruptible. m->ip is the header, a
+        // constant, so the back edge itself needs no ip bookkeeping at all.
+        EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_ATT);
+        bput(b, 0x04); bput(b, 0x40);                       // if
+        EGet(b, 0); EConst(b, (i64)bl->start); EStore(b, OFF_IP);
+        bput(b, 0x0c); bleb_u(b, (u64)st.n);                // br $EXIT
+        bput(b, 0x0b);                                      // end if
+      }
+    }
+    if (i && !inherit) {
+      RcEnterBlock(rc, regs);
+    } else if (!i) {
       RcEnterBlock(rc, regs);
       if (bl->preds <= 1) {  // no back edge: the preamble just loaded them
         for (r = 0; r < 16; ++r) rc->dirty[r] = 0;
@@ -2304,26 +2456,21 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
       pc += ol;
       if (b->ovf) return false;
     }
-    // terminator
     switch (bl->term) {
       case kTermJcc:
         RegionSync(b, rc, regs);
         EmitCond(b, bl->cc);
         bput(b, 0x04); bput(b, 0x40);  // if (taken)
-        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 1, usetbl);
+        if (!EmitGoto(b, bs, sc, &st, bl->s_tgt, bl->tgt, i, 1)) return false;
         bput(b, 0x0b);                 // end if
-        EmitGoto(b, bs, bl->s_fall, bl->fall, i, nl, 0, usetbl);
-        if (bl->s_fall >= 0 && bs[bl->s_fall].pos == i + 1 &&
-            bs[bl->s_fall].preds == 1) {
-          inherit = true;
-        } else {
-          inherit = false;
-        }
+        if (!EmitGoto(b, bs, sc, &st, bl->s_fall, bl->fall, i, 0)) return false;
+        inherit = (bl->s_fall >= 0 && bs[bl->s_fall].pos == i + 1 &&
+                   bs[bl->s_fall].preds == 1);
         break;
       case kTermJmp:
       case kTermFall:
         RegionSync(b, rc, regs);
-        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 0, usetbl);
+        if (!EmitGoto(b, bs, sc, &st, bl->s_tgt, bl->tgt, i, 0)) return false;
         inherit = (bl->s_tgt >= 0 && bs[bl->s_tgt].pos == i + 1 &&
                    bs[bl->s_tgt].preds == 1);
         break;
@@ -2339,19 +2486,17 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
         EmitPush(b, rc, -1, bl->fall, rde, x.op.disp, x.op.uimm0,
                  (u32)(uintptr_t)GetOp(Mopcode(rde)), bl->fall, ol);
         RegionSync(b, rc, regs);
-        EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 0, usetbl);
+        if (!EmitGoto(b, bs, sc, &st, bl->s_tgt, bl->tgt, i, 0)) return false;
         inherit = (bl->s_tgt >= 0 && bs[bl->s_tgt].pos == i + 1 &&
                    bs[bl->s_tgt].preds == 1);
         break;
       }
       case kTermRet: {
         // pop into m->ip, then match it against the region's known return
-        // sites; a hit re-enters that block through the loop dispatch, a miss
-        // (recursion below the region entry, or a caller outside it) leaves
-        // with m->ip already correct.
+        // sites; a hit branches straight to that block, a miss (recursion, or a
+        // caller outside the region) leaves with m->ip already correct.
         u64 rde;
         u32 ol;
-        int k;
         if (GetInstruction(m, bl->end, &x)) return false;
         rde = x.op.rde;
         ol = Oplength(rde);
@@ -2360,40 +2505,41 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
                 (u32)(uintptr_t)GetOp(Mopcode(rde)), bl->tgt, ol);
         RegionSync(b, rc, regs);
         EGet(b, 0); ELoad(b, OFF_IP); ESet(b, LT2);
-        for (k = 0; k < nl; ++k) {
+        for (k = i + 1; k < nl; ++k) {  // forward guard edges only (see RSuccs)
           if (!bs[order[k]].isret) continue;
           EGet(b, LT2);
           EConst(b, (i64)bs[order[k]].start);
           bput(b, 0x51);                 // i64.eq
           bput(b, 0x04); bput(b, 0x40);  // if (void)
-          if (k > i) {                   // forward: straight out of block $B_k
-            bput(b, 0x0c); bleb_u(b, (u64)(k - i));
-          } else {                       // backward: through the loop dispatch
-            EConstI(b, k); ESet(b, TG);
-            bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $L (extra depth 1)
+          if (!EmitGoto(b, bs, sc, &st, order[k], bs[order[k]].start, i, 1)) {
+            return false;
           }
           bput(b, 0x0b);                 // end if
         }
-        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        bput(b, 0x0c); bleb_u(b, (u64)(st.n - 1));  // br $EXIT
         inherit = false;
         break;
       }
       case kTermExit:
         // the last instruction was a handler-emitted branch: it set m->ip
         RegionSync(b, rc, regs);
-        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        bput(b, 0x0c); bleb_u(b, (u64)(st.n - 1));  // br $EXIT
         inherit = false;
         break;
       default:  // kTermStop
         RegionSync(b, rc, regs);
         EGet(b, 0); EConst(b, (i64)bl->tgt); EStore(b, OFF_IP);
-        bput(b, 0x0c); bleb_u(b, (u64)(nl - i));  // br $EXIT
+        bput(b, 0x0c); bleb_u(b, (u64)(st.n - 1));  // br $EXIT
         inherit = false;
         break;
     }
+    while (st.n > 1 && sc[st.idx[st.n - 1]].e == i) {  // close, innermost first
+      bput(b, 0x0b);
+      --st.n;
+    }
     if (b->ovf) return false;
   }
-  bput(b, 0x0b);   // end $L
+  if (st.n != 1) return false;  // scopes did not balance: drop the region
   bput(b, 0x0b);   // end $EXIT
   // postamble: every register the region assigned goes back to the Machine
   for (r = 0; r < 16; ++r) {
@@ -2408,8 +2554,9 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
 static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
                        u64 *firstpc, u64 *lastpc) {
   struct RBlock bs[PKJIT_RBLOCKS];
+  struct RScope sc[PKJIT_RSCOPES];
   int order[PKJIT_RBLOCKS];
-  int n, nl = 0, i, usetbl = 0, hasback = 0;
+  int n, nl = 0, nsc = 0, i;
   u64 lo = ip, hi = ip;
   u16 regs;
   struct Rc probe;
@@ -2422,7 +2569,7 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
   if (bs[0].end <= bs[0].start) return false;
   RLayout(bs, 0, order, &nl);
   if (nl < 1) return false;
-  for (i = 0; i < nl; ++i) {  // predecessor counts + loop shape
+  for (i = 0; i < nl; ++i) {  // predecessor counts
     struct RBlock *bl = &bs[order[i]];
     int s[2], k, ns = 0;
     if (bl->term == kTermJcc) { s[ns++] = bl->s_tgt; s[ns++] = bl->s_fall; }
@@ -2435,41 +2582,46 @@ static bool EmitRegion(struct Machine *m, u64 ip, struct Buf *bb, struct Rc *rc,
     for (k = 0; k < ns; ++k) {
       if (s[k] < 0 || bs[s[k]].pos < 0) continue;
       ++bs[s[k]].preds;
-      if (bs[s[k]].pos <= i) {
-        hasback = 1;
-        if (bs[s[k]].pos != 0) usetbl = 1;
-      }
     }
     if (bl->start < lo) lo = bl->start;
     if (bl->end > hi) hi = bl->end;
   }
   bs[0].preds++;  // the region entry is reached from outside
-  // A ret guard branching FORWARD to a return site is a plain `br` out of a
-  // nested block, so the usual layout (call, callee, return site) needs no
-  // dispatch at all. Only a BACKWARD guard edge - recursion, or a callee laid
-  // out after one of its return sites - has to go through the br_table.
-  for (i = 0; i < nl; ++i) {
-    int k;
-    if (bs[order[i]].term != kTermRet) continue;
-    for (k = 0; k <= i; ++k) {
-      if (!bs[order[k]].isret) continue;
-      usetbl = 1;
-      hasback = 1;
+  if (!RScopes(bs, order, nl, sc, &nsc)) {
+    // An irreducible loop (a branch into a loop body that is not its header)
+    // cannot be expressed with wasm's structured control flow. Demoting every
+    // backward edge to a region exit is always CORRECT - the dispatcher just
+    // re-enters at that address - and leaves an acyclic region, which always
+    // stackifies because block scopes only ever grow leftwards. Better than
+    // dropping the whole region back to one-block-at-a-time.
+    for (i = 0; i < nl; ++i) {
+      struct RBlock *bl = &bs[order[i]];
+      if (bl->s_tgt >= 0 && bs[bl->s_tgt].pos >= 0 && bs[bl->s_tgt].pos <= i) {
+        bl->s_tgt = -1;
+      }
+      if (bl->s_fall >= 0 && bs[bl->s_fall].pos >= 0 &&
+          bs[bl->s_fall].pos <= i) {
+        bl->s_fall = -1;
+      }
     }
+    if (!RScopes(bs, order, nl, sc, &nsc)) return false;
+    ++g_rdemote;
   }
   // pass 1 discovers which GPRs the region actually keeps in locals
   memset(&probe, 0, sizeof(probe));
   pb = *bb;
-  if (!EmitRegionPass(m, &pb, &probe, bs, order, nl, 0, usetbl, hasback, ip)) {
-    return false;
-  }
+  if (!EmitRegionPass(m, &pb, &probe, bs, order, nl, 0, sc, nsc)) return false;
   regs = probe.touched;
+#ifdef PKJIT_RPROF
+  { int loops = 0, k;
+    for (k = 0; k < nsc; ++k) loops += sc[k].kind;
+    fprintf(stderr, "PKJIT region ip=%llx nl=%d regs=%04x scopes=%d loops=%d\n",
+            (unsigned long long)ip, nl, (unsigned)probe.touched, nsc, loops); }
+#endif
   bb->n = 0;
   bb->ovf = 0;
   memset(rc, 0, sizeof(*rc));
-  if (!EmitRegionPass(m, bb, rc, bs, order, nl, regs, usetbl, hasback, ip)) {
-    return false;
-  }
+  if (!EmitRegionPass(m, bb, rc, bs, order, nl, regs, sc, nsc)) return false;
   *lastpc = hi;
   *firstpc = lo;  // call following can pull in code BELOW ip; SMC must see it
   return true;
