@@ -41,6 +41,7 @@
 #include "blink/rde.h"
 
 extern int pk_jit_install(const void *bytes, int len, int first_compile);
+extern void pk_jit_release(int idx);  // give a table slot back to the free list
 
 // static in machine.c, un-static'd (pk910) so we can identify them by symbol
 // and avoid 2-byte-opcode collisions from a pure-opcode decode.
@@ -2503,9 +2504,17 @@ static inline u32 HashLocal(u64 ip) {
 
 static nexgen32e_f InstantiateLocal(struct SharedEntry *s, u64 ip, u32 gen,
                                     int first_compile) {
+  struct LocalHook *lh = &t_local[HashLocal(ip)];
+  // We only get here on a miss, a hash collision or a stale generation, so any
+  // idx already in this slot is about to lose its last reference: hand the
+  // table slot back first, so the install below reuses it instead of growing.
+  if (lh->idx) {
+    pk_jit_release((int)lh->idx);
+    lh->idx = 0;
+    lh->virt = 0;
+  }
   int idx = pk_jit_install(s->bytes, (int)s->len, first_compile);
   if (idx <= 0) return 0;
-  struct LocalHook *lh = &t_local[HashLocal(ip)];
   lh->idx = (u32)idx;
   lh->gen = gen;
   lh->virt = ip;
