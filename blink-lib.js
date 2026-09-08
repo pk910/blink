@@ -711,7 +711,7 @@ addToLibrary({
       op = op >>> 0; // requests with bit 31 set (TIOCGPTN) arrive as negative ints
       var argp = HEAPU32[varargs >> 2];
       if (op === 0x5401 || op === 0x5402 || op === 0x5403 || op === 0x5404 || op === 0x5413) {
-        if (ksys('fstat', [fd]).type !== 'char') return -25; // ENOTTY
+        if (ksys('fstat', [fd]).type !== 'char') return -59; // ENOTTY (WASI numbering: 25 is EILSEQ)
       }
       var tm = PKSYS.termios;
       if (op === 0x5401) {
@@ -747,7 +747,7 @@ addToLibrary({
       if (op === 0x5421) { ksys('ioctl', [fd, 'FIONBIO', HEAP32[argp >> 2] !== 0]); return 0; } // FIONBIO
       if (op === 0x541b) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'FIONREAD']) | 0; return 0; } // FIONREAD
       if (op === 0x8905) { HEAP32[argp >> 2] = ksys('ioctl', [fd, 'SIOCATMARK']) | 0; return 0; } // SIOCATMARK
-      return -25; // ENOTTY
+      return -59; // ENOTTY (WASI numbering: 25 is EILSEQ)
     } catch (e) { return PKSYS.errS(e); }
   },
   __syscall_poll__deps: ['$PKSYS'],
@@ -823,6 +823,13 @@ addToLibrary({
       return 0;
     } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
+  js_getpid__deps: ['$PKSYS'],
+  js_getpid__proxy: 'none',
+  js_getpid: function () {
+    // the kernel's pid for this process. Called once per System so blink's own
+    // bookkeeping (and gettid for the main thread) matches what the guest sees.
+    try { return ksys('getpid', []) | 0; } catch (e) { return -1; }
+  },
   js_session__deps: ['$PKSYS'],
   js_session__proxy: 'none',
   js_session: function (which, a, b) {
@@ -831,7 +838,9 @@ addToLibrary({
         case 0: return ksys('setsid', []) | 0;
         case 1: ksys('setpgid', [a, b]); return 0;
         case 2: return ksys('getpgid', [a]) | 0;
-        default: return ksys('getsid', [a]) | 0;
+        case 3: return ksys('getsid', [a]) | 0;
+        case 4: return ksys('getpid', []) | 0;
+        default: return ksys('getppid', []) | 0;
       }
     } catch (e) { if (e && e.__exit) throw e; return PKSYS.errS(e); }
   },
