@@ -1205,6 +1205,18 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   } else if (h == OpMovGvqpEvqp && lg == 1) {  // mov r16, [mem] (keeps upper)
     kind = 4; dst = (int)RexrReg(rde); mergesh = 0;
     mergemask = ~(i64)0xffff; size = 2; loadop = 0x33;
+  } else if (h == OpAlui && (int)ModrmReg(rde) == ALU_CMP && lg < 2 &&
+             !Lock(rde)) {
+    // cmp byte/word [mem], imm (opcode 0x80, and 0x81/0x83 under 66:). Narrow
+    // widths are safe HERE and only here because cmp writes no register, so the
+    // "8/16-bit writeback would clobber the upper bits" bail below does not
+    // apply, and EmitAluInline's width-masked formulas already cover log2 0/1
+    // (the register-direct byte ALU has used them since the 8/16-bit flags
+    // work). This one form is 95% of the `str` benchmark's runtime: gcc's
+    // strlen idiom is `cmpb $0,(%rdx)` and MEMPROF counted 50.0M of the
+    // benchmark's 52.5M handler fallbacks on it, and 23.1M of busybox's 61.9M.
+    kind = 3; t = ALU_CMP;
+    size = 1 << lg; loadop = lg == 0 ? 0x31 : 0x33;  // i64.load8_u / load16_u
   } else if (lg != 2 && lg != 3) {
     return false;  // remaining 16-bit-dst forms keep upper bits: fallback
   } else if (h == OpMovGvqpEvqp) {       // mov reg, [mem]
