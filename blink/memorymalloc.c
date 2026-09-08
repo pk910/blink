@@ -312,7 +312,20 @@ struct System *NewSystem(struct XedMachineMode mode) {
     Write64(s->rlim[i].cur, RLIM_INFINITY_LINUX);
     Write64(s->rlim[i].max, RLIM_INFINITY_LINUX);
   }
+#ifdef __EMSCRIPTEN__
+  // pk910: the host's getpid() is emscripten's stub (always 42), so every guest
+  // believed it was pid 42: setpgid, kill, /proc self-reference and job control
+  // all compared against a number the kernel never heard of. The kernel owns
+  // the pid. NewSystem runs inside main(), where the syscall channel is up; a
+  // negative answer (no channel yet) keeps the host value.
+  {
+    extern int js_getpid(void);
+    int kpid = js_getpid();
+    s->pid = kpid > 0 ? kpid : getpid();
+  }
+#else
   s->pid = getpid();
+#endif
   return s;
 }
 

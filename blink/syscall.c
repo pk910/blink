@@ -231,7 +231,7 @@ extern int js_exec(const char *prog, char **argv, char **envp);  // execve: the 
 #define PK_EXEC_BUF 16384
 extern int js_exec_resolve(const char *prog, char **argv, char **envp, char *buf, int buflen);
 extern void js_procexit(int code);  // exit_group: notify the kernel, then this pthread ends (worker reclaimed)
-extern int js_session(int which, int a, int b);        // 0 setsid 1 setpgid 2 getpgid 3 getsid
+extern int js_session(int which, int a, int b);  // 0 setsid 1 setpgid 2 getpgid 3 getsid 4 getpid 5 getppid
 static int PkBridge(int r) {
   if (r < 0) {
     errno = -r;
@@ -849,6 +849,10 @@ static int PkForkThread(struct Machine *m) {
   }
   fa = (struct PkForkArg *)malloc(sizeof(*fa));
   fa->m = m2;
+  // the child is a new process: its System (and its main thread's tid) take the
+  // kernel pid, so getpid/gettid in the child are the child's, not the parent's
+  child->pid = pid;
+  m2->tid = pid;
   fa->pid = pid;
   unassert(!pthread_attr_init(&attr));
   unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
@@ -5762,7 +5766,11 @@ static int SysSetsid(struct Machine *m) {
 }
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(3, pid, 0));
+#else
   return getsid(pid);
+#endif
 }
 
 static int SysGetpid(struct Machine *m) {
@@ -5774,7 +5782,11 @@ static int SysGettid(struct Machine *m) {
 }
 
 static int SysGetppid(struct Machine *m) {
+#ifdef __EMSCRIPTEN__
+  return PkBridge(js_session(5, 0, 0));
+#else
   return getppid();
+#endif
 }
 
 // pk910: under emscripten the host libc's geteuid()/getegid() collapse to the

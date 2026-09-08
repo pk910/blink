@@ -93,11 +93,10 @@ static int IoctlTcsets(struct Machine *m, int fd, int request, i64 addr,
 static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
   int rc;
   u8 *pgrp;
-#ifdef __EMSCRIPTEN__
-  // Force shells to disable job control in emscripten
-  errno = ENOTTY;
-  return -1;
-#endif
+  // pk910: upstream fails this under emscripten to force shells to give up job
+  // control, because there is no kernel behind it. Ours has sessions, process
+  // groups and controlling ttys, and musl's tcgetpgrp is an ioctl that reaches
+  // it through the glue, so let the shell ask.
   if (!(pgrp = (u8 *)SchlepW(m, addr, 4))) return -1;
   if ((rc = VfsTcgetpgrp(fd)) == -1) return -1;
   Write32(pgrp, rc);
