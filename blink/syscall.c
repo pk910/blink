@@ -1332,16 +1332,21 @@ static i32 SysGetRobustList(struct Machine *m, int pid, i64 head_ptr_addr,
   } else {
     rc = -1;
     errno = ESRCH;
+    // pk910: find the thread under the lock but do the guest write outside it.
+    // CopyToUserWrite can split a COW page, and that now invalidates the whole
+    // system, which takes machines_lock again and would deadlock here.
+    struct Machine *found = 0;
     LOCK(&m->system->machines_lock);
     for (e = dll_first(m->system->machines); e;
          e = dll_next(m->system->machines, e)) {
       m2 = MACHINE_CONTAINER(e);
       if (m2->tid == pid) {
-        rc = ReturnRobustList(m2, head_ptr_addr, len_ptr_addr);
+        found = m2;
         break;
       }
     }
     UNLOCK(&m->system->machines_lock);
+    if (found) rc = ReturnRobustList(found, head_ptr_addr, len_ptr_addr);
   }
   return rc;
 }
@@ -1552,6 +1557,20 @@ static i64 SysBrk(struct Machine *m, i64 addr) {
   if (addr >= kNullSize) {
     if (addr > m->system->brk) {
       size = addr - m->system->brk;
+      // pk910: linux refuses to grow the break into address space that is
+      // already mapped, and musl's mallocng relies on it: it mmaps a PROT_NONE
+      // guard page right at the initial break so that any later brk() growth
+      // fails and it owns everything above outright. ReserveVirtual silently
+      // replaces whatever was there, so without this check we grow straight
+      // through the guard and corrupt mallocng's bookkeeping (AaronO/blink
+      // 3a2aa93d, seen as a SIGILL in mallocng's own self-check). return the
+      // unchanged break instead, which is the kernel's collision behaviour.
+      if (!IsFullyUnmapped(m->system, m->system->brk, size)) {
+        MEM_LOGF("brk(%#" PRIx64 ") refused: [%#" PRIx64 ",%#" PRIx64
+                 ") is already mapped",
+                 addr, m->system->brk, addr);
+        goto BrkDone;
+      }
       CleanseMemory(m->system, size);
       if (m->system->rss < GetMaxRss(m->system)) {
         if (size / 4096 + m->system->vss < GetMaxVss(m->system)) {
@@ -1582,6 +1601,7 @@ static i64 SysBrk(struct Machine *m, i64 addr) {
       }
     }
   }
+BrkDone:
   rc = m->system->brk;
   unassert(CheckMemoryInvariants(m->system));
   UNLOCK(&m->system->mmap_lock);
