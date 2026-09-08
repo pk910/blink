@@ -117,7 +117,7 @@ addToLibrary({
         EAGAIN: 6, EINPROGRESS: 26, EALREADY: 7, ECONNREFUSED: 14, ECONNRESET: 15, ECONNABORTED: 13, EADDRINUSE: 3, EADDRNOTAVAIL: 4,
         ENOTSOCK: 57, EAFNOSUPPORT: 5, EPROTONOSUPPORT: 66, ESOCKTNOSUPPORT: 66, EOPNOTSUPP: 138, ENOTSUP: 58, EHOSTUNREACH: 23, ENETUNREACH: 40, ENETDOWN: 39,
         ETIMEDOUT: 73, EISCONN: 30, ENOTCONN: 53, EMSGSIZE: 35, ENOBUFS: 42, EDESTADDRREQ: 17, ENOPROTOOPT: 50, EINTR: 27, ENODEV: 43, ENXIO: 60,
-        ESRCH: 71, ENOSYS: 52, ESHUTDOWN: 15, EFAULT: 21, EIO: 29,
+        ESRCH: 71, ELOOP: 32, ENOSYS: 52, ESHUTDOWN: 15, EFAULT: 21, EIO: 29,
       };
       return map[name] || 29; // default EIO
     },
@@ -186,8 +186,8 @@ addToLibrary({
       U32(60, 4096);       // f_frsize
       return 0;
     },
-    statPath: function (path, buf) {
-      try { return PKSYS.writeStat(buf, ksys('stat', [path])); } catch (e) { return PKSYS.errS(e); }
+    statPath: function (path, buf, nofollow) {
+      try { return PKSYS.writeStat(buf, ksys(nofollow ? 'lstat' : 'stat', [path])); } catch (e) { return PKSYS.errS(e); }
     },
     read: function (fd, iov, iovcnt, pnum) {
       var total = 0;
@@ -571,10 +571,10 @@ addToLibrary({
   __syscall_stat64: function (path, buf) { return PKSYS.statPath(PKSYS.cstr(path), buf); },
   __syscall_lstat64__deps: ['$PKSYS'],
   __syscall_lstat64__proxy: 'none',
-  __syscall_lstat64: function (path, buf) { return PKSYS.statPath(PKSYS.cstr(path), buf); },
+  __syscall_lstat64: function (path, buf) { return PKSYS.statPath(PKSYS.cstr(path), buf, true); },
   __syscall_newfstatat__deps: ['$PKSYS'],
   __syscall_newfstatat__proxy: 'none',
-  __syscall_newfstatat: function (dirfd, path, buf) { return PKSYS.statPath(PKSYS.atPath(dirfd, path), buf); },
+  __syscall_newfstatat: function (dirfd, path, buf, flags) { return PKSYS.statPath(PKSYS.atPath(dirfd, path), buf, (flags & 0x100) !== 0); }, // AT_SYMLINK_NOFOLLOW
   __syscall_fstat64__deps: ['$PKSYS'],
   __syscall_fstat64__proxy: 'none',
   __syscall_fstat64: function (fd, buf) { try { return PKSYS.writeStat(buf, ksys('fstat', [fd])); } catch (e) { return PKSYS.errS(e); } },
@@ -626,11 +626,12 @@ addToLibrary({
   __syscall_readlinkat__deps: ['$PKSYS'],
   __syscall_readlinkat__proxy: 'none',
   __syscall_readlinkat: function (dirfd, path, buf, bufsize) {
-    // the kernel answers for /proc/<pid>/fd/<n>; anything else is EINVAL (no symlinks in the VFS)
-    try { var b = PKSYS.enc().encode(ksys('readlink', [UTF8ToString(path)])); var n = Math.min(b.length, bufsize); HEAPU8.set(b.subarray(0, n), buf); return n; } catch (e) { return PKSYS.errS(e); }
+    // readlink(2): EINVAL for anything that is not a link
+    try { var b = PKSYS.enc().encode(ksys('readlink', [PKSYS.atPath(dirfd, path)])); var n = Math.min(b.length, bufsize); HEAPU8.set(b.subarray(0, n), buf); return n; } catch (e) { return PKSYS.errS(e); }
   },
+  __syscall_symlinkat__deps: ['$PKSYS'],
   __syscall_symlinkat__proxy: 'none',
-  __syscall_symlinkat: function () { return -1; }, // EPERM
+  __syscall_symlinkat: function (target, dirfd, linkpath) { try { ksys('symlink', [PKSYS.cstr(target), PKSYS.atPath(dirfd, linkpath)]); return 0; } catch (e) { return PKSYS.errS(e); } },
   __syscall_linkat__proxy: 'none',
   __syscall_linkat: function () { return -1; }, // EPERM
   __syscall_utimensat__proxy: 'none',
