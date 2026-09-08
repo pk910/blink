@@ -731,9 +731,21 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
     pagesize = FLAG_pagesize;
     real = mug = FindHostPage(entry);
     while ((uintptr_t)mug & (pagesize - 1)) mug -= 4096;
-    // pk910 probe: under emscripten, munmap of a sub-range of an existing
-    // host mapping returns EINVAL. Leaking the host page beats aborting.
-    if (Munmap(mug, real - mug + size)) { /* host cannot unmap a sub-range */ }
+    // pk910: free exactly the page that was mapped, not `size` - what the
+    // caller is unmapping is not what was allocated. The two callers disagree
+    // about the tail of a short interval (FreeVirtual passes MIN(4096, end -
+    // virt), the MAP_FIXED replace in ReserveVirtual passes 4096), while the
+    // allocation is always a whole page. A host that checks the length -
+    // emscripten refuses a munmap that does not match its record - answered
+    // EINVAL, and the page leaked, once per shared object every dlopen.
+    if (Munmap(mug, real - mug + 4096)) {
+      static bool complained;
+      if (!complained) {
+        complained = true;
+        ERRF("munmap(%p, %ld) failed: %s - a host page leaked", mug,
+             (long)(real - mug + 4096), DescribeHostErrno(errno));
+      }
+    }
     if (entry & PAGE_RSRV) {
       s->memstat.reserved -= 1;
     } else {
@@ -1066,7 +1078,17 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             int mugflags;
             long mugsize;
             long mugskew;
-            mugsize = MIN(4096, end - virt);
+            // pk910: a whole page, even for the tail of a shorter interval.
+            // The free side has no record of what was asked for: it recomputes
+            // the length from the page table, and the two call sites disagree
+            // (FreeVirtual says MIN(4096, end - virt), the MAP_FIXED replace
+            // below says 4096). Allocating the page a page table entry stands
+            // for makes them agree by construction, and a host that checks the
+            // length - emscripten refuses a munmap that does not match its
+            // record - stops refusing. Linux hands out the whole page too, with
+            // the tail past the file zero-filled, which is what a short pread
+            // leaves behind here.
+            mugsize = 4096;
             if (fd != -1) {
               mugskew = offset - ROUNDDOWN(offset, pagesize);
               mugoff = ROUNDDOWN(offset, pagesize);
