@@ -800,15 +800,21 @@ static bool LeaDecode(nexgen32e_f h, u64 rde, i64 disp, int *dst, int *base,
 // RW lookup path enqueues SMC invalidation - phase 2, not inlined yet.)
 
 // Decode a MEMORY rm operand's effective address parts. Only the flat common
-// case is inlined: long mode, 64-bit addressing, no segment override, no LOCK,
-// userland (!metal: ds/ss/es bases are 0, no ROM aliasing, Cpl always 3).
+// case is inlined: long mode, 64-bit addressing, no LOCK, userland (!metal:
+// ds/ss/es bases are 0, no ROM aliasing, Cpl always 3).
+//
+// A segment override IS covered: blink's AddSegment ignores the ds/ss base it
+// computed and returns `ea + m->seg[Sego(rde)-1].base` whenever Sego is set, so
+// *sego (0 = none, else the 1-based seg[] index) makes EmitEaAddr add that base
+// with one extra i64 load. musl puts TLS and the stack canary behind fs:, so
+// this is in the prologue/epilogue of nearly every -fstack-protector function.
 static bool MemEaDecode(struct Machine *m, u64 rde, int *base, int *index,
                         int *scale, bool *hasBase, bool *hasIndex,
-                        bool *riprel) {
+                        bool *riprel, int *sego) {
   if (IsModrmRegister(rde) || Lock(rde)) return false;
   if (m->metal) return false;
   if (Mode(rde) != XED_MODE_LONG || Eamode(rde) != XED_MODE_LONG) return false;
-  if (Sego(rde)) return false;  // fs/gs override -> handler
+  *sego = (int)Sego(rde);
   *base = *index = *scale = 0;
   *hasBase = *hasIndex = *riprel = false;
   if (!SibExists(rde)) {
@@ -825,16 +831,24 @@ static bool MemEaDecode(struct Machine *m, u64 rde, int *base, int *index,
   return true;
 }
 
-// LT3 = disp + base + (index << scale) [+ pc_next when rip-relative].
+// LT3 = disp + base + (index << scale) [+ pc_next when rip-relative]
+//       [+ m->seg[sego-1].base when a segment override is present].
 static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
                        int scale, i64 dispv, bool hasBase, bool hasIndex,
-                       bool riprel, u64 pc_next) {
+                       bool riprel, u64 pc_next, int sego) {
   EConst(b, dispv + (riprel ? (i64)pc_next : 0));
   if (hasBase) { RcLoad(b, rc, base); EGet(b, LOC_GPR + base); EBin(b, I64_ADD); }
   if (hasIndex) {
     RcLoad(b, rc, index);
     EGet(b, LOC_GPR + index);
     if (scale) { EConst(b, (i64)scale); EBin(b, I64_SHL); }
+    EBin(b, I64_ADD);
+  }
+  if (sego) {  // fs:/gs: (and the legacy overrides, whose base is 0 here)
+    EGet(b, 0);
+    ELoad(b, (u32)(offsetof(struct Machine, seg) +
+                   (size_t)(sego - 1) * sizeof(struct DescriptorCache) +
+                   offsetof(struct DescriptorCache, base)));
     EBin(b, I64_ADD);
   }
   ESet(b, LT3);
@@ -983,10 +997,12 @@ static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
   } else {
     return false;
   }
-  int base, index, scale;
+  int base, index, scale, sego;
   bool hb, hi, rip;
-  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
-  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip, &sego)) {
+    return false;
+  }
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next, sego);
   if (kind == 4) RcLoad(b, rc, dst);  // merge needs the old dst value
   struct Rc pre = *rc;            // the $slow fallback spills THIS state
   EmitMemBegin(b, size, false);
@@ -1068,10 +1084,12 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
   } else {
     return false;
   }
-  int base, index, scale;
+  int base, index, scale, sego;
   bool hb, hi, rip;
-  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip)) return false;
-  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next);
+  if (!MemEaDecode(m, rde, &base, &index, &scale, &hb, &hi, &rip, &sego)) {
+    return false;
+  }
+  EmitEaAddr(b, rc, base, index, scale, x->op.disp, hb, hi, rip, pc_next, sego);
   if (kind == 0 || kind == 2) RcLoad(b, rc, ysrc);  // reg operand
   struct Rc pre = *rc;
   EmitMemBegin(b, size, true);
