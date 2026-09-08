@@ -273,6 +273,14 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I32_MUL 0x6c
 #define I32_ADD 0x6a
 #define I32_GTU 0x4b
+#define I64_GTU 0x56
+#define I64_GEU 0x5a
+#define I64_LEU 0x58
+#define I64_LTS 0x53
+#define I64_GTS 0x55
+#define I64_GES 0x59
+#define I64_LES 0x57
+#define I32_EQZ 0x45
 
 // ── register cache ──────────────────────────────────────────────────────────
 struct Rc {
@@ -286,6 +294,16 @@ struct Rc {
   // postamble only stores those back.
   u16 touched;
   u16 wrote;
+  // pk910 cmp/jcc fusion. `fuse_req` is (condition code + 1) of the jcc that
+  // terminates the block being emitted, and is set ONLY while that block's LAST
+  // instruction goes through EmitOneInsn, and only when GetNeededFlags says no
+  // flag is live on either successor arm. EmitAluInline answers by setting
+  // fuse_done: it then skips the flags word entirely and leaves x/y/z in
+  // LT0/LT1/LT2, which the terminator turns straight into the branch condition.
+  u8 fuse_req;
+  u8 fuse_done;
+  u8 fuse_kind;    // 0 logical (CF = OF = 0), 1 add, 2 sub/cmp
+  u8 fuse_signsh;  // width-1: sign bit position of the masked operands
 };
 static void RcMark(struct Rc *rc, int r) {
   rc->loaded[r] = 1;
@@ -394,6 +412,99 @@ static void EmitCond(struct Buf *b, int cc) {
     default: EmitBit(b, 6); EmitBit(b, 7); EmitBit(b, 11);           // JG (15)
              bput(b, I32_XOR); bput(b, I32_OR);
              EConstI(b, 1); bput(b, I32_XOR); break;
+  }
+}
+
+// ── cmp/jcc fusion ──────────────────────────────────────────────────────────
+// A cmp/test whose only consumer is the jcc right behind it never has to build
+// a flags word: the branch condition is one wasm compare over the operands the
+// ALU already has in locals. EmitAluInline leaves the width-masked x in LT0,
+// y in LT1 and z = x OP y in LT2, so the whole fusion is "emit the ALU with
+// needed = 0, then read those three locals". Guard: blink's own fusion.c rule,
+// GetNeededFlags == 0 on BOTH successor arms of the branch.
+//
+// Not fused, deliberately: JO/JNO and JP/JNP (no cheap form - OF for add is the
+// 9-instruction Hacker's-Delight term and parity is our lazy byte), the signed
+// codes after an `add` (they need that same OF term), adc/sbb (two-step, and
+// the carry-in makes the operand pair a poor proxy), and anything with a memory
+// operand (its $slow arm runs the real handler, which sets m->flags but not
+// LT0/LT1/LT2, so the two arms would not rejoin with the same state).
+static bool FuseCcOk(int cc, int kind) {
+  switch (cc) {
+    case 2: case 3: case 6: case 7:  // B/AE/BE/A: CF, or CF|ZF
+      return true;
+    case 4: case 5:                  // E/NE: ZF
+      return true;
+    case 8: case 9:                  // S/NS: sign bit of z
+      return true;
+    case 12: case 13: case 14: case 15:  // L/GE/LE/G: SF^OF
+      return kind != 1;              // add would need the real OF term
+    default:                         // 0/1 (O/NO), 10/11 (P/NP)
+      return false;
+  }
+}
+
+// Push LT`loc` sign-extended for a signed compare. The operands are masked to
+// width, so shifting both sides left by the same amount is enough: it puts the
+// operand's sign bit in bit 63 and preserves signed order, without the matching
+// shr_s an actual sign-extension would need.
+static void EPushSx(struct Buf *b, int loc, int signsh) {
+  EGet(b, loc);
+  if (signsh != 63) { EConst(b, 63 - signsh); EBin(b, I64_SHL); }
+}
+
+// Push (z >> signsh) as an i32 0/1 - SF, since z is masked to width.
+static void EPushSf(struct Buf *b, int signsh) {
+  EGet(b, LT2); EConst(b, signsh); EBin(b, I64_SHRU); bput(b, I64_WRAP);
+}
+
+// Push the i32 branch condition for `cc` directly from the fused compare's
+// LT0 = x, LT1 = y (both masked, zero-extended to width) and LT2 = z.
+static void EmitFusedCond(struct Buf *b, int cc, int kind, int signsh) {
+  switch (cc) {
+    case 4:  EGet(b, LT2); bput(b, I64_EQZ); return;               // JE  z==0
+    case 5:  EGet(b, LT2); EConst(b, 0); bput(b, I64_NE); return;  // JNE
+    case 8:  EPushSf(b, signsh); return;                           // JS
+    case 9:  EPushSf(b, signsh); bput(b, I32_EQZ); return;         // JNS
+    case 2: case 3: case 6: case 7:  // CF group
+      if (kind == 2) {               // sub/cmp: CF = x <u y, so all four are
+        EGet(b, LT0); EGet(b, LT1);  // one unsigned compare of the operands
+        bput(b, cc == 2 ? I64_LTU : cc == 3 ? I64_GEU
+                        : cc == 6 ? I64_LEU : I64_GTU);
+        return;
+      }
+      if (kind == 1) {               // add: CF = z <u y
+        if (cc == 2 || cc == 3) {
+          EGet(b, LT2); EGet(b, LT1);
+          bput(b, cc == 2 ? I64_LTU : I64_GEU);
+          return;
+        }
+        EGet(b, LT2); EGet(b, LT1); bput(b, I64_LTU);   // CF
+        EGet(b, LT2); bput(b, I64_EQZ);                 // ZF
+        EBin(b, I32_OR);
+        if (cc == 7) bput(b, I32_EQZ);                  // JA = !(CF|ZF)
+        return;
+      }
+      // logical: CF = 0, so JB is never taken, JAE always, JBE = ZF, JA = !ZF
+      if (cc == 2) { EConstI(b, 0); return; }
+      if (cc == 3) { EConstI(b, 1); return; }
+      EGet(b, LT2);
+      if (cc == 6) bput(b, I64_EQZ); else { EConst(b, 0); bput(b, I64_NE); }
+      return;
+    default:  // 12..15, signed
+      if (kind == 2) {  // sub/cmp: SF^OF is exactly the signed compare of x,y
+        EPushSx(b, LT0, signsh); EPushSx(b, LT1, signsh);
+        bput(b, cc == 12 ? I64_LTS : cc == 13 ? I64_GES
+                         : cc == 14 ? I64_LES : I64_GTS);
+        return;
+      }
+      // logical: OF = 0, so SF^OF is SF
+      EPushSf(b, signsh);
+      if (cc == 13) { bput(b, I32_EQZ); return; }       // JGE = !SF
+      if (cc == 12) return;                             // JL  =  SF
+      EGet(b, LT2); bput(b, I64_EQZ); EBin(b, I32_OR);  // ZF|SF
+      if (cc == 15) bput(b, I32_EQZ);                   // JG  = !(ZF|SF)
+      return;
   }
 }
 
@@ -662,6 +773,16 @@ static void EmitAluInline(struct Buf *b, struct Rc *rc, int t, int log2, int dst
              : (t == 2)                   ? 3
              : (t == 3)                   ? 4
                                           : 2;
+  // fusion: the terminator asked for a condition we can build from x/y/z, so
+  // drop the flags word entirely (see FuseCcOk). Nothing between here and the
+  // br_if writes LT0/LT1/LT2, so the terminator can just read them back.
+  if (rc->fuse_req && !keepcf && kind <= 2 &&
+      FuseCcOk((int)rc->fuse_req - 1, kind)) {
+    needed = 0;
+    rc->fuse_done = 1;
+    rc->fuse_kind = (u8)kind;
+    rc->fuse_signsh = (u8)signsh;
+  }
   // x -> LT0 (dst<0: x is the memory operand value already in LT3, no wb)
   if (dst >= 0) {
     RcLoad(b, rc, dst);
@@ -1076,6 +1197,7 @@ static void EmitMemEnd(struct Buf *b, const struct Rc *pre, const struct Rc *rc,
 static bool TryEmitMemRead(struct Machine *m, struct Buf *b, struct Rc *rc,
                            nexgen32e_f h, u64 rde, const struct XedDecodedInst *x,
                            u64 pc_next, u32 oplen) {
+  rc->fuse_req = 0;  // the $slow arm calls the handler: no LT0/LT1/LT2 there
   int lg = (int)RegLog2(rde);
   int kind;  // 0 mov load->reg ; 1 alu reg,[mem] ; 2 cmp/test [mem],reg ;
              // 3 cmp [mem],imm ; 4 subword load merged into dst (mov r8/r16)
@@ -1179,6 +1301,7 @@ static bool TryEmitMemWrite(struct Machine *m, struct Buf *b, struct Rc *rc,
                             nexgen32e_f h, u64 rde,
                             const struct XedDecodedInst *x, u64 pc_next,
                             u32 oplen) {
+  rc->fuse_req = 0;  // the $slow arm calls the handler: no LT0/LT1/LT2 there
   int lg = (int)RegLog2(rde);
   int kind;  // 0 mov [mem],reg ; 1 mov [mem],imm ; 2 alu [mem],reg ; 3 alu [mem],imm
   int t = 0, ysrc = 0, size, srcsh = 0;
@@ -2703,6 +2826,15 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
     pc = pcn;
   }
   if (cc < 0 || !cnt || sksp) return false;
+  // cmp/jcc fusion for the loop terminator: same predicate as the region
+  // compiler, both arms of the backward branch (the loop head and the exit).
+  int fuse_cc = -1;
+  if (ops[cnt - 1].kind == kSlAluInline &&
+      !GetNeededFlags(m, (i64)ip, CF | ZF | SF | OF | AF | PF) &&
+      !GetNeededFlags(m, (i64)fall, CF | ZF | SF | OF | AF | PF)) {
+    fuse_cc = cc;
+  }
+  rc->fuse_done = 0;
 
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
@@ -2725,6 +2857,10 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
       bput(bb, 0x0b);  // end if
       --sksp;
     }
+    // fuse only when the producer is the last op AND is not inside an open
+    // forward-jcc skip region: LT0/LT1/LT2 would be stale on the skipped path.
+    rc->fuse_req = (fuse_cc >= 0 && i == cnt - 1 && !sksp)
+                       ? (u8)(fuse_cc + 1) : 0;
     switch (o->kind) {
       case kSlSkip:
         // internal forward Jcc: wrap the skipped ops in `if (!taken)`. Spill
@@ -2761,6 +2897,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
                 o->lrp, o->llg, o->lg, o->pcn);
         break;
     }
+    rc->fuse_req = 0;
     opc = o->pcn;
   }
   while (sksp) {  // skip regions closing at the terminator
@@ -2768,8 +2905,12 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
     --sksp;
   }
   // condition: loop back if the jcc is taken
-  FlagsEnsure(bb, rc);
-  EmitCond(bb, cc);
+  if (rc->fuse_done) {
+    EmitFusedCond(bb, cc, (int)rc->fuse_kind, (int)rc->fuse_signsh);
+  } else {
+    FlagsEnsure(bb, rc);
+    EmitCond(bb, cc);
+  }
   bput(bb, 0x0d); bleb_u(bb, 0);   // br_if 0 -> loop $L
   // not taken: m->ip = fall-through, exit
   EGet(bb, 0); EConst(bb, (i64)fall); EStore(bb, OFF_IP);
@@ -3169,6 +3310,18 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
   for (i = 0; i < nl; ++i) {
     struct RBlock *bl = &bs[order[i]];
     u64 pc = bl->start;
+    int fuse_cc = -1;
+    // cmp/jcc fusion: this block ends in a conditional branch, so offer its
+    // condition code to the block's LAST instruction. Only legal when nothing
+    // downstream reads a flag on EITHER arm - blink's own fusion.c predicate
+    // (fusion.c:75-79). GetNeededFlags returns -1 for "assume all", which the
+    // != 0 test rejects along with any real liveness.
+    if (bl->term == kTermJcc && bl->end > bl->start &&
+        !GetNeededFlags(m, (i64)bl->tgt, CF | ZF | SF | OF | AF | PF) &&
+        !GetNeededFlags(m, (i64)bl->fall, CF | ZF | SF | OF | AF | PF)) {
+      fuse_cc = bl->cc;
+    }
+    rc->fuse_done = 0;
     if (i) {
       bput(b, 0x0b);  // end $B_i - control now joins here
       if (!inherit) RcEnterBlock(rc, regs);
@@ -3188,11 +3341,14 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
       ol = Oplength(rde);
       if (!ol) return false;
       h = GetOp(Mopcode(rde));
+      rc->fuse_req = (fuse_cc >= 0 && pc + ol == bl->end)
+                         ? (u8)(fuse_cc + 1) : 0;
       // a handler invalidated the cache; DON'T reload the whole region set
       // here - the invariant is only owed at block edges, and every terminator
       // below does its own RegionSync. Reloading eagerly cost one load per
       // hoisted register per handler call, which grew with the region.
       (void)EmitOneInsn(m, b, rc, h, rde, &x, pc + ol, ol);
+      rc->fuse_req = 0;
       pc += ol;
       if (b->ovf) return false;
     }
@@ -3200,7 +3356,11 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
     switch (bl->term) {
       case kTermJcc:
         RegionSync(b, rc, regs);
-        EmitCond(b, bl->cc);
+        if (rc->fuse_done) {
+          EmitFusedCond(b, bl->cc, (int)rc->fuse_kind, (int)rc->fuse_signsh);
+        } else {
+          EmitCond(b, bl->cc);
+        }
         bput(b, 0x04); bput(b, 0x40);  // if (taken)
         EmitGoto(b, bs, bl->s_tgt, bl->tgt, i, nl, 1, usetbl);
         bput(b, 0x0b);                 // end if
@@ -3374,6 +3534,8 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
   RcInval(&rc);
   rc.touched = 0;
   rc.wrote = 0;
+  rc.fuse_req = 0;
+  rc.fuse_done = 0;
   t_wasloop = 0;
   struct XedDecodedInst xedd;
   u64 pc = ip;
