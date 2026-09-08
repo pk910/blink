@@ -223,15 +223,26 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define OFF_OPLEN ((u32)offsetof(struct Machine, oplen))
 #define OFF_STASH ((u32)offsetof(struct Machine, stashaddr))
 #define OFF_ATT ((u32)offsetof(struct Machine, attention))
-// scratch locals (declared after the 16 GPR locals): i64 20..23, i32 24..26
+// scratch locals (declared after the 16 GPR locals): i64 20..24, i32 25..29
 #define LT0 20
 #define LT1 21
 #define LT2 22
 #define LT3 23
-#define FL  24   // cached m->flags (i32)
-#define HP0 25   // i32 scratch: tlb slot / host pointer (memory fast path)
-#define HP1 26   // i32 scratch: offset within page
-#define TG  27   // i32: region block-dispatch target (br_table index)
+// pk910: one-entry page cache per emitted function (see EmitMemBegin). PGV
+// holds the guest base of the page most recently resolved, PGH the host pointer
+// of that page's first byte. A page base is 4096-aligned, so bit 0 of PGV is
+// free and carries the permission the page was validated for: 0 = read only,
+// 1 = also write (PAGE_RW|PAGE_XD checked). A read therefore hits on
+// (PGV & -4096) == page and a write on PGV == (page | 1), which is why one pair
+// of locals serves both - and locals are not free, they cost every emitted
+// function. PG_EMPTY is a non-canonical address so it matches neither test.
+#define PGV 24   // i64
+#define FL  25   // cached m->flags (i32)
+#define HP0 26   // i32 scratch: tlb slot / host pointer (memory fast path)
+#define HP1 27   // i32 scratch: offset within page
+#define TG  28   // i32: region block-dispatch target (br_table index)
+#define PGH 29   // i32
+#define PG_EMPTY ((i64)1 << 59)
 #define OFF_TLB   ((u32)offsetof(struct Machine, tlb))
 #define OFF_INVAL ((u32)offsetof(struct Machine, invalidated))
 
@@ -248,6 +259,7 @@ static void EBin(struct Buf *b, u8 op) { bput(b, op); }  // i64/i32 binop
 #define I64_LTU 0x54
 #define I64_EQZ 0x50
 #define I64_NE  0x52
+#define I64_EQ  0x51
 #define I64_WRAP 0xa7
 #define I64_SHRS 0x87
 #define I64_NE  0x52
@@ -917,31 +929,67 @@ static void EmitEaAddr(struct Buf *b, struct Rc *rc, int base, int index,
 }
 
 // LT3 holds the guest addr. Opens block $done { block $slow { ... and emits the
-// TLB-hit checks; on the fast path HP0 = host pointer for [addr, addr+size).
-// Any check failing branches to $slow (the handler fallback in EmitMemEnd).
-// write=true additionally requires PAGE_RW (a fresh-TLB RW entry can't be COW:
-// CowMaybeSplit needs RW clear, so skipping CowSplitRange is equivalent) AND
-// PAGE_XD set (a write to an executable page is the SMC-enqueue case in
-// LookupAddress2 - keep that on the handler).
+// address-resolution checks; on the fast path HP0 = host pointer for
+// [addr, addr+size). Any check failing branches to $slow (the handler fallback
+// in EmitMemEnd). write=true additionally requires PAGE_RW (a fresh-TLB RW
+// entry can't be COW: CowMaybeSplit needs RW clear, so skipping CowSplitRange
+// is equivalent) AND PAGE_XD set (a write to an executable page is the
+// SMC-enqueue case in LookupAddress2 - keep that on the handler).
+//
+// pk910 page cache: even a TLB hit costs the slot arithmetic, the page compare,
+// the entry load and then TWO DEPENDENT loads (g_hostpages.p, then p[idx]) - a
+// pointer chase on every guest access, which dominates byte-at-a-time loops.
+// So the emitted function remembers the last page it resolved in locals and a
+// repeat access to it is `page == PGxV ? PGxH + off`. Soundness:
+//   * PGxV starts at PG_EMPTY and is reset to it after EVERY handler call
+//     (a handler can mmap, munmap, fault a page in, COW-split or reset the
+//     TLB), so the cache is always FRESHER than m->tlb, which is only revalidated
+//     on a miss;
+//   * m->invalidated is still checked per access, exactly as the TLB path does,
+//     so another thread's InvalidateSystem is honoured;
+//   * read and write get SEPARATE caches, because the write fast path needs
+//     PAGE_RW|PAGE_XD that a read-validated page was never checked for. A
+//     write-validated page is read-valid by construction, so the write path
+//     fills both.
 static void EmitMemBegin(struct Buf *b, int size, bool write) {
   bput(b, 0x02); bput(b, 0x40);   // block $done
   bput(b, 0x02); bput(b, 0x40);   // block $slow
   // if (m->invalidated) goto slow  (interp resets the TLB before trusting it)
   EGet(b, 0); bput(b, 0x2d); bleb_u(b, 0); bleb_u(b, OFF_INVAL);  // i32.load8_u
   bput(b, 0x0d); bleb_u(b, 0);    // br_if $slow
+  // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those).
+  // Hoisted above the cache test: it is needed on both arms.
+  EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
+  if (size > 1) {
+    bput(b, 0x22); bleb_u(b, HP1);  // local.tee
+    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
+  } else {
+    ESet(b, HP1);
+  }
+  // LT2 = addr & -4096 ; take the cached host page if it is the same page
+  EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
+  bput(b, 0x22); bleb_u(b, LT2);  // local.tee
+  if (write) {  // exact match: only a write-validated page carries bit 0
+    EConst(b, 1); EBin(b, I64_OR); EGet(b, PGV); bput(b, I64_EQ);
+  } else {      // either permission serves a read
+    EGet(b, PGV); EConst(b, -4096); EBin(b, I64_AND); bput(b, I64_EQ);
+  }
+  bput(b, 0x04); bput(b, 0x40);   // if (cache hit)
+  EGet(b, PGH); EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
+  bput(b, 0x05);                  // else: the full softmmu probe
   // HP0 = m + ((addr>>12) & (TLB_ENTRIES-1))*sizeof(MachineTlb)
   // (tlb slot; OFF_TLB applied at each load). Same index FindPageTableEntry
   // computes, so a JIT hit and an interpreter hit are the same entry.
   _Static_assert(sizeof(struct MachineTlb) == 16, "tlb slot shift is 4");
   _Static_assert((TLB_ENTRIES & (TLB_ENTRIES - 1)) == 0, "tlb size pow2");
-  EGet(b, LT3); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
+  EGet(b, LT2); EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
   EConstI(b, TLB_ENTRIES - 1); bput(b, I32_AND);
   EConstI(b, 4); bput(b, I32_SHL);
   EGet(b, 0); bput(b, I32_ADD); ESet(b, HP0);
-  // tlb.page != (addr & -4096) -> slow
+  // tlb.page != (addr & -4096) -> slow  (br 1: we are one `if` deeper here)
   EGet(b, HP0); bput(b, 0x29); bleb_u(b, 0); bleb_u(b, OFF_TLB);
-  EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
-  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
+  EGet(b, LT2);
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
   // entry -> LT2; need PAGE_V|PAGE_U|PAGE_HOST with PAGE_RSRV clear
   // (read perms = LookupAddress2(mask=need=PAGE_U) at Cpl 3; RSRV can't be in
   // the TLB, checked anyway; !HOST would mean s->real, not inlined)
@@ -957,23 +1005,29 @@ static void EmitMemBegin(struct Buf *b, int size, bool write) {
     EConst(b, (i64)mask); EBin(b, I64_AND);
     EConst(b, (i64)want);
   }
-  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 0);
-  // HP1 = addr & 4095; page-crossing access -> slow (handler stashes those)
-  EGet(b, LT3); bput(b, I64_WRAP); EConstI(b, 4095); bput(b, I32_AND);
-  if (size > 1) {
-    bput(b, 0x22); bleb_u(b, HP1);  // local.tee
-    EConstI(b, 4096 - size); bput(b, I32_GTU); bput(b, 0x0d); bleb_u(b, 0);
-  } else {
-    ESet(b, HP1);
-  }
-  // HP0 = g_hostpages.p[(entry & PAGE_TA) >> 12] + HP1
+  bput(b, I64_NE); bput(b, 0x0d); bleb_u(b, 1);
+  // ch = g_hostpages.p[(entry & PAGE_TA) >> 12] (host base of the page)
   EConstI(b, (i32)(uintptr_t)&g_hostpages.p);
   bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p
   EGet(b, LT2); EConst(b, (i64)PAGE_TA); EBin(b, I64_AND);
   EConst(b, 12); EBin(b, I64_SHRU); bput(b, I64_WRAP);
   EConstI(b, 2); bput(b, I32_SHL); bput(b, I32_ADD);
   bput(b, 0x28); bleb_u(b, 0); bleb_u(b, 0);   // i32.load p[idx] (page base)
+  bput(b, 0x22); bleb_u(b, PGH);               // local.tee PGH
   EGet(b, HP1); bput(b, I32_ADD); ESet(b, HP0);
+  // arm the cache LAST, so nothing above can leave it armed after a br $slow
+  // (LT2 holds the entry by now, so the page base is recomputed)
+  EGet(b, LT3); EConst(b, -4096); EBin(b, I64_AND);
+  if (write) { EConst(b, 1); EBin(b, I64_OR); }  // mark it write-validated
+  ESet(b, PGV);
+  bput(b, 0x0b);                  // end if
+}
+
+// Empty the page cache. Must run at function entry (wasm zero-inits locals and
+// 0 is a legal page base) and after every handler call_indirect, which may have
+// changed the mapping under us.
+static void EmitPgInval(struct Buf *b) {
+  EConst(b, PG_EMPTY); ESet(b, PGV);
 }
 
 // Close the fast path and emit the $slow fallback: spill the PRE-instruction
@@ -999,6 +1053,7 @@ static void EmitMemEnd(struct Buf *b, const struct Rc *pre, const struct Rc *rc,
   bput(b, 0x3a); bleb_u(b, 0); bleb_u(b, OFF_OPLEN);    // i32.store8
   EmitHandler(b, rde, disp, uimm0, hidx);
   EmitCommitStash(b);
+  EmitPgInval(b);                 // the handler may have remapped anything
   for (r = 0; r < 16; ++r) {      // resync locals the fast path left valid
     if (!rc->loaded[r]) continue;
     EGet(b, 0); ELoad(b, OFF_WEG + (u32)r * 8); ESet(b, LOC_GPR + r);
@@ -1792,6 +1847,7 @@ static bool EmitSelfLoop(struct Machine *m, u64 ip, struct Buf *bb,
   // preamble: hoist reg + flags loads OUT of the loop (persist across iterations)
   for (int r = 0; r < 16; ++r) if (regs & (1u << r)) RcLoad(bb, rc, r);
   FlagsEnsure(bb, rc);
+  EmitPgInval(bb);
   bput(bb, 0x02); bput(bb, 0x40);  // block $B
   bput(bb, 0x03); bput(bb, 0x40);  // loop $L
   // attention check at loop top: if (m->attention) { m->ip = ip; exit }
@@ -1957,6 +2013,7 @@ static bool EmitOneInsn(struct Machine *m, struct Buf *bb, struct Rc *rc,
   bput(bb, 0x3a); bleb_u(bb, 0); bleb_u(bb, OFF_OPLEN);  // i32.store8
   EmitHandler(bb, rde, xedd->op.disp, xedd->op.uimm0, (u32)(uintptr_t)h);
   EmitCommitStash(bb);                // drain page-crossing store stash
+  EmitPgInval(bb);                    // handler may have remapped memory
   RcInval(rc);                        // handler may have changed regs
   return false;
 }
@@ -2184,6 +2241,7 @@ static bool EmitRegionPass(struct Machine *m, struct Buf *b, struct Rc *rc,
     if (regs & (1u << r)) RcLoad(b, rc, r);
   }
   FlagsEnsure(b, rc);
+  EmitPgInval(b);
   if (usetbl) { EConstI(b, 0); ESet(b, TG); }
   bput(b, 0x02); bput(b, 0x40);   // block $EXIT
   bput(b, 0x03); bput(b, 0x40);   // loop $L
@@ -2373,6 +2431,7 @@ static bool WasmJitEmit(struct Machine *m, u64 ip, const u8 **out, u32 *outlen) 
     rc.wrote = 0;
   }
 #endif
+  EmitPgInval(&bb);
   for (; count < PKJIT_MAXINSN; ++count) {
     if (GetInstruction(m, pc, &xedd)) break;
     u64 rde = xedd.op.rde;
@@ -2411,8 +2470,10 @@ assemble:
   bleb_u(&mb, content_len);
   bleb_u(&mb, 1);         // 1 function body
   bleb_u(&mb, body_len);
-  bput(&mb, 0x02); bput(&mb, 0x14); bput(&mb, 0x7e);  // 20 i64 (16 GPR + LT0..3)
-  bput(&mb, 0x04); bput(&mb, 0x7f);                   // 4 i32 (FL, HP0, HP1, TG)
+  bput(&mb, 0x02); bput(&mb, 0x15); bput(&mb, 0x7e);  // 21 i64 (16 GPR, LT0..3,
+                                                     //         PGV)
+  bput(&mb, 0x05); bput(&mb, 0x7f);                   // 5 i32 (FL, HP0, HP1,
+                                                     //        TG, PGH)
   bputs(&mb, bb.p, bb.n);
   bput(&mb, 0x0b);        // end
   if (mb.ovf) { free(mem); return false; }
